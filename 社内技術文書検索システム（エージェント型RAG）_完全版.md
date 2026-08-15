@@ -1,6 +1,6 @@
 # 社内技術文書検索システム（エージェント型RAG）（完全版）
 
-本章では、Unity Catalogで管理された社内技術文書をDatabricks AI Searchへ公開し、承認済みの根拠だけに基づいて回答するエージェント型RAGを扱う。最初に完成形を示し、その後、**前提設計、PoC、本番化準備、本番導入、運用高度化**の順で完成させるロードマップを説明する。完全なコードは「8. 実装リファレンス」へ一度だけ掲載する。
+本章では、Unity Catalogで管理された社内技術文書をDatabricks AI Searchへ公開し、承認済みの根拠だけに基づいて回答するエージェント型RAGを扱う。最初に完成形を示し、その後、**PoC、本番導入、本番導入後**の順で、各段階に必要な設計と完全なコードを説明する。用語を後から検索する場合は第8章の索引を参照する。
 
 ## 1. システム全体像
 
@@ -12,22 +12,11 @@
 
 **文書の取込と公開は別処理**である。Bronze／Silverへ保存されても、審査済みVersionがManifestの公開Version Pointerへ設定されるまではGold Current、AI Search、RAG Agentから参照できない。
 
-```mermaid
-flowchart TD
-    A["文書を仮登録"] --> B["原文書をStagingへUpload"]
-    B --> C["拡張子・Size・Malware・署名を事前検査"]
-    C --> D["Manifestへdraft登録"]
-    D --> E["監視対象Volumeへ配置"]
-    E --> F["Bronzeへ取込"]
-    F --> G["Parse・Prep・Chunk生成"]
-    G --> H["Version審査"]
-    H --> I["公開Version Pointerを切替"]
-    I --> J["Gold Current"]
-    J --> K["Search Sync Table"]
-    K --> L["AI Search"]
-    L --> M["RAG Agent"]
-    M --> N["Citation付き回答または回答拒否"]
-```
+1. 文書を仮登録し、原文書をStagingへUploadする。
+2. 拡張子、Size、Malware、署名を検査し、合格した文書だけをDocument Manifestへdraft登録する。
+3. 監視対象Volumeへ配置し、Bronze、Parse／Prep Attempt、Silver Chunkの順に履歴を作る。
+4. 審査済みVersionを公開Version Pointerへ設定し、Gold CurrentとSearch Sync Tableへ反映する。
+5. AI Searchが公開ChunkをIndex化し、RAG AgentがCitation付き回答または回答拒否を返す。
 
 ### 1.3 データと公開状態の分離
 
@@ -72,24 +61,25 @@ flowchart TD
     RELEASE --> AGENT
 ```
 
-### 1.6 基本用語
+### 1.6 後続章を読むための最小用語
 
-| 用語 | 定義 |
+第1章では、完成形のデータフローを理解するために必要な用語だけを定義する。MLflowの評価機能、監視機能、運用Workflowなどは、実際に構築する章で役割と物理的実体を説明する。
+
+| 用語 | この章で押さえる意味 |
 | --- | --- |
-| Manifest | 論理文書の現在状態、最新管理属性、公開Version Pointerを保持する管理台帳。 |
-| 論理文書 | 改訂をまたいで同一と扱う文書。不変の`document_id`で識別する。 |
-| 文書Version | 原文内容単位の版。`document_version_id`で識別する。 |
-| 公開Version Pointer | Manifestの`approved_document_version_id`。現在公開してよいVersionを指す。 |
-| Attempt Dataset | AI Functionの結果とErrorを一度だけ物理保持するDataset。 |
-| Reconciliation | Volume、Manifest、Gold、Indexの差分を検出する定期照合。 |
-| Service Principal | JobやService用の非人間Identity。 |
-| `run_as` | 作成済みService PrincipalをJob／Pipeline実行主体に指定するDAB設定。 |
-| Assessment | TraceまたはSpanへ付与する評価データの総称。実績を評価するFeedbackと、正解値を表すExpectationを含む。PoCから利用する。 |
-| Feedback | 実際の回答、検索結果、Agent経路がどの程度よかったかを表すAssessment。Code、LLM Judge、人間のいずれも作成できる。 |
-| Expectation | 期待回答、期待文書、期待Chunk、期待拒否など「何が起きるべきか」を表す人間定義の正解値。 |
-| Scorer | Trace、入力、出力、ExpectationからFeedbackを生成する評価器。決定論的Code ScorerとLLM Judgeを用途別に使い分ける。 |
-| Judge Alignment | 同じ名前のJudge Feedbackと人間Feedbackを使い、JudgeのInstructionsや例示を人間基準へ適応させる処理。基盤LLMのWeight更新ではない。 |
-| Production Monitoring | 本番TraceをSamplingし、登録済みScorer／Judgeで継続評価するMLflow機能。本番導入前に設定・Dry Runする。 |
+| 論理文書 | 改訂をまたいで同じ文書として扱う単位。不変の`document_id`で識別する。 |
+| 文書Version | 原文内容ごとの版。内容から決まる`document_version_id`で識別する。 |
+| Document Manifest | 論理文書の管理属性と公開Version Pointerを保持するUnity Catalog上の管理用Delta Table。 |
+| 公開Version Pointer | 現在公開してよい文書Versionを指す`approved_document_version_id`。 |
+| Bronze／Silver／Gold | 取込履歴、処理済み履歴、現在公開してよいデータを分離する三層構成。 |
+| Attempt Dataset | AI Functionの結果とErrorを一度だけ物理保持し、成功表と失敗表へ再計算なしで分岐する中間Dataset。 |
+| RAG Release | Code、Prompt、Model Route、Index、Corpus Snapshot、評価器を一体として固定した実行構成。 |
+
+#### 1.6.1 本資料の読み方
+
+後続章はPoC、本番導入、本番導入後の順に読む。各Serviceや用語は、必要になる箇所で「目的、物理的実体、実装、実行結果、確認方法」の順に説明する。網羅的な定義を後から確認したい場合は、第8章の用語索引を参照する。
+
+機能StatusとAPI前提は2026年8月15日時点のDatabricks／MLflow公式資料に基づく。Beta、Public Preview、ExperimentalはRuntime更新やRegion差の影響を受けるため、各Deploy前に第7章の公式LinkとStaging Smoke Testで再確認する。
 
 ## 2. 三段階の導入ロードマップ
 
@@ -109,8 +99,8 @@ flowchart TD
 
 | 段階 | 開始前に構築する機能 | 実施中の監視・運用 | 結果の分析・改善 | 完了・移行判断 |
 | --- | --- | --- | --- | --- |
-| PoC時 | Lakeflow Medallion、AI Search、RAG、Trace、EvaluationDataset、Scorer、Assessment最小契約 | Pipeline Run、Error、件数、Index同期、Trace、限定Testerの実質問をRunごとに確認 | Component別・Slice別に失敗を分類し、固定Datasetで1要素ずつ比較 | KPI、Risk、Cost、Latency、本番化GapをEvidenceとしてGo／No-Goを決める |
-| 本番導入／Pilot時 | Manifest、SP職務分離、Training／Holdout、Release Gate、正式Assessment、Monitoring、Alert、Runbook、Rollback | Dry Run後、Pilotで文書公開、Pipeline、Agent、Model、ACL、品質、Costを監視 | 障害試験とPilot結果から閾値、手順、利用Scopeを見直す | Release継続、Rollback、No-Go、利用範囲拡大を責任者が承認する |
+| PoC時 | Model Service、明示Experiment、Prompt Registry、固定EvaluationDataset、Lakeflow Medallion、AI Search、RAG、Trace、Scorer、Assessment最小契約 | Smoke Test後、Pipeline Run、Error、件数、Index同期、Trace、限定Testerの実質問をRunごとに確認 | Component別・Slice別に失敗を分類し、固定Datasetで1要素ずつ比較 | KPI、Risk、Cost、Latency、本番化GapをEvidenceとしてGo／No-Goを決める |
+| 本番導入／Pilot時 | 3 Experiment、UC Trace、Manifest、SP職務分離、Training／Holdout、Release Gate、正式Assessment、Monitoring、Alert、Runbook、Rollback | 本番PreflightとDry Run後、Pilotで文書公開、Pipeline、Agent、Model、ACL、品質、Costを監視 | 障害試験とPilot結果から閾値、手順、利用Scopeを見直す | Release継続、Rollback、No-Go、利用範囲拡大を責任者が承認する |
 | 本番導入後 | Review Workflow、Dataset同期、改善Job、Judge Alignment、Canary／A-BをEvidenceに応じて高度化 | 定常監視、Alert対応、専門家Review、Assessment、Release Drift確認 | 原因別Backlogへ配送し、Training探索、Holdout判定、段階Releaseを循環する | 品質Guardrail、Security、SLO、Cost、運用負荷に基づき採用・却下・追加調査を決める |
 
 ### 2.1 Architectureと手運用範囲の比較
@@ -150,7 +140,7 @@ flowchart LR
 | 文書登録 | 開発者がSampleを手動配置 | 登録Job、Scanner、Manifest draft | 利用実績に基づき検査・通知を改善 |
 | 公開判断 | 開発者がPoC Run Logで確認 | 登録者と承認者を分離しPointer切替 | Failure分析から審査基準を改善 |
 | Pipeline | 開発者が手動起動可能 | Ingestion SPで自動実行・監視 | Cost・処理時間・Error傾向を最適化 |
-| Prompt／Model | Prompt RegistryとModel Servingを使用 | Release ManifestでVersion／Route固定 | Optimization、Canary、A/Bで比較 |
+| Prompt／Model | Prompt RegistryとModel Serviceを使用 | Release ManifestでVersion／Destination Route固定 | Optimization、Canary、A/Bで比較 |
 | 品質確認 | `mlflow.genai.evaluate()`、Code Scorer、RAG Judge、手動Assessment | Training／Holdout、ACL等Golden Test、Judge対人間誤差、Release Gate、Monitoring Dry Run | 本番AssessmentでDatasetを育成し、必要時だけJudgeを再Alignment |
 | 人が残す判断 | PoC合否と本番化Gap | 文書承認、Release、障害対応 | Expectation、root cause、改善Release承認 |
 | MLflow運用 | Trace UIへ少数担当者がFeedback／Expectationを直接入力 | Assessment SchemaとReviewerを正式化し、MonitoringをPilot開始時に有効化 | Review Queueを定期配送し、滞留・Cost・品質を継続監視 |
@@ -187,7 +177,7 @@ PoCでもLakeflow Spark Declarative PipelinesでBronze／Silver／Goldを実装�
 
 ### 3.2 PoC開始前に構築する最小機能
 
-PoC開発でも、PromptをSourceコードへ埋め込むだけでは比較できないため、Prompt Registryへ判定・回答Promptを登録し、解決したPrompt VersionをTraceへ残す。生成ModelはDatabricks Model Serving Endpoint経由で呼び、Model名、Endpoint、Request IDをTraceへ記録する。Lakeflow SDP、AI Search、RAG、Streamlitはdev DABで再現可能にする。
+PoC開発でも、PromptをSourceコードへ埋め込むだけでは比較できないため、Prompt Registryへ判定・回答Promptを登録し、解決したPrompt VersionをTraceへ残す。生成ModelはUnity AI Gateway Model Service経由で呼び、Service FQN、実Route、Request IDをTraceへ記録する。Lakeflow SDP、AI Search、RAG、Streamlitはdev環境へ再現可能に配備する。
 
 Canary／A/BのTraffic Splitやオンライン最適化はPoC必須ではない。PoCでは候補PromptやModel Routeを**評価Runごとに固定してオフライン比較**すればよい。ただし、本番でCanaryを予定する場合は、Requestへ`candidate_id`、Prompt Version、Model Routeを記録できる契約だけ先に用意する。
 
@@ -200,6 +190,9 @@ internal-docs-rag-poc/
 ├── databricks.yml
 ├── resources/
 │   ├── poc_pipeline.yml
+│   ├── poc_mlflow.yml
+│   ├── poc_bootstrap_job.yml
+│   ├── poc_evaluation_job.yml
 │   ├── poc_monitoring_job.yml
 │   ├── poc_dashboard.yml
 │   └── poc_alerts.yml
@@ -214,6 +207,8 @@ internal-docs-rag-poc/
 │   ├── 05_gold_poc.sql
 │   ├── create_search_index.py
 │   ├── register_poc_prompt.py
+│   ├── seed_poc_evaluation_dataset.py
+│   ├── smoke_test_poc_workspace.py
 │   ├── rag_app.py
 │   ├── poc_scorers.py
 │   ├── evaluate_poc.py
@@ -231,15 +226,35 @@ internal-docs-rag-poc/
 
 #### 3.2.2 PoC BundleとPipeline
 
+Databricks Asset Bundles（DAB）は、Source、Workspace Resource、環境別変数をGit上の一つのDeploy単位として扱う仕組みである。このPoCでは`poc/databricks.yml`がBundleの入口となり、Pipeline、Job、Experiment、Dashboard、Alertの各YAMLを読み込む。`bundle deploy`はResource定義をWorkspaceへ反映し、`bundle run`は作成済みJobやPipelineを実行するため、Deploy成功だけを処理成功とはみなさない。
+
+文書の増分処理にはLakeflow Spark Declarative Pipelinesを使う。これは、SQLとPythonで定義したDataset間の依存関係を解決し、StreamingのCheckpoint、再実行、Event Logを管理するDatabricks Serviceである。本システムでは、VolumeからBronze、Parse／Prep Attempt、Silver、PoC Goldまでを一つのPipeline Resourceとして作成し、結果はPipelines UI、公開Event Log、Catalog Explorerで確認する。
+
+```mermaid
+flowchart TD
+    SRC["Unity Catalog Volume<br/>PoC文書"] --> PIPE["Lakeflow SDP<br/>poc_pipeline.yml"]
+    PIPE --> BRONZE["Bronze Streaming Table"]
+    BRONZE --> ATTEMPT["Parse・Prep Attempt Table"]
+    ATTEMPT --> SILVER["Silver Chunk履歴"]
+    SILVER --> GOLD["PoC Gold Current"]
+    GOLD --> INDEX["AI Search Index"]
+    PIPE --> EVENT["Pipeline UI・Event Log"]
+```
+
 `poc/databricks.yml`
 
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Trigger | `bundle validate/deploy`時にPoC Resource、Target、環境差分の入口を定義する |
+| 読取／更新 | CI／開発者が渡すBundle変数を読み、Included YAMLのResourceへ値を展開する |
+| 処理順序 | Target決定→変数解決→`resources/*.yml`読込→Resource Graph検証→Deploy |
+| 重要判定 | Model、Warehouse、Destination、Git Commit等の空値はPreflightで拒否し、個人DefaultへFallbackしない |
+| 正常／失敗／Retry | Deploy成功時は同TargetのResourceへ収束。Validate失敗時はWorkspace Resourceを変更しない |
+
 ```yaml
-# Bundle自体の識別情報を定義する。
 bundle:
-  # Databricks上で表示・参照するResource名を設定する。
   name: internal-docs-rag-poc
 
-# 別YAMLのResource定義をBundleへ読み込む。
 include:
   - resources/*.yml
 
@@ -269,22 +284,53 @@ variables:
   poc_reviewer_group:
     # 個人名や固定GroupをSourceへ書かず、環境ごとにDeploy変数で注入する。
     default: ""
-  # source_pathに関する設定値を定義する。
+  # PoC Experiment、Prompt、Datasetを作成・更新できる開発Groupを設定する。
+  poc_developer_group:
+    # Reviewerの読取権限と、開発者の更新権限を分離する。
+    default: ""
+  # PoC回答生成に使うUnity AI Gateway Model ServiceのFQNを設定する。
+  answer_model_service:
+    # Platform管理者が事前作成した`catalog.schema.service`をDeploy時に注入する。
+    default: ""
+  # PoC意味評価に使うJudge専用Model ServiceのFQNを設定する。
+  judge_model_service:
+    # Answer Modelと同じ値を暗黙利用せず、評価可能なModelを別指定する。
+    default: ""
+  # PoC RAGがQueryするAI Search Indexの完全修飾名を設定する。
+  poc_index_name:
+    # create_search_index.pyが作成しSmoke Test済みのIndex名を渡す。
+    default: ""
+  # PoC評価Caseを保存するMLflow EvaluationDataset名を設定する。
+  poc_evaluation_dataset:
+    # tests/poc_cases.jsonのSeed先とするUC 3階層名を指定する。
+    default: main.llmops_poc.internal_rag_poc_evaluation
+  # PipelineとEvaluation Runが固定するCorpus Versionを設定する。
+  poc_corpus_version:
+    default: "poc-corpus-v1"
+  # Evaluation対象ChunkのSchema Versionを設定する。
+  poc_chunk_schema_version:
+    default: "poc-v1"
+  # CIがBuild対象のクリーンなGit Commitを注入する。
+  git_commit:
+    default: ""
+  # Local／Job／AppのTracking先をDatabricksに固定する。
+  mlflow_tracking_uri:
+    default: databricks
+  # Prompt RegistryをUnity Catalog Backendへ固定する。
+  mlflow_registry_uri:
+    default: databricks-uc
+  # PoC Promptの可変development Alias URIを設定する。
+  poc_prompt_uri:
+    default: prompts:/main.llmops_poc.internal_rag_answer@development
   source_path:
-    # 変数未指定時に使う既定値を設定する。
     default: /Volumes/main/llmops_poc/source
-  # image_output_pathに関する設定値を定義する。
   image_output_path:
-    # 変数未指定時に使う既定値を設定する。
     default: /Volumes/main/llmops_poc/parsed_images
 
-# dev／staging／prodなどDeploy先環境を定義する。
 targets:
-  # devに関する設定値を定義する。
   dev:
     # 開発用Prefixや権限制御を適用するBundle Modeを設定する。
     mode: development
-    # 変数未指定時に使う既定値を設定する。
     default: true
     # Deploy先Workspace内の配置設定を定義する。
     workspace:
@@ -294,14 +340,19 @@ targets:
 
 `poc/resources/poc_pipeline.yml`
 
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Trigger | PoC Medallionの6 SourceとEvent Logを1つのLakeflow PipelineとしてDeploy／Runする |
+| 入出力 | Sample VolumeとPipeline Configurationを読み、Bronze、Attempt、Error、Silver、PoC Gold、Event Logを更新する |
+| 処理順序 | Source登録→LakeflowがDataset依存を解決→Serverless Update→Event Log公開 |
+| 重要判定 | SQL／Pythonは別Fileで混在させ、AI Function Attempt Datasetを物理保持して重複実行を防ぐ |
+| 正常／失敗／Retry | Checkpointから再開。失敗RunはEvent Logへ残り、成功済みVersionを再処理しない |
+
 ```yaml
-# Bundleが作成・更新するDatabricks Resourceを定義する。
 resources:
   # Lakeflow Spark Declarative Pipeline Resourceを定義する。
   pipelines:
-    # poc_document_pipelineに関する設定値を定義する。
     poc_document_pipeline:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-rag-poc
       # Pipelineの出力先Unity Catalog Catalogを設定する。
       catalog: ${var.catalog}
@@ -321,41 +372,24 @@ resources:
       development: true
       # Pipeline／Jobへ読み込むSource FileやLibraryを列挙する。
       libraries:
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/01_bronze.sql
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/01b_unique_versions.py
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/02_parse.sql
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/03_prep.sql
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/04_chunks_silver.sql
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/05_gold_poc.sql
       # Source Fileから参照するPipeline設定値を定義する。
       configuration:
-        # poc.source_pathに関する設定値を定義する。
         poc.source_path: ${var.source_path}
-        # poc.image_output_pathに関する設定値を定義する。
         poc.image_output_path: ${var.image_output_path}
-        # poc.parse_versionに関する設定値を定義する。
         poc.parse_version: "2.0"
-        # poc.prep_versionに関する設定値を定義する。
         poc.prep_version: "2.0"
-        # poc.chunk_schema_versionに関する設定値を定義する。
         poc.chunk_schema_version: "poc-v1"
 ```
 
@@ -363,9 +397,18 @@ PoCでは開発者Identityで実行してよいが、専用dev SchemaとVolume�
 
 #### 3.2.3 Bronzeと文書Version重複排除
 
+Streaming Tableは、到着したデータをCheckpoint付きで増分処理し、追記型履歴として保持するLakeflow Datasetである。ここでは`poc_documents_bronze`へ原文書の内容VersionとPreflight結果を保存し、処理済みFileを再実行のたびに全件読み直さない。後続のPython Datasetは`document_version_id`で重複を除き、同じ内容VersionへAI Functionを複数回実行しないための入口になる。
+
 以下の想定出力は処理のつながりを理解するための説明用データである。Hash、Timestamp、Binary、VARIANTは読みやすいよう省略・短縮しており、実環境の値や完全なSchema Dumpではない。
 
 `poc/src/01_bronze.sql`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Dataset | Volume Fileを`poc_documents_bronze`追記型Streaming Tableへ取り込むBronze入口 |
+| 変換順序 | Binary File読取→暫定論理ID／内容Version Hash→拡張子・Size Preflight→取込時刻付与 |
+| 重要判定 | Unsupported／Empty／Oversizeも履歴へ残すが、下流AI Functionへ渡さない |
+| Retry／後続 | Auto Loader Checkpointで既読Fileを管理し、`01b_unique_versions.py`が内容Versionを重複排除する |
 
 ```sql
 -- PoC Bronze層。Manifestは使わず、Sample Volumeだけを入力にする。
@@ -407,6 +450,13 @@ FROM STREAM read_files(
 `content`はBinaryのため省略している。1行目はParse対象、2行目は履歴には残るがAI Functionへ渡らない。
 
 `poc/src/01b_unique_versions.py`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Dataset | Bronze Streamを`document_version_id`単位で一意化し、Private Streaming Tableへ物理保持する |
+| 処理順序 | Bronze Stream読取→Stateful `dropDuplicates`→`poc_unique_versions`へ出力 |
+| 重要判定 | Pathではなく内容HashをKeyにし、再配置で高Cost AI Functionを再実行しない |
+| Retry／後続 | Checkpoint／Stateから再開し、`02_parse.sql`だけが一意Versionを読む |
 
 ```python
 """PoC Bronzeを文書Version単位でStreaming重複排除するLakeflow Source。
@@ -451,6 +501,13 @@ def poc_unique_versions() -> DataFrame:
 #### 3.2.4 Parse／Prep AttemptとError分岐
 
 `poc/src/02_parse.sql`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Dataset | ParseをVersionごとに一度だけ実行するPrivate Attemptと、成功／Errorの相互排他的出力を作る |
+| 処理順序 | Preflight合格行→`ai_parse_document`→Attempt物理保持→`error_status`で`poc_parsed`／`poc_parse_errors`へ分岐 |
+| 重要判定 | NULL、VARIANT NULL、Error配列をすべて失敗とし、Error VersionをPrepへ渡さない |
+| Retry／後続 | Attemptから再分岐できるためAI Functionを再呼出しせず、成功だけ`03_prep.sql`へ渡す |
 
 ```sql
 -- ai_parse_documentはこのAttempt Datasetだけで呼ぶ。
@@ -509,6 +566,13 @@ WHERE parsed_document IS NULL
 
 `poc/src/03_prep.sql`
 
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Dataset | Parse成功Versionへ`ai_prep_search`を一度だけ実行し、成功とQuarantineを分離する |
+| 処理順序 | `poc_parsed`→Prep Attempt物理保持→NULL／Error検査→`poc_prepared`／`poc_prep_errors` |
+| 重要判定 | Prep失敗をChunk展開へ流さず、Version、Processor Version、Errorを再試行用に保持する |
+| Retry／後続 | Attemptを再利用して重複課金を防ぎ、成功だけ`04_chunks_silver.sql`へ渡す |
+
 ```sql
 -- ai_prep_searchもこのAttempt Datasetだけで呼ぶ。
 -- 目的: ai_prep_searchの結果をVersionごとに一度だけ物理保持するPoC内部Attempt Table。
@@ -561,7 +625,16 @@ WHERE prepared_document IS NULL
 
 #### 3.2.5 Silver ChunkとPoC Gold
 
+Materialized Viewは、上流Tableから導出した現在値をLakeflowがRefreshするDatasetである。追記履歴を保持するStreaming Tableと異なり、PoC Goldでは各論理文書の最新成功Versionだけを現在の検索対象として見せるために使う。ただし、この「最新」はPoC限定であり、本番ではDocument Manifestの承認Pointer一致へ置き換える。
+
 `poc/src/04_chunks_silver.sql`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Dataset | Prepared VARIANTをChunk単位へ展開し、Version付きSilver履歴を追記する |
+| 処理順序 | `variant_explode`→Position補完→Chunk Version Hash→Embed／Retrieve本文とPage抽出 |
+| 重要判定 | `chunk_to_embed`と`chunk_to_retrieve`を別列で維持し、文書VersionとSchema Versionを失わない |
+| Retry／後続 | Streaming履歴として再開し、`05_gold_poc.sql`が論理文書ごとの最新成功Versionを選ぶ |
 
 ```sql
 -- PoC Silver層。chunk_to_embedは検索用、chunk_to_retrieveは回答Context用である。
@@ -605,6 +678,13 @@ FROM exploded;
 
 `poc/src/05_gold_poc.sql`
 
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Dataset | PoC限定で各論理文書の最新Parse／Prep成功Versionだけを検索公開するMaterialized View |
+| 処理順序 | Version別最終時刻集計→`row_number`で最新版選択→Silver ChunkへVersion Join |
+| 重要判定 | Parse／Prep失敗を除外するが承認を表さないため一般公開しない。本番ではManifest Pointer一致へ置換 |
+| Retry／後続 | Source変更時に再計算され、PoC AI Search IndexのSourceとなる |
+
 ```sql
 -- PoC Gold。Manifest審査はまだないため、各document_idの最新成功Versionを公開する。
 -- 一般利用へは公開せず、本番ではこのViewを承認Pointer一致条件へ置き換える。
@@ -645,9 +725,137 @@ WHERE latest.version_rank = 1;
 
 #### 3.2.6 PoC AI Search、RAG、評価
 
-PoCでは`poc_chunks_gold`から開発用Indexを1つ作る。Index作成は手動Jobでもよいが、設定はGitへ保存する。RAGはACLやRelease Manifestをまだ持たず、取得Chunkだけから回答し、Citationが不足する場合は拒否する。
+Databricks AI Searchは、Delta TableをVector／Hybrid検索用Indexへ同期し、Metadata Filter付きでChunkを取得するServiceである。PoCでは`poc_chunks_gold`から開発用Delta Sync Indexを1つ作り、Vector Search Endpoint上で実行する。Endpointは検索Compute、Indexは`chunk_version_id`をPrimary Keyとする検索資産であり、作成状態、同期結果、最小検索はVector Search UIとSmoke Testで確認する。
+
+Index作成は手動Jobでもよいが、設定はGitへ保存する。RAGはACLやRelease Manifestをまだ持たず、取得Chunkだけから回答し、Citationが不足する場合は拒否する。
+
+##### 3.2.6.1 PoC Workspace・MLflow Bootstrap
+
+PoCでもApplication Codeの前に、Model、Experiment、Prompt Schema、EvaluationDataset Schema、SQL Warehouse、AI Search Endpointを準備する。ただし、UC Trace Storage、Production Monitoring、複雑なLabeling Session、本番と同じSP職務分離はPoC必須としない。
+
+MLflow Experimentは評価処理そのものではなく、Run、Trace、Assessment、Datasetを同じ管理単位として閲覧するWorkspace Resourceである。PoCでは`/Shared/llmops/${bundle.target}/internal-rag-poc`をDABで作成し、そのExperiment IDをRAG、Evaluation Job、Smoke Testへ明示的に渡す。Default Experimentへ誤保存しないことをSmoke TestとMLflow Experiment UIで確認する。
+
+**Model呼出しの標準方式**
+
+本資料の新規標準は、Platform管理者が作成した**Unity AI Gateway Model Service（Unity Catalog上の`catalog.schema.service`というSecurable）**をApplicationが参照する方式とする。PoC BundleはModelを提供するResourceを作成せず、完全修飾名を変数で受け取る。System-provided Model APIは即時利用できるが、金融機関向けでは用途別の権限、Rate Limit、Fallback、Cost Attributionを管理できる組織共通Model Serviceを推奨する。
+
+| 用途 | Bundle変数／互換Environment Variable | 物理的な実体 | 利用理由 | PoC時の制御 |
+| --- | --- | --- | --- | --- |
+| Answer Model | `answer_model_service`／`POC_MODEL_ENDPOINT` | 組織共通Answer Model Service。値はFQN | RAG回答を生成する | `temperature=0`、QPM／TPM上限、Fallbackなしまたは1系統 |
+| Judge Model | `judge_model_service`／`POC_JUDGE_MODEL` | 組織共通Judge Model Service。値は`databricks:/<service-or-endpoint>`としてScorerへ渡す | 回答Modelと独立した意味評価 | 評価時のみ呼び、Cost上限を別管理 |
+| Prompt Optimization Reflection | PoCでは未設定 | 本番後のReflection専用Model Service | PoC範囲にOptimizationを入れない | 未使用 |
+| Judge Alignment Reflection | PoCでは未設定 | 本番後のAlignment専用Model Service | Human Label不足のPoCで過剰設計しない | 未使用 |
+
+`POC_MODEL_ENDPOINT`という既存名は互換性のため維持するが、値はLegacy Serving Endpoint名ではなくModel Service FQNである。新規Codeでは`answer_model_service`を正式名とし、互換Environment VariableへはJob LauncherまたはApp設定が明示的に同じ値を渡す。
+
+| Resource／設定 | 機能概要 | 物理的な実体 | 初めて必要 | 作成・設定主体 | 作成方法 | 利用主体／必要権限 | 設定値の受渡し／確認方法 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Answer Model Service | 統一APIで回答Modelを提供 | UC Model Service | PoC前 | Platform管理者 | AI Gateway UIまたはUC REST API | PoC実行主体に`USE CATALOG`、`USE SCHEMA`、`EXECUTE` | FQNを`answer_model_service`→`POC_MODEL_ENDPOINT`へ渡し、最小推論と200 Responseを確認 |
+| Judge Model Service | 意味評価用Modelを提供 | UC Model Service | PoC評価前 | Platform管理者、Quality Owner | AI Gateway UIまたはUC REST API | PoC Quality実行主体に`EXECUTE` | FQN／Endpoint URIを`POC_JUDGE_MODEL`へ渡しJudge最小呼出しを確認 |
+| PoC MLflow Experiment | Trace、Evaluation Run、Assessment、Datasetの管理単位 | Workspace Experiment `/Shared/llmops/${bundle.target}/internal-rag-poc` | PoC前 | PoC DAB | DAB `experiments` Resource | Developerに`CAN_EDIT`、Reviewerに`CAN_READ` | `${resources.experiments.poc_experiment.id}`をJob Parameter／Local Envに渡し、Trace UIでIDを確認 |
+| PoC Trace保存 | 小規模TraceをExperiment内で保存 | Experiment既定Storage | PoC前 | MLflow | Experiment作成時の既定 | `CAN_EDIT`で書込、`CAN_READ`で閲覧 | Smoke Test TraceのExperiment IDを確認。UC Traceへの移行は本番化Gap |
+| Prompt Registry Schema | Prompt Version・AliasをUCで管理 | `main.llmops_poc` SchemaのPrompt Resource | PoC前 | UC管理者 | SQL Grant／Catalog Explorer | 登録者に`CREATE FUNCTION`、`EXECUTE`、`MANAGE`、Runtimeに`EXECUTE` | `MLFLOW_REGISTRY_URI=databricks-uc`、Prompt FQN、Prompts UIでVersion／Aliasを確認 |
+| PoC EvaluationDataset | 固定PoC Caseの評価正本 | UC Table `main.llmops_poc.internal_rag_poc_evaluation` | PoC評価前 | PoC Bootstrap Job | MLflow SDK `create_dataset()`／`merge_records()` | Bootstrapに`CREATE TABLE`、Evaluationに`SELECT` | Dataset FQNをJob Parameterに渡し、Dataset UIで`case_id`と件数を確認 |
+| SQL Warehouse | Dashboard、Alert、Smoke Test SQLを実行 | Warehouse Resource | PoC前 | Workspace管理者 | UI、Terraform、REST API | PoC Job／Dashboardに`CAN USE` | `sql_warehouse_id`としてDeployしQuery Historyを確認 |
+| AI Search Endpoint／Index | Gold ChunkをHybrid Search | Endpoint／Delta Sync Index | PoC RAG前 | PoC開発者 | SDK、UI | PoC実行主体にQuery権限 | `poc_index_name`→`POC_INDEX_NAME`、Index `ONLINE`とGolden Queryを確認 |
+| System Destination | Job／Alertの通知先 | Destination ID | PoC運用前 | Workspace Admin | Admin UI | Job／Alertが参照 | IDを`ops_system_destination_id`で渡し、試験通知を確認 |
+
+PoC Prompt Schemaの権限は次のように分ける。`MANAGE`はAlias変更や権限管理を行うPrompt Managerに限定し、PoC Runtimeは`USE CATALOG`、`USE SCHEMA`、`EXECUTE`だけとする。PoC担当者に本番Schemaの`MANAGE`を付与しない。
+
+```sql
+-- UC管理者が一度だけ実行するPoC Schema Grantの例。
+GRANT USE CATALOG ON CATALOG main TO `<poc-developer-group>`;
+GRANT USE SCHEMA ON SCHEMA main.llmops_poc TO `<poc-developer-group>`;
+GRANT CREATE FUNCTION, EXECUTE ON SCHEMA main.llmops_poc TO `<poc-developer-group>`;
+GRANT MANAGE ON SCHEMA main.llmops_poc TO `<poc-prompt-manager-group>`;
+GRANT USE CATALOG ON CATALOG main TO `<poc-runtime-principal>`;
+GRANT USE SCHEMA ON SCHEMA main.llmops_poc TO `<poc-runtime-principal>`;
+GRANT EXECUTE ON SCHEMA main.llmops_poc TO `<poc-runtime-principal>`;
+GRANT CREATE TABLE ON SCHEMA main.llmops_poc TO `<poc-bootstrap-principal>`;
+```
+
+`poc/resources/poc_mlflow.yml`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | PoC専用Experimentを一度だけ作成し、Developer／Reviewer権限とExperiment IDの受渡し元を定義する |
+| 呼出元／Trigger | `databricks bundle deploy -t <target>` |
+| 読取／更新 | Bundle Target／Group変数を読み、Workspace Experimentを作成・更新する |
+| 主な処理順序 | Target解決→Experiment Path確定→ACL適用→Resource IDをBootstrap／Evaluation Jobへ公開 |
+| 重要な判定 | PoCではUC Trace Locationを設定しない。同PathのExperimentをSDKで重複作成しない |
+| 正常／失敗／Retry | Deploy成功時は同じExperiment IDを維持。ACL適用失敗時はBootstrap Jobを起動しない |
+| 後続処理 | `poc_bootstrap_job`、`poc_evaluation_job`、Trace記録 |
+
+```yaml
+# PoCのTrace、Evaluation Run、Assessment、DatasetをひとつのUI入口で確認するExperimentを定義する。
+resources:
+  experiments:
+    poc_experiment:
+      # TargetごとにPathを分け、devとstagingのTraceを混ぜない。
+      name: /Shared/llmops/${bundle.target}/internal-rag-poc
+      permissions:
+        # DeveloperはTrace、Evaluation Run、Assessmentを書き込む。
+        - level: CAN_EDIT
+          group_name: ${var.poc_developer_group}
+        # Reviewerは結果を閲覧するがExperiment設定は変更しない。
+        - level: CAN_READ
+          group_name: ${var.poc_reviewer_group}
+```
+
+**想定デプロイ結果**
+
+| Experiment Path | Resource IDの参照 | Trace Storage |
+| --- | --- | --- |
+| `/Shared/llmops/dev/internal-rag-poc` | `${resources.experiments.poc_experiment.id}` | PoCはExperiment既定Storage |
+
+##### 3.2.6.2 PoC設定値の受渡し
+
+DABのServerless Jobに存在しない汎用`environment_variables` Fieldを作らない。JobはDAB Resource参照とBundle変数をTask ParameterでPythonへ渡し、Pythonは`argparse`で必須値を受け取る。Local実行とDatabricks AppsだけはEnvironment Variableを使い、未設定時に個人Experiment、Default Model、Default SchemaへFallbackしない。
+
+| 論理設定 | DAB変数／Resource | Job Parameter | Local／App Environment Variable | 値の作成者 |
+| --- | --- | --- | --- | --- |
+| PoC Experiment ID | `${resources.experiments.poc_experiment.id}` | `--experiment-id` | `MLFLOW_POC_EXPERIMENT_ID`／互換`MLFLOW_EXPERIMENT_ID` | DAB Deploy |
+| Tracking URI | `mlflow_tracking_uri` | `--tracking-uri` | `MLFLOW_TRACKING_URI` | Platform Policy／DAB |
+| Registry URI | `mlflow_registry_uri` | `--registry-uri` | `MLFLOW_REGISTRY_URI` | Platform Policy／DAB |
+| Answer Model | `answer_model_service` | `--answer-model-service` | `POC_MODEL_ENDPOINT` | Platform管理者 |
+| Judge Model | `judge_model_service` | `--judge-model` | `POC_JUDGE_MODEL` | Platform／Quality Owner |
+| AI Search Index | `poc_index_name` | `--index-name` | `POC_INDEX_NAME` | `create_search_index.py` |
+| EvaluationDataset | `poc_evaluation_dataset` | `--dataset-name` | `POC_EVALUATION_DATASET` | PoC Bootstrap Job |
+| Prompt URI | `poc_prompt_uri` | `--prompt-uri` | `POC_PROMPT_URI` | `register_poc_prompt.py` |
+| Corpus Version | `poc_corpus_version` | `--corpus-version` | `POC_CORPUS_VERSION` | PoC Release担当 |
+| Chunk Schema | `poc_chunk_schema_version` | `--chunk-schema-version` | `POC_CHUNK_SCHEMA_VERSION` | Pipeline Source |
+| Git Commit | `git_commit` | `--git-commit` | `GIT_COMMIT` | CI |
+
+```mermaid
+flowchart TD
+    ADMIN["Platform Bootstrap<br/>Model Service・Warehouse・Grant"] --> CICD["CI/CD Secret・Variable"]
+    CICD --> DAB["poc/databricks.yml<br/>Bundle Variable"]
+    DAB --> EXP["DAB Experiment Resource ID"]
+    DAB --> JOB["Job Task Parameter"]
+    EXP --> JOB
+    JOB --> PY["argparseで必須値を取得"]
+    DAB --> APP["app.yaml env／Resource Binding"]
+    APP --> ENV["Environment Variable"]
+    ENV --> PY
+    PY --> TRACE["Trace・Run・Resource Call"]
+```
+
+##### 3.2.6.3 PoC PromptをPrompt Registryへ登録する
+
+Prompt Registryは、Prompt Templateを名前、変更不能なVersion、可変Aliasで管理するMLflow Resourceである。このシステムではUnity Catalog上の`main.llmops_poc.internal_rag_answer`を物理的なPrompt名とし、PoC用`development` Aliasだけを更新する。実行再現性を保つため、RAGはAliasを解決した後のVersion URIをTraceへ記録する。
 
 `poc/src/register_poc_prompt.py`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | Answer PromptをUC Prompt Registryへ不変Versionとして登録し、PoC専用`development` Aliasだけを更新する |
+| 呼出元／Trigger | PoC Bootstrap Job、Prompt変更の承認後 |
+| 読取対象 | Git管理Template、`--tracking-uri`、`--registry-uri` |
+| 更新対象 | `main.llmops_poc.internal_rag_answer`の新Versionと`development` Alias |
+| 主な処理順序 | Tracking／Registry Backend固定→Prompt Version登録→登録Version確認→PoC Alias切替→不変URI出力 |
+| 重要な判定 | 本番Aliasを変更しない。RuntimeはAliasだけでなく解決済みVersionをTraceへ保存する |
+| 正常／失敗／Retry | 正常時は新VersionとURIを出力。登録失敗時はAliasを変更しない。Retryは別Versionを作るため、同Template重複の採用可否をRun Logで判断 |
+| Trace／後続 | `rag_app.py`と`evaluate_poc.py`がPromptをLoadし、Trace／Evaluation Runに解決Versionを記録 |
 
 ```python
 """PoC回答PromptをMLflow Prompt Registryへ登録するModule。
@@ -655,6 +863,8 @@ PoCでは`poc_chunks_gold`から開発用Indexを1つ作る。Index作成は手�
 開発者がPoC初期化時とPrompt変更時に実行する。Prompt Versionと`development`
 Aliasを出力し、本番Aliasの切替やModel Weightの更新は行わない。
 """
+
+import argparse
 
 import mlflow
 
@@ -672,8 +882,19 @@ TEMPLATE = """
 """.strip()
 
 
+def parse_args() -> argparse.Namespace:
+    """MLflow BackendをDefaultに任せずJob Parameterから取得する。"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tracking-uri", required=True)
+    parser.add_argument("--registry-uri", required=True)
+    return parser.parse_args()
+
+
 def main() -> None:
     """Promptを新Versionとして登録し、PoC用Aliasを更新する。"""
+    args = parse_args()
+    mlflow.set_tracking_uri(args.tracking_uri)
+    mlflow.set_registry_uri(args.registry_uri)
     prompt = mlflow.genai.register_prompt(
         name=PROMPT_NAME,
         template=TEMPLATE,
@@ -702,9 +923,436 @@ if __name__ == "__main__":
 
 再実行するとVersion `3`を上書きせず、新しいVersion `4`を作成して`development` Aliasだけを更新する。
 
+##### 3.2.6.4 Seed FixtureをPoC EvaluationDatasetへ反映する
+
+EvaluationDatasetは、評価InputとExpectationをUnity Catalogで保持し、MLflow ExperimentからVersionとDigestを追跡できる評価ケースの正本である。このPoCでは`main.llmops_poc.internal_rag_poc_evaluation`というUC Tableが物理的な実体になる。
+
+`tests/poc_cases.json`はEvaluationDatasetそのものではなく、GitでReviewする初期Seed Fixtureである。PoC Bootstrap JobがJSONをEvaluationDatasetへ冪等反映し、`evaluate_poc.py`はJSONを直接読まずDatasetを取得する。
+
+`poc/src/seed_poc_evaluation_dataset.py`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | Git管理Seedを`inputs`／`expectations`／`tags`契約へ変換し、PoC Experimentに関連付くUC EvaluationDatasetへ反映する |
+| 呼出元／Trigger | PoC Bootstrap Job、Seed Version変更時 |
+| 読取対象 | `tests/poc_cases.json`、Experiment ID、Dataset FQN、Seed Version |
+| 更新対象 | `main.llmops_poc.internal_rag_poc_evaluation` |
+| 主な処理順序 | MLflow Backend／Experiment固定→Dataset取得または作成→JSON Validation→Case正規化→`case_id+seed_version`で既存確認→未反映RecordだけMerge→件数確認 |
+| 重要な判定 | Case ID、質問、期待拒否を必須とし、機密情報はSeedに含めない。既存Versionを上書きしない |
+| 正常／失敗／Retry | 正常時はDataset名・Seed Version・追加数・総件数を出力。失敗時はEvaluationを開始しない。Retryは反映済みKeyをSkip |
+| 後続処理 | `smoke_test_poc_workspace.py`が件数を確認し、`evaluate_poc.py`が`to_df()`を評価する |
+
+```python
+"""Git管理Seed FixtureをPoC MLflow EvaluationDatasetへ冪等反映する。"""
+
+import argparse
+import json
+from pathlib import Path
+
+import mlflow
+from mlflow.exceptions import MlflowException
+from mlflow.genai.datasets import create_dataset, get_dataset
+
+
+def parse_args() -> argparse.Namespace:
+    """Dataset、Experiment、Seedの全参照をJob Parameterから取得する。"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tracking-uri", required=True)
+    parser.add_argument("--registry-uri", required=True)
+    parser.add_argument("--experiment-id", required=True)
+    parser.add_argument("--dataset-name", required=True)
+    parser.add_argument("--seed-path", required=True)
+    parser.add_argument("--seed-version", required=True)
+    return parser.parse_args()
+
+
+def get_or_create_dataset(dataset_name: str):
+    """Datasetがない場合だけ作成し、他Errorを握りつぶさない。"""
+    try:
+        return get_dataset(name=dataset_name)
+    except MlflowException as error:
+        if error.error_code != "RESOURCE_DOES_NOT_EXIST":
+            raise
+        return create_dataset(name=dataset_name)
+
+
+def normalize_cases(seed_path: str, seed_version: str) -> list[dict]:
+    """SeedをMLflowの公式`inputs`／`expectations`／`tags`形式へ変換する。"""
+    cases = json.loads(Path(seed_path).read_text(encoding="utf-8"))
+    records = []
+    for case in cases:
+        required = {"case_id", "question", "expected_response", "expected_refused"}
+        missing = required - set(case)
+        if missing:
+            raise ValueError(
+                f"case={case.get('case_id')} missing fields={sorted(missing)}"
+            )
+        records.append(
+            {
+                "inputs": {"question": case["question"]},
+                "expectations": {
+                    "expected_response": case["expected_response"],
+                    "expected_document_ids": case.get("expected_document_ids", []),
+                    "expected_chunk_version_ids": case.get(
+                        "expected_chunk_version_ids", []
+                    ),
+                    "expected_refused": case["expected_refused"],
+                    "expected_refusal_reason": case.get("expected_refusal_reason"),
+                },
+                "tags": {
+                    "case_id": case["case_id"],
+                    "category": case.get("category", "general"),
+                    "seed_version": seed_version,
+                },
+            }
+        )
+    return records
+
+
+def record_key(tags: dict) -> str:
+    """Case IDとSeed Versionを冪等反映のKeyにする。"""
+    return f"{tags['case_id']}:{tags['seed_version']}"
+
+
+def main() -> None:
+    """ExperimentとDatasetを固定し、未反映SeedだけをMergeする。"""
+    args = parse_args()
+    mlflow.set_tracking_uri(args.tracking_uri)
+    mlflow.set_registry_uri(args.registry_uri)
+    mlflow.set_experiment(experiment_id=args.experiment_id)
+    dataset = get_or_create_dataset(args.dataset_name)
+    records = normalize_cases(args.seed_path, args.seed_version)
+
+    existing = dataset.to_df()
+    existing_keys = {
+        record_key(tags)
+        for tags in existing.get("tags", [])
+        if isinstance(tags, dict)
+        and tags.get("case_id")
+        and tags.get("seed_version")
+    }
+    pending = [
+        record for record in records if record_key(record["tags"]) not in existing_keys
+    ]
+    if pending:
+        dataset = dataset.merge_records(pending)
+    print(
+        f"dataset={args.dataset_name}, seed_version={args.seed_version}, "
+        f"inserted={len(pending)}, total={len(dataset.to_df())}"
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**想定出力サンプル**
+
+```text
+dataset=main.llmops_poc.internal_rag_poc_evaluation, seed_version=poc-seed-v1, inserted=12, total=12
+```
+
+同じJobを再実行すると`inserted=0, total=12`となり、Seedを重複登録しない。
+
+##### 3.2.6.5 PoC Bootstrap・Evaluation Jobを定義する
+
+Lakeflow Jobsは、複数Taskの依存順序、実行Parameter、Retry、Schedule、通知を管理するDatabricks Serviceである。ここではPrompt登録、Dataset Seed、Smoke Test、Evaluationを別Taskとして定義し、前段が失敗した場合は後続を起動しない。Jobの作成結果はJobs UI、実行結果はRun／Task RunとMLflow Experimentで確認する。
+
+`poc/resources/poc_bootstrap_job.yml`と`poc/resources/poc_evaluation_job.yml`は、DAB Resource IDとBundle変数をPythonの必須Parameterへ渡す接続層である。DeployはResourceを作るだけで、Prompt登録、Dataset Seed、Smoke Test、EvaluationはJob Runで実行する。
+
+`poc/resources/poc_bootstrap_job.yml`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Trigger | Prompt登録、Dataset Seed、Workspace Smoke Testを依存順に実行するPoC初期化Jobを定義する |
+| 変数解決 | DAB Experiment ID、Model Service、Prompt、Dataset、Index、Warehouseを各Taskの必須Parameterへ展開する |
+| 処理順序 | Prompt登録→Dataset Seed→Smoke Test。前Task失敗時は後続を起動しない |
+| 重要判定 | DeployとRunを分離し、Resource定義成功だけでPoC準備完了とみなさない |
+| 正常／失敗／Retry | SeedはKeyで冪等、Smoke TraceはTest Tagで識別。失敗時はEvaluation Jobを起動しない |
+
+```yaml
+# Prompt、EvaluationDataset、Workspace依存Resourceをこの順で検証するBootstrap Job。
+resources:
+  jobs:
+    poc_bootstrap_job:
+      name: internal-rag-poc-bootstrap
+      tasks:
+        - task_key: register_prompt
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/register_poc_prompt.py
+            parameters:
+              - --tracking-uri
+              - ${var.mlflow_tracking_uri}
+              - --registry-uri
+              - ${var.mlflow_registry_uri}
+        - task_key: seed_evaluation_dataset
+          environment_key: default
+          depends_on:
+            - task_key: register_prompt
+          spark_python_task:
+            python_file: ../src/seed_poc_evaluation_dataset.py
+            parameters:
+              - --tracking-uri
+              - ${var.mlflow_tracking_uri}
+              - --registry-uri
+              - ${var.mlflow_registry_uri}
+              - --experiment-id
+              - ${resources.experiments.poc_experiment.id}
+              - --dataset-name
+              - ${var.poc_evaluation_dataset}
+              - --seed-path
+              - ../tests/poc_cases.json
+              - --seed-version
+              - poc-seed-v1
+        - task_key: smoke_test
+          environment_key: default
+          depends_on:
+            - task_key: seed_evaluation_dataset
+          spark_python_task:
+            python_file: ../src/smoke_test_poc_workspace.py
+            parameters:
+              - --experiment-id
+              - ${resources.experiments.poc_experiment.id}
+              - --tracking-uri
+              - ${var.mlflow_tracking_uri}
+              - --registry-uri
+              - ${var.mlflow_registry_uri}
+              - --prompt-uri
+              - ${var.poc_prompt_uri}
+              - --dataset-name
+              - ${var.poc_evaluation_dataset}
+              - --answer-model-service
+              - ${var.answer_model_service}
+              - --judge-model
+              - ${var.judge_model_service}
+              - --index-name
+              - ${var.poc_index_name}
+              - --sql-warehouse-id
+              - ${var.sql_warehouse_id}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - mlflow[databricks]>=3.14.0
+              - databricks-openai
+              - databricks-ai-search
+```
+
+`poc/resources/poc_evaluation_job.yml`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Trigger | Bootstrap合格後に固定EvaluationDatasetと固定Resource VersionでPoC評価を実行するJobを定義する |
+| 変数解決 | DAB Experiment IDとBundle変数をTask Parameterへ展開し、Pythonの必須`argparse`へ渡す |
+| 処理順序 | Evaluation Task起動→Dataset取得→RAG／Scorer実行→Evaluation Run保存 |
+| 重要判定 | Answer／Judge Modelを別Parameterにし、Git、Prompt、Index、Corpus、Chunk Versionを空にしない |
+| 正常／失敗／Retry | 成功Runを比較Evidence化。失敗時はGo判定に使わず、Retryは新Runとして履歴を残す |
+
+```yaml
+# Bootstrap合格後に固定EvaluationDatasetと固定Versionで評価するJob。
+resources:
+  jobs:
+    poc_evaluation_job:
+      name: internal-rag-poc-evaluation
+      tasks:
+        - task_key: evaluate
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/evaluate_poc.py
+            parameters:
+              - --experiment-id
+              - ${resources.experiments.poc_experiment.id}
+              - --tracking-uri
+              - ${var.mlflow_tracking_uri}
+              - --registry-uri
+              - ${var.mlflow_registry_uri}
+              - --dataset-name
+              - ${var.poc_evaluation_dataset}
+              - --prompt-uri
+              - ${var.poc_prompt_uri}
+              - --index-name
+              - ${var.poc_index_name}
+              - --answer-model-service
+              - ${var.answer_model_service}
+              - --judge-model
+              - ${var.judge_model_service}
+              - --corpus-version
+              - ${var.poc_corpus_version}
+              - --chunk-schema-version
+              - ${var.poc_chunk_schema_version}
+              - --git-commit
+              - ${var.git_commit}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - mlflow[databricks]>=3.14.0
+              - databricks-openai
+              - databricks-ai-search
+```
+
+各Taskの`environment_key: default`は、Job下の`environments`で固定したMLflow／AI Search Clientを実際に使うための参照である。Deploy時はResourceとParameterだけが更新され、Pythonの処理は`databricks bundle run`またはJobs Scheduleでのみ実行される。
+
+**処理順序**
+
+1. DAB DeployでExperimentと2 Jobを作成する。
+2. Bootstrap JobがPrompt Versionを登録する。Promptが解決できない状態でDataset・RAG検証へ進まない。
+3. Seed JobがExperimentを固定し、EvaluationDatasetを作成・Mergeする。
+4. Smoke TestがModel、Experiment／Trace、Prompt、Dataset、Assessment、Index、Warehouseを検証する。
+5. 全項目が合格した後だけEvaluation Jobを起動する。
+
+##### 3.2.6.6 PoC Workspace Smoke Testを実行する
+
+`poc/src/smoke_test_poc_workspace.py`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | Applicationが必要とするResourceの存在、権限、最小Read／Write／InferenceをPoC開始前に検証する |
+| 呼出元／Trigger | Bootstrap Jobの最終Task、Resource／Grant／Model Route変更時 |
+| 読取対象 | Model Service、Experiment、Prompt、EvaluationDataset、AI Search Index、SQL Warehouse |
+| 更新対象 | Smoke Test Trace、Test Feedback／Expectation、Job Run。業務Tableは更新しない |
+| 主な処理順序 | Backend／Experiment固定→Warehouse状態→Prompt解決→Dataset件数→Index取得→Answer／Judge最小推論→Trace ID取得→Assessment書込確認 |
+| 重要な判定 | 対象Experiment ID不一致、Dataset 0件、Model／Index／Warehouse利用不可のいずれかでFail Closed |
+| 正常／失敗／Retry | 全項目をJSONで出力。1項目でも失敗するとJobを失敗させPoC開始不可。Test TraceはTagで識別しRetry可能 |
+| Trace／後続 | Smoke Test Root TraceにResource参照をTagし、合格後に`evaluate_poc.py`を実行 |
+
+```python
+"""PoC開始前にWorkspace・MLflow・Model・Search依存をFail Closedで検証する。"""
+
+import argparse
+import json
+
+import mlflow
+from databricks.ai_search.client import AISearchClient
+from databricks.sdk import WorkspaceClient
+from databricks_openai import DatabricksOpenAI
+from mlflow.entities import AssessmentSource, AssessmentSourceType
+from mlflow.genai.datasets import get_dataset
+
+
+def parse_args() -> argparse.Namespace:
+    """検証対象をすべて明示Parameterにし、Default Resourceを使わない。"""
+    parser = argparse.ArgumentParser()
+    for name in (
+        "experiment-id",
+        "tracking-uri",
+        "registry-uri",
+        "prompt-uri",
+        "dataset-name",
+        "answer-model-service",
+        "judge-model",
+        "index-name",
+        "sql-warehouse-id",
+    ):
+        parser.add_argument(f"--{name}", required=True)
+    return parser.parse_args()
+
+
+@mlflow.trace(name="poc_workspace_smoke_test")
+def run_smoke_test(args: argparse.Namespace) -> dict:
+    """Readと最小Inferenceを行い、検証に使ったTrace IDを返す。"""
+    workspace = WorkspaceClient()
+    warehouse = workspace.warehouses.get(args.sql_warehouse_id)
+    if str(warehouse.state) not in {"RUNNING", "WarehouseState.RUNNING"}:
+        raise RuntimeError(f"SQL warehouse is not running: {warehouse.state}")
+
+    prompt = mlflow.genai.load_prompt(args.prompt_uri)
+    dataset = get_dataset(name=args.dataset_name)
+    if dataset.to_df().empty:
+        raise RuntimeError("PoC EvaluationDataset has no records")
+
+    AISearchClient().get_index(index_name=args.index_name)
+    model_client = DatabricksOpenAI()
+    answer = model_client.chat.completions.create(
+        model=args.answer_model_service,
+        messages=[{"role": "user", "content": "Reply only with OK."}],
+        max_tokens=8,
+        extra_headers={
+            "Databricks-Ai-Gateway-Request-Tags": json.dumps(
+                {"project": "internal-rag", "environment": "poc-smoke"}
+            )
+        },
+    )
+    judge = model_client.chat.completions.create(
+        model=args.judge_model,
+        messages=[{"role": "user", "content": "Return yes if the text is OK: OK"}],
+        max_tokens=8,
+    )
+    return {
+        "experiment_id": args.experiment_id,
+        "prompt_version": str(prompt.version),
+        "dataset_rows": len(dataset.to_df()),
+        "answer_model_response": answer.choices[0].message.content,
+        "judge_model_response": judge.choices[0].message.content,
+        "warehouse_id": args.sql_warehouse_id,
+        "index_name": args.index_name,
+    }
+
+
+def main() -> None:
+    """Smoke Test TraceへAssessmentも書き、TraceとAssessment権限を同時検証する。"""
+    args = parse_args()
+    mlflow.set_tracking_uri(args.tracking_uri)
+    mlflow.set_registry_uri(args.registry_uri)
+    experiment = mlflow.set_experiment(experiment_id=args.experiment_id)
+    if experiment.experiment_id != args.experiment_id:
+        raise RuntimeError("Active MLflow experiment ID does not match")
+
+    result = run_smoke_test(args)
+    trace_id = mlflow.get_last_active_trace_id()
+    source = AssessmentSource(
+        source_type=AssessmentSourceType.CODE,
+        source_id="poc-workspace-smoke-test",
+    )
+    mlflow.log_feedback(
+        trace_id=trace_id,
+        name="workspace_smoke_test",
+        value=True,
+        rationale="All required PoC resources passed minimal read/write checks",
+        source=source,
+    )
+    mlflow.log_expectation(
+        trace_id=trace_id,
+        name="expected_smoke_result",
+        value="pass",
+        source=source,
+    )
+    result["trace_id"] = trace_id
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+| 確認対象 | 合格条件 | 失敗時 |
+| --- | --- | --- |
+| Answer／Judge Model Service | 存在、`EXECUTE`可能、最小推論成功 | PoC／自動評価開始不可 |
+| MLflow Experiment／Trace | 指定IDがActive、Smoke TraceがそのExperimentに表示 | Trace出力不可として停止 |
+| Prompt Registry | Prompt Version読取とAlias解決成功 | RAG起動不可 |
+| EvaluationDataset | Dataset取得、Seed Record 1件以上 | Evaluation開始不可 |
+| Assessment | Feedback／Expectation登録成功 | Review開始不可 |
+| AI Search | Index Object取得成功、後続Golden Query成功 | RAG起動不可 |
+| SQL Warehouse | `RUNNING`、実行主体に`CAN USE` | Dashboard／Alertを有効化しない |
+
 `poc/src/rag_app.py`
 
-この実装では、RAG全体を`AGENT`、検索を`RETRIEVER`、生成Model呼び出しを`LLM` Spanとして記録する。`RETRIEVER` Spanの出力は`Document`へ正規化し、`page_content`、`metadata.doc_uri`、`metadata.chunk_id`をMLflowのRAG Judgeが解釈できる形で残す。Prompt、Model Endpoint、Index、Corpus／Chunk Version、Git CommitはTrace Tagへ付与し、どの構成で回答したかをEvaluation Runから追跡できるようにする。
+MLflow Traceは1回のRAG Requestの入出力と処理経路を時系列で残すEvidenceであり、Spanは検索やModel呼出しなどTrace内の一区間である。この実装ではRAG全体を`AGENT`、検索を`RETRIEVER`、生成Model呼び出しを`LLM` Spanとして記録する。`RETRIEVER` Spanの出力は`Document`へ正規化し、Prompt、Model Service、Index、Corpus／Chunk Version、Git CommitはTrace Tagへ付与する。結果はPoC ExperimentのTraces UIで確認する。
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | AI Searchの根拠だけで回答し、検索・Model・拒否・Citationを構造化出力とTraceに残す |
+| 呼出元／Trigger | `evaluate_poc.py`、限定Tester用Launcher、1質問ごと |
+| 読取対象 | Prompt Version、AI Search Index、Answer Model Service、Corpus／Chunk／Git Version |
+| 更新対象 | MLflow Trace／Spanのみ。Manifest、Index、Datasetは更新しない |
+| Call Flow | `answer_question()`→Prompt解決・Tag→`retrieve_chunks()`→0件拒否またはContext構築→`generate_answer()`→Citation検証→`PocResult` |
+| 重要な判定 | Search 0件ならLLMを呼ばない。生成回答にStable Citationがなければ回答を破棄しFail Closedで拒否 |
+| Traceとの関係 | Root=`AGENT`、Search=`RETRIEVER`、Model Service呼出し=`LLM`。解決済みPrompt VersionとModel Service FQNをTag |
+| 正常／失敗／Retry | 正常時はCitation付き`PocResult`。Dependency ErrorはTrace Errorに残しTableは更新しない。Requestは非破壊的なため再実行可能だが、Evaluationは新Traceとして残す |
+| 後続処理 | `poc_scorers.py`がID・Citation・拒否を評価し、`evaluate_poc.py`がRunに集約 |
 
 ```python
 """PoC AI Search結果だけを根拠に回答する最小RAG Application。
@@ -714,18 +1362,11 @@ if __name__ == "__main__":
 """
 
 from dataclasses import dataclass
-import os
 
 import mlflow
 from databricks.ai_search.client import AISearchClient
-from databricks.sdk import WorkspaceClient
+from databricks_openai import DatabricksOpenAI
 from mlflow.entities import Document, SpanType
-
-
-PROMPT_URI = os.getenv(
-    "POC_PROMPT_URI",
-    "prompts:/main.llmops_poc.internal_rag_answer@development",
-)
 
 
 @dataclass(frozen=True)
@@ -807,11 +1448,11 @@ def retrieve_chunks(question: str, index_name: str) -> list[RetrievedChunk]:
 
 
 @mlflow.trace(name="poc_generate_answer", span_type=SpanType.LLM)
-def generate_answer(prompt: str, endpoint_name: str) -> str:
-    """Databricks Model Serving Endpointを呼び、回答本文を生成する。"""
-    client = WorkspaceClient().serving_endpoints.get_open_ai_client()
+def generate_answer(prompt: str, model_service: str) -> str:
+    """Unity AI GatewayのAnswer Model Serviceを呼び、回答本文を生成する。"""
+    client = DatabricksOpenAI()
     completion = client.chat.completions.create(
-        model=endpoint_name,
+        model=model_service,
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
     )
@@ -822,7 +1463,8 @@ def generate_answer(prompt: str, endpoint_name: str) -> str:
 def answer_question(
     question: str,
     index_name: str,
-    endpoint_name: str,
+    model_service: str,
+    prompt_uri: str,
     corpus_version: str,
     chunk_schema_version: str,
     git_commit: str,
@@ -832,7 +1474,8 @@ def answer_question(
     Args:
         question: 限定Testerが入力した質問。
         index_name: PoC AI Search Index名。
-        endpoint_name: PoC生成Model Serving Endpoint名。
+        model_service: PoC Answer Model Serviceの完全修飾名。
+        prompt_uri: Prompt RegistryのVersionまたはPoC Alias URI。
         corpus_version: PoC GoldのCorpus Version。
         chunk_schema_version: Chunk生成契約のVersion。
         git_commit: Evaluation対象ApplicationのGit Commit。
@@ -843,12 +1486,12 @@ def answer_question(
     Security:
         PoC Indexには低機密Sampleだけを格納し、一般利用者へ公開しない。
     """
-    registered_prompt = mlflow.genai.load_prompt(PROMPT_URI)
+    registered_prompt = mlflow.genai.load_prompt(prompt_uri)
     mlflow.update_current_trace(
         tags={
             "poc.prompt.name": registered_prompt.name,
             "poc.prompt.version": str(registered_prompt.version),
-            "poc.model.endpoint": endpoint_name,
+            "poc.model.service": model_service,
             "poc.index.name": index_name,
             "poc.corpus.version": corpus_version,
             "poc.chunk.schema_version": chunk_schema_version,
@@ -872,7 +1515,7 @@ def answer_question(
         f"{citations[i]} {chunk.content}" for i, chunk in enumerate(chunks)
     )
     prompt = registered_prompt.format(question=question, context=context)
-    answer = generate_answer(prompt=prompt, endpoint_name=endpoint_name)
+    answer = generate_answer(prompt=prompt, model_service=model_service)
     if not any(citation in answer for citation in citations):
         return PocResult(
             answer="根拠を検証できないため回答できません。",
@@ -907,15 +1550,25 @@ def answer_question(
 
 | Trace階層 | `span_type` | 主な入力 | 主な出力 |
 | --- | --- | --- | --- |
-| `poc_rag` | `AGENT` | 質問、Index、Endpoint、各Version | 上記`PocResult` |
+| `poc_rag` | `AGENT` | 質問、Index、Model Service、各Version | 上記`PocResult` |
 | `poc_retrieve` | `RETRIEVER` | 質問、Index | `Document(page_content=..., metadata.chunk_id=...)`の配列 |
-| `poc_generate_answer` | `LLM` | Prompt、Endpoint | Citation付き回答文字列 |
+| `poc_generate_answer` | `LLM` | Prompt、Model Service FQN | Citation付き回答文字列 |
 
 検索0件なら`refused=true`、`refusal_reason="NO_RETRIEVAL_RESULT"`となり、LLM Spanは生成されない。
 
 `poc/src/poc_scorers.py`
 
-文書／Chunk Recall、Citation、拒否はIDやBooleanを比較すれば再現できるため、LLMへ判定させない。Groundedness、検索関連性、検索十分性、期待回答との意味的CorrectnessだけをBuilt-in Judgeへ任せる。これにより、同じEvaluationDatasetとScorerを候補Prompt、Model Endpoint、Index設定の比較へ再利用できる。
+ScorerはTrace、出力、Expectationから品質結果を生成する評価器である。決定論的Code ScorerはIDやBooleanを再現可能に比較し、LLM JudgeはRubricとJudge Modelを使ってGroundednessなど意味的品質を判定する。文書／Chunk Recall、Citation、拒否はCode Scorerへ任せ、検索関連性、検索十分性、期待回答との意味的CorrectnessだけをJudgeへ任せる。
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | RAG出力とExpectationを決定論的に比較し、再実行しても同じ値になるFeedbackを返す |
+| 呼出元／Trigger | `evaluate_poc.py`がDataset RecordごとにScorerとして呼ぶ |
+| 読取／更新 | `outputs`と`expectations`だけを読み、外部TableやTraceを直接更新しない。MLflow Evaluationが戻り値をAssessment化する |
+| 主な処理順序 | 期待集合を取得→実績集合と比較→Pass条件を計算→Rationale付きFeedbackを返す |
+| 重要な判定 | 期待集合が空のCase、拒否Case、未知Citationを明示的に扱い、LLM Judgeへ委譲しない |
+| 正常／失敗／Retry | Pure Functionとして同一入力へ同一結果。必須Keyの契約不一致はEvaluation Runを失敗させる |
+| 後続処理 | Evaluation集計、Slice分析、本番Quality Bundleの決定論的Gate |
 
 ```python
 """PoCと本番Quality Bundleで再利用する決定論的RAG Scorer。"""
@@ -985,16 +1638,29 @@ def expected_refusal(outputs: dict, expectations: dict) -> Feedback:
 
 `poc/src/evaluate_poc.py`
 
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | UC EvaluationDatasetの各CaseにPoC RAGを実行し、決定論的ScorerとJudgeを同じEvaluation Runへ記録する |
+| 呼出元／Trigger | `poc_evaluation_job`、Bootstrap Smoke Test合格後、Prompt／Model／Index変更ごと |
+| 読取対象 | Experiment ID、EvaluationDataset、Prompt Version、AI Search Index、Answer／Judge Model Service、各Version |
+| 更新対象 | Evaluation Run、CaseごとのRAG Trace、Scorer Assessment、Run Parameter |
+| Call Flow | `main()`→Backend／Experiment／Dataset固定→`evaluate()`がCaseごとに`predict_fn()`→`answer_question()`→Scorer→`log_evaluation_configuration()` |
+| 重要な判定 | Dataset 0件、Git Commit未設定、Prompt／Model／Index不明なら開始しない。Answer ModelとJudge Modelを別Parameterにする |
+| Traceとの関係 | 1 Dataset Recordに1 `AGENT` Trace。ScorerはTraceとExpectationからAssessmentを作る |
+| 正常／失敗／Retry | 正常時はRun ID、Dataset Digest、不変Versionを出力。失敗時はRelease判定に使わない。Retryは新Evaluation Runとして比較可能に残す |
+| 後続処理 | PoC Run Log、Slice分析、Go／No-Go、本番化Gap判定 |
+
 ```python
 """PoC RAGをMLflow GenAI Evaluationでケース別・集計評価する。"""
 
+import argparse
 from dataclasses import asdict
+import hashlib
 import json
-import os
-from pathlib import Path
 
 import mlflow
 from mlflow import MlflowClient
+from mlflow.genai.datasets import get_dataset
 from mlflow.genai.scorers import (
     Correctness,
     RetrievalGroundedness,
@@ -1008,71 +1674,85 @@ from poc_scorers import (
     expected_document_recall,
     expected_refusal,
 )
-from rag_app import PROMPT_URI, answer_question
+from rag_app import answer_question
 
 
-EXPERIMENT_NAME = os.getenv(
-    "POC_MLFLOW_EXPERIMENT",
-    "/Shared/llmops/internal-rag-poc-evaluation",
-)
-INDEX_NAME = os.environ["POC_INDEX_NAME"]
-MODEL_ENDPOINT = os.environ["POC_MODEL_ENDPOINT"]
-JUDGE_MODEL = os.getenv("POC_JUDGE_MODEL", "databricks")
-CORPUS_VERSION = os.environ["POC_CORPUS_VERSION"]
-CHUNK_SCHEMA_VERSION = os.environ["POC_CHUNK_SCHEMA_VERSION"]
-GIT_COMMIT = os.environ["GIT_COMMIT"]
+def parse_args() -> argparse.Namespace:
+    """Evaluationの全比較軸をJob Parameterから必須取得する。"""
+    parser = argparse.ArgumentParser()
+    for name in (
+        "experiment-id",
+        "tracking-uri",
+        "registry-uri",
+        "dataset-name",
+        "prompt-uri",
+        "index-name",
+        "answer-model-service",
+        "judge-model",
+        "corpus-version",
+        "chunk-schema-version",
+        "git-commit",
+    ):
+        parser.add_argument(f"--{name}", required=True)
+    return parser.parse_args()
 
 
-def load_evaluation_data(path: str) -> list[dict]:
-    """JSON Caseを`inputs`、`expectations`、`tags`形式へ正規化する。"""
-    cases = json.loads(Path(path).read_text(encoding="utf-8"))
-    return [
-        {
-            "inputs": {"question": case["question"]},
-            "expectations": {
-                "expected_response": case["expected_response"],
-                "expected_document_ids": case.get("expected_document_ids", []),
-                "expected_chunk_version_ids": case.get(
-                    "expected_chunk_version_ids", []
-                ),
-                "expected_refused": case["expected_refused"],
-                "expected_refusal_reason": case.get("expected_refusal_reason"),
-            },
-            "tags": {
-                "case_id": case["case_id"],
-                "category": case.get("category", "general"),
-            },
-        }
-        for case in cases
-    ]
+def normalize_judge_model(model_service: str) -> str:
+    """MLflow Judgeが要求する`databricks:/...`形式へ正規化する。"""
+    return (
+        model_service
+        if model_service.startswith("databricks:/")
+        else f"databricks:/{model_service}"
+    )
 
 
-def predict_fn(question: str) -> dict:
+def predict_fn(question: str, args: argparse.Namespace) -> dict:
     """1 Caseにつき1つのAGENT Traceを生成し、評価可能な構造化出力を返す。"""
     result = answer_question(
         question=question,
-        index_name=INDEX_NAME,
-        endpoint_name=MODEL_ENDPOINT,
-        corpus_version=CORPUS_VERSION,
-        chunk_schema_version=CHUNK_SCHEMA_VERSION,
-        git_commit=GIT_COMMIT,
+        index_name=args.index_name,
+        model_service=args.answer_model_service,
+        prompt_uri=args.prompt_uri,
+        corpus_version=args.corpus_version,
+        chunk_schema_version=args.chunk_schema_version,
+        git_commit=args.git_commit,
     )
     return asdict(result)
 
 
-def log_evaluation_configuration(run_id: str) -> None:
+def dataset_digest(dataset_df) -> str:
+    """Evaluation時のRecord集合を安定JSONからHash化する。"""
+    records = json.loads(dataset_df.to_json(orient="records", force_ascii=False))
+    records.sort(key=lambda record: json.dumps(record, sort_keys=True, ensure_ascii=False))
+    payload = json.dumps(
+        records,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def log_evaluation_configuration(
+    run_id: str,
+    args: argparse.Namespace,
+    prompt,
+    digest: str,
+) -> None:
     """Evaluation Runへ比較軸となる不変Versionを記録する。"""
-    prompt = mlflow.genai.load_prompt(PROMPT_URI)
     client = MlflowClient()
     parameters = {
+        "experiment_id": args.experiment_id,
+        "evaluation_dataset": args.dataset_name,
+        "evaluation_dataset_digest": digest,
         "prompt_name": prompt.name,
         "prompt_version": str(prompt.version),
-        "model_endpoint": MODEL_ENDPOINT,
-        "judge_model": JUDGE_MODEL,
-        "index_name": INDEX_NAME,
-        "corpus_version": CORPUS_VERSION,
-        "chunk_schema_version": CHUNK_SCHEMA_VERSION,
-        "git_commit": GIT_COMMIT,
+        "answer_model_service": args.answer_model_service,
+        "judge_model": args.judge_model,
+        "index_name": args.index_name,
+        "corpus_version": args.corpus_version,
+        "chunk_schema_version": args.chunk_schema_version,
+        "git_commit": args.git_commit,
     }
     for key, value in parameters.items():
         client.log_param(run_id, key, value)
@@ -1080,22 +1760,36 @@ def log_evaluation_configuration(run_id: str) -> None:
 
 def main() -> None:
     """固定Datasetに同じScorer群を適用し、Evaluation Runを作成する。"""
-    mlflow.set_experiment(EXPERIMENT_NAME)
+    args = parse_args()
+    mlflow.set_tracking_uri(args.tracking_uri)
+    mlflow.set_registry_uri(args.registry_uri)
+    mlflow.set_experiment(experiment_id=args.experiment_id)
+    dataset = get_dataset(name=args.dataset_name)
+    data = dataset.to_df()
+    if data.empty:
+        raise ValueError("PoC EvaluationDataset has no records")
+    prompt = mlflow.genai.load_prompt(args.prompt_uri)
+    judge_model = normalize_judge_model(args.judge_model)
     evaluation = mlflow.genai.evaluate(
-        data=load_evaluation_data("tests/poc_cases.json"),
-        predict_fn=predict_fn,
+        data=data,
+        predict_fn=lambda question: predict_fn(question, args),
         scorers=[
             expected_document_recall,
             expected_chunk_recall,
             citation_valid,
             expected_refusal,
-            RetrievalRelevance(model=JUDGE_MODEL),
-            RetrievalGroundedness(model=JUDGE_MODEL),
-            RetrievalSufficiency(model=JUDGE_MODEL),
-            Correctness(model=JUDGE_MODEL),
+            RetrievalRelevance(model=judge_model),
+            RetrievalGroundedness(model=judge_model),
+            RetrievalSufficiency(model=judge_model),
+            Correctness(model=judge_model),
         ],
     )
-    log_evaluation_configuration(evaluation.run_id)
+    log_evaluation_configuration(
+        evaluation.run_id,
+        args,
+        prompt,
+        dataset_digest(data),
+    )
     print(f"evaluation_run_id={evaluation.run_id}")
 
 
@@ -1110,9 +1804,9 @@ if __name__ == "__main__":
 | `poc-001` | 1.0 | 1.0 | `true` | `true` | `yes` | `yes` | `yes` |
 | `poc-002` | 0.0 | 0.0 | `true` | `false` | `no` | `yes` | `no` |
 
-Evaluation Runには集計値として、例えば`expected_document_recall/mean=0.50`、`citation_valid/mean=1.00`が残る。Consoleには`evaluation_run_id=...`が出力され、Run ParameterからPrompt Version、Model Endpoint、Index、Corpus／Chunk Version、Git Commitを比較できる。
+Evaluation Runには集計値として、例えば`expected_document_recall/mean=0.50`、`citation_valid/mean=1.00`が残る。Consoleには`evaluation_run_id=...`が出力され、Run ParameterからDataset Digest、Prompt Version、Answer／Judge Model Service、Index、Corpus／Chunk Version、Git Commitを比較できる。
 
-`tests/poc_cases.json`は少数の代表Caseを`inputs`へ渡す質問と、Scorerが読む`expectations`へ変換できる形で保持する。単一の`poc_pass_rate`へ潰さず、各Scorerのケース別Feedback、Rationale、集計MetricをEvaluation Runへ残す。
+`tests/poc_cases.json`は初回Seed Fixtureであり、Evaluation Jobはこれを直接読まない。`seed_poc_evaluation_dataset.py`がUC EvaluationDatasetへ反映し、`evaluate_poc.py`はDatasetの`inputs`と`expectations`を読む。単一の`poc_pass_rate`へ潰さず、各ScorerのCase別Feedback、Rationale、集計MetricをEvaluation Runへ残す。
 
 ```json
 [
@@ -1131,7 +1825,20 @@ Evaluation Runには集計値として、例えば`expected_document_recall/mean
 
 `poc/src/record_poc_assessments.py`
 
-PoCではReview Queueを構築せず、開発者または少人数の業務担当者がTrace UIから直接入力してよい。APIで再現する場合は、実際の回答品質を`Feedback`、期待値を`Expectation`として分けて付与する。`expected_response`、期待文書／Chunk、拒否要否／理由はExpectationであり、回答が良かったかという判定とは別資産である。`mlflow.log_feedback()`と`mlflow.log_expectation()`はMLflow 3.2.0以降を前提にし、DABでMLflow Versionを固定する。
+AssessmentはTraceまたはSpanへ付与するMLflowの評価Recordの総称である。今回の実績がよかったかを表す`Feedback`と、同じ入力で何を正解とするかを表す`Expectation`を分けて保存する。
+
+PoCではReview Queueを構築せず、開発者または少人数の業務担当者がTrace UIから直接入力してよい。`expected_response`、期待文書／Chunk、拒否要否／理由はExpectationであり、回答が良かったかという判定とは別資産である。`mlflow.log_feedback()`と`mlflow.log_expectation()`はMLflow 3.2.0以降を前提にし、DABでMLflow Versionを固定する。
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | 1件のPoC Traceへ人間の品質Feedbackと再利用可能な正解Expectationを別Assessmentとして保存する |
+| 呼出元／Trigger | ReviewerがTrace確認後に限定JobまたはNotebookから手動実行 |
+| 読取対象 | `POC_TRACE_ID`、認証済み`POC_REVIEWER_ID`、Review済みJSON |
+| 更新対象 | 指定TraceのFeedback／Expectation。EvaluationDatasetへは直接同期しない |
+| 主な処理順序 | Reviewer Source作成→品質Feedback記録→期待回答・文書・Chunk・拒否を個別記録 |
+| 重要な判定 | Reviewer IDとTrace IDを必須化し、FeedbackとExpectationを同名・同用途に混ぜない |
+| 正常／失敗／Retry | AssessmentがTrace UIへ表示される。部分失敗時はTraceの既存Assessmentを確認してから再実行し、重複を人が解消する |
+| 後続処理 | PoC分析。本番化後はLabeling SessionとReview Case同期へ置換 |
 
 ```python
 """PoC Traceへ人間Feedbackと正解Expectationを手動登録する。"""
@@ -1207,6 +1914,8 @@ PoCで収集する最小Assessmentは、`internal_rag_quality` Feedback、`expec
 
 3.3の運用は、人が思い出したときにUIを確認するだけでは成立しない。PoC開始前に、Triggerを受けて異常を検知し、担当者へ通知し、Quality Caseを重複なく登録し、再評価Evidenceを伴ってCloseする最小基盤を構築する。
 
+Quality CaseはMLflowの標準Resourceではない。低品質回答やPipeline異常について、検知、原因分類、担当割当、修正、再評価、Closeまでを管理する本システム独自のWorkflow Recordであり、PoCではDelta Table`main.llmops_poc.poc_quality_cases`を正本とする。採用、却下、Risk受容、Closeの人間判断は別のDelta Table`poc_decision_log`へ追記し、TraceやEvaluation Runは複製せずIDで参照する。
+
 ```mermaid
 flowchart TD
     A["Trigger<br/>Run・Threshold・Change・Feedback・Security"] --> B["検知<br/>Notification・Event Log・SQL Alert・Scorer"]
@@ -1280,24 +1989,15 @@ Sample台帳、件数照合表、Quarantine台帳、Dataset候補一覧、変更
 
 `poc/src/create_poc_operational_tables.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC開始前 |
-| 初めて必要になる段階 | PoC |
-| 実行主体 | PoC Monitoring Jobの実行Identity |
-| Trigger | 初回DeployおよびSchema Migration |
-| 入力 | Catalog／Schema、承認済みSchema Version |
-| 出力 | `poc_run_log`、`poc_quality_cases`、`poc_decision_log` |
-| Data Source | Lakeflow Run、MLflow Run／Trace／Assessmentへの参照 |
-| 通知先 | DDL失敗時のみPoC運用Group |
-| 記録先 | Unity Catalog Delta Table |
-| 正常終了時 | 3 Tableと制約が存在する |
-| 失敗時 | PoC開始を保留し、Migration Runを失敗させる |
-| 再実行時 | `CREATE TABLE IF NOT EXISTS`とVersion管理されたMigrationで冪等にする |
-| Security | 原文・Chunk・PII・Credentialを複製しない |
-| 権限 | Monitoring Jobに`MODIFY`、Reviewerに必要Viewの`SELECT`だけ付与する |
-| Retention | PoC終了後に監査要件で定めた期間保持し、削除は承認制にする |
-| ファイルパス | `poc/src/create_poc_operational_tables.sql` |
+| 目的 | PoCのRun、Quality Case、判断を監査可能な三つのDelta台帳として初期化する。 呼出元はPoC Monitoring JobのSchema Migration Task。 |
+| 入力 | Catalog／Schema設定と既存Table定義。 Triggerは初回Deploy後とDDL Version更新時。 |
+| 処理 | 三表をIF NOT EXISTSで作成し、状態・Severity・参照IDの制約を定義する。 Trace本文を複製せずID参照だけを保持し、Case状態と判断Evidenceを分離する。 Traceは更新せず、run_id／trace_idを外部Evidence参照として保持する。 |
+| 出力 | poc_run_log、poc_quality_cases、poc_decision_log。 三表が作成され、後続ViewとTriage Jobが利用できる。 後続はcreate_poc_monitoring_views.sqlとtriage_poc_quality_cases.py。 |
+| 失敗・再実行 | DDLを中断し、監視JobとPoC開始を進めない。 同一DDLは再適用でき、Schema変更はVersion付きMigrationとして追加する。 |
 
 ```sql
 -- PoCのPipeline／Evaluation実行を1行ずつ記録する実行台帳を作成する。
@@ -1435,24 +2135,15 @@ DashboardとAlertは、生のEvent Log、System Table、各Layer Tableを個別�
 
 `poc/src/create_poc_monitoring_views.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC開始前 |
-| 初めて必要になる段階 | PoC |
-| 実行主体 | PoC Monitoring Job |
-| Trigger | 初回Deploy、監視Query変更時 |
-| 入力 | 公開Pipeline Event Log、PoC Layer／Error Table、Quality Case、System Tables |
-| 出力 | Dashboard／Alert用View |
-| Data Source | Event Log、`system.lakeflow.*`、PoC Delta Table |
-| 通知先 | View作成失敗時のみPoC運用Group |
-| 記録先 | Unity Catalog View、Job Run |
-| 正常終了時 | 監視IdentityがViewをQueryできる |
-| 失敗時 | Dashboard／Alertを有効化せず権限とSchemaを修正する |
-| 再実行時 | `CREATE OR REPLACE VIEW`で定義を置換する |
-| Security | Event LogのError本文をDashboardへ直接公開せず、分類・件数中心にする |
-| 権限 | System Table参照は専用監視Identityに限定し、Viewへ必要列だけ公開する |
-| Retention | 元System Tableは公式保持期間、PoC Tableは組織Policyに従う |
-| ファイルパス | `poc/src/create_poc_monitoring_views.sql` |
+| 目的 | Pipeline、Evaluation、Case、CostのEvidenceを運用者向けViewへ正規化する。 呼出元はPoC Monitoring JobのView Migration Task。 |
+| 入力 | Pipeline Event Log、System Tables、PoC運用三表、MLflow参照ID。 Triggerは運用Table作成後のDeploy時。 |
+| 処理 | 生ログを必要列へ射影し、Run単位に集約してAlert／Dashboard用Viewを作る。 Raw Eventや質問本文を公開せず、権限と保持期間をView境界で限定する。 Trace IDを表示用Keyとして結合し、Trace内容自体は複製しない。 |
+| 出力 | poc_pipeline_event_log_vなどの監視View。 DashboardとSQL Alertが安定Schemaを参照できる。 後続はpoc_alerts.yml、poc_dashboard.yml、triage_poc_quality_cases.py。 |
+| 失敗・再実行 | View更新を失敗させ、旧Viewを維持して誤った監視値を公開しない。 CREATE OR REPLACE VIEWで同じ定義へ収束する。 |
 
 ```sql
 -- Pipeline UIと同じEventをSQLで確認するため、公開Event Logの必要列だけをView化する。
@@ -1661,24 +2352,15 @@ HAVING SUM(usage_quantity) <> 0;
 
 `poc/ops/poc_monitoring_thresholds.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC開始前 |
-| 初めて必要になる段階 | PoC |
-| 実行主体 | PoC Monitoring Job |
-| Trigger | 初回Deploy、承認済み閾値変更 |
-| 入力 | Git管理YAML、Decision ID |
-| 出力 | `poc_monitoring_thresholds`の有効Version |
-| Data Source | 品質基準、PoC SLO、Cost上限 |
-| 通知先 | 不正Schemaまたは未承認Decision時はPoC Owner |
-| 記録先 | Threshold Table、Decision Log、Git |
-| 正常終了時 | 同一Metricに有効Versionが1件だけ存在する |
-| 失敗時 | 旧Versionを維持し、新閾値を適用しない |
-| 再実行時 | `policy_version + metric_name`で冪等MERGEする |
-| Security | 通知先URLやCredentialを含めない |
-| 権限 | Quality担当者が変更申請し、PoC OwnerがDecisionを承認する |
-| Retention | 全VersionをPoC監査期間保持する |
-| ファイルパス | `poc/ops/poc_monitoring_thresholds.yml` |
+| 目的 | PoCの品質・Latency・Cost・運用閾値とSeverityをGit管理する。 呼出元はMonitoring JobとTriage Python。 |
+| 入力 | Gitで承認されたPolicy Version。 Triggerは各監視Run開始時。 |
+| 処理 | Policy Versionを読込み、Signal種別ごとの閾値、連続回数、Severity、通知先を解決する。 一回の揺らぎでCritical化せず、ACL越境など即時停止項目だけを別扱いにする。 Trace TagやScorer結果と閾値を比較するがTraceは更新しない。 |
+| 出力 | 実行時に読まれる閾値設定。 全Signalが同じVersionの基準で判定される。 後続はpoc_monitoring_job.ymlとtriage_poc_quality_cases.py。 |
+| 失敗・再実行 | 未知Keyや不正範囲を検出したらTriageを停止する。 同じPolicy Versionでは同じ判定となり、変更時は新Versionを記録する。 |
 
 ```yaml
 # 監視Policy全体の不変Versionを定義する。
@@ -1727,24 +2409,15 @@ Pipelineを直接手動更新するだけではJob Notificationを設定でき�
 
 `poc/resources/poc_monitoring_job.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC開始前 |
-| 初めて必要になる段階 | PoC |
-| 実行主体 | PoC実行Identity |
-| Trigger | 手動／APIのPipeline Run、日次18時の監視トリアージ |
-| 入力 | Pipeline Resource、監視SQL／Python、Threshold YAML |
-| 出力 | Pipeline Run、監視View更新、Quality Case候補 |
-| Data Source | Jobs Event、Pipeline Event Log、MLflow／PoC Table |
-| 通知先 | `${var.poc_ops_email}`、`${var.ops_system_destination_id}` |
-| 記録先 | Jobs Run、`poc_run_log`、`poc_quality_cases` |
-| 正常終了時 | Run IDと結果を記録し、正常通知は抑制する |
-| 失敗時 | Failure／Duration WarningをPushし、Case候補を作る |
-| 再実行時 | 新Run IDで実行し、Trigger IDによるCase重複を防ぐ |
-| Security | Email／Webhook URLをSourceへ埋め込まない |
-| 権限 | Jobの`CAN_MANAGE_RUN`とSystem Destination管理権限を分離する |
-| Retention | Jobs System Table 365日、PoC台帳は組織Policyに従う |
-| ファイルパス | `poc/resources/poc_monitoring_job.yml` |
+| 目的 | PoC Pipeline実行、監視View更新、Signal Triageを依存順に実行するLakeflow Jobを定義する。 呼出元はDAB DeployとJobs Scheduler／手動Run。 |
+| 入力 | Bundle変数、Pipeline Resource、Threshold YAML、Python／SQL Source。 TriggerはSchedule、手動実行、Pipeline障害後の再実行。 |
+| 処理 | Pipeline更新後に監視資産更新とTriageをdepends_onで直列化し、Run結果を通知する。 上流失敗時は下流Triageを走らせず、誤った正常判定を防ぐ。 Job Run IDをRun Logへ渡し、生成Traceへの参照をTriageが保持する。 |
+| 出力 | Lakeflow Job、Task Run、通知設定。 Run LogとCaseが更新され、通知対象だけがDestinationへ送られる。 後続はpoc_alerts.yml、poc_dashboard.yml、日次レビュー。 |
+| 失敗・再実行 | 失敗TaskとRun IDを残し、後続Taskを開始しない。 TaskはRun IDとSignal Keyで冪等化し、失敗地点から再実行する。 |
 
 ```yaml
 # PoC Pipelineの標準起動経路と通知を定義する。
@@ -1845,24 +2518,15 @@ SQL Alertは全Metricを通知せず、`Critical`／`Error`のOpen Caseまたは
 
 `poc/resources/poc_alerts.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC開始前 |
-| 初めて必要になる段階 | PoC |
-| 実行主体 | SQL Alert v2の`run_as` Identity |
-| Trigger | 10分ScheduleによるQuery評価 |
-| 入力 | `poc_open_quality_cases_v`、`poc_monitoring_signals_v` |
-| 出力 | Alert State、Alert History、Notification |
-| Data Source | Unity Catalog監視View |
-| 通知先 | `${var.ops_system_destination_id}` |
-| 記録先 | Databricks SQL Alert History、Quality Caseの`alert_id`／`alert_history_url` |
-| 正常終了時 | 0件なら通知せず、既存Alertが回復した場合だけOK通知する |
-| 失敗時 | Alert Query失敗を運用GroupへEscalateし、Dashboardで代替確認する |
-| 再実行時 | `retrigger_seconds`で30分抑止し、同じCaseの通知洪水を防ぐ |
-| Security | 通知本文へ質問・Chunk・機密Error本文を含めない |
-| 権限 | Alert管理者と閲覧者を分離し、Query用Viewだけ`SELECT`許可する |
-| Retention | Alert HistoryはWorkspace設定、Case参照はPoC監査期間保持する |
-| ファイルパス | `poc/resources/poc_alerts.yml` |
+| 目的 | PoCのCritical／Error監視QueryをSQL Alert v2として配備する。 呼出元はDAB Deploy。 |
+| 入力 | 監視View、Warehouse ID、通知Destination ID、閾値変数。 TriggerはDeploy時にResource更新、Warehouse Schedule時にQuery実行。 |
+| 処理 | Queryと閾値を結び、Scheduleで評価し、状態変化時だけ通知する。 Dashboard用Warningと即時通知対象を分け、Raw System Tableへ直接依存しない。 AlertからTrace ID／Case IDへ遷移できるがTrace本文は通知しない。 |
+| 出力 | SQL Alert、Alert履歴、通知Event。 閾値超過時に履歴と通知が作られる。 後続はtriage_poc_quality_cases.pyと担当者Runbook。 |
+| 失敗・再実行 | Query失敗を正常扱いせず、Alert実行失敗として運用者へ通知する。 同じSignal状態の重複通知はAlert状態管理で抑制する。 |
 
 ```yaml
 # Databricks CLI 0.279.0以降のSQL Alert v2 Resourceを定義する。
@@ -1932,24 +2596,15 @@ Dashboardは通知画面ではなく、担当者が傾向、Slice、Backlogを�
 
 `poc/resources/poc_dashboard.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC開始前 |
-| 初めて必要になる段階 | PoC |
-| 実行主体 | DashboardのQuery実行Identity |
-| Trigger | 利用者の閲覧、Dashboard Schedule、Subscription |
-| 入力 | Event Log／Layer／Error／Run／Quality Case／Usage View |
-| 出力 | AI/BI Dashboard、日次Snapshot |
-| Data Source | `main.llmops_poc`の監視View |
-| 通知先 | 日次SubscriptionのPoC Reviewer Group |
-| 記録先 | Dashboard Resource、Schedule ID、Subscription実行履歴 |
-| 正常終了時 | 最新Refresh時刻と全Widgetが表示される |
-| 失敗時 | Subscriptionを障害通知の代用にせず、SQL Alert／Job Notificationで通知する |
-| 再実行時 | DAB DeployでJSON差分を反映し、Scheduleは同じIDを更新する |
-| Security | `embed_credentials: false`を原則とし、閲覧者権限でQueryする |
-| 権限 | PoC Reviewerへ`CAN_RUN`、編集者を限定する |
-| Retention | Dashboard Snapshot添付の保管先・転送禁止をPoC Policyで定める |
-| ファイルパス | `poc/resources/poc_dashboard.yml`、`poc/dashboards/poc_operations.lvdash.json` |
+| 目的 | Git管理したAI/BI DashboardをPoC運用画面として配備する。 呼出元はDAB Deploy。 |
+| 入力 | 監視ViewとWarehouse ID。 TriggerはDeploy時にDashboard Asset更新、利用者が閲覧時。 |
+| 処理 | lvdash AssetをWorkspaceへ登録し、Warehouseと閲覧権限を関連付ける。 個人情報や質問本文をDatasetへ含めず、集計値と参照IDだけを表示する。 Trace／Run／Case IDから権限のある公式画面へ遷移する。 |
+| 出力 | 公開済みDashboard Resource。 品質、運用、Cost、Case backlogを同じ時点で比較できる。 後続は日次レビュー、SQL Alert、Quality Case対応。 |
+| 失敗・再実行 | Asset不整合時はDeployを失敗させ、旧公開版を維持する。 同じResource Keyを更新し、Dashboardを重複作成しない。 |
 
 ```yaml
 # Git管理するAI/BI Dashboard AssetをDAB Resourceとして定義する。
@@ -1994,24 +2649,15 @@ Dashboard ScheduleはPoC実施日の18時に更新し、必要ならEmail／Slac
 
 `poc/src/triage_poc_quality_cases.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC開始前 |
-| 初めて必要になる段階 | PoC |
-| 実行主体 | PoC Monitoring Job |
-| Trigger | 10分Schedule、必要時の手動Run |
-| 入力 | Threshold YAML、Signal View、Job Run View、Error View |
-| 出力 | Threshold Version、重複排除済みQuality Case |
-| Data Source | Unity Catalog監視View |
-| 通知先 | Case登録後にSQL AlertがPoC運用Groupへ通知する |
-| 記録先 | `poc_monitoring_thresholds`、`poc_quality_cases` |
-| 正常終了時 | 新規Caseだけが`triaged`で登録される |
-| 失敗時 | 既存Caseを変更せずJobを失敗させる |
-| 再実行時 | `dedup_key`のMERGEで同一Caseを再作成しない |
-| Security | Trigger IDと参照IDだけを保存し、質問・Chunk本文を複製しない |
-| 権限 | Monitoring Jobに対象Tableの`SELECT`／`MODIFY`だけを付与する |
-| Retention | Case TableのRetention Policyに従う |
-| ファイルパス | `poc/src/triage_poc_quality_cases.py` |
+| 目的 | 監視Signalを重複排除し、原因候補・担当Group付きQuality Caseへ変換する。 呼出元はpoc_monitoring_job.ymlのTriage Task。 |
+| 入力 | 監視View、Threshold YAML、既存Quality Case。 TriggerはPipeline／Evaluation完了後と定期監視時。 |
+| 処理 | Signalを評価し、fingerprintを生成し、既存Open Caseを照合して新規作成または再検知更新する。 同一原因のSignalをCase乱立させず、Critical Security Signalは即時停止対象にする。 source_trace_idとevaluation_run_idをEvidence参照として保存する。 |
+| 出力 | poc_quality_cases、poc_run_log、通知用Case ID。 新規Caseまたは既存Caseのlast_seen_atが更新される。 後続は担当者調査とclose_poc_quality_case.py。 |
+| 失敗・再実行 | 判定不能時はCaseを自動Closeせず、Runを失敗として記録する。 fingerprint＋Open状態のMERGEで同じSignalを冪等処理する。 |
 
 ```python
 """PoC監視Signalを重複排除し、担当Group付きQuality Caseへ登録する。"""
@@ -2281,24 +2927,15 @@ if __name__ == "__main__":
 
 `poc/src/close_poc_quality_case.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC開始前 |
-| 初めて必要になる段階 | PoC |
-| 実行主体 | PoC Ownerまたは委任された品質責任者 |
-| Trigger | Caseが`validated`になりClose申請されたとき |
-| 入力 | Quality Case ID、Close承認者 |
-| 出力 | `closed`状態、Close時刻、承認者 |
-| Data Source | `poc_quality_cases`、Evaluation Run／Decisionへの参照 |
-| 通知先 | Close失敗時はCase Owner |
-| 記録先 | `poc_quality_cases` |
-| 正常終了時 | `validated_run_id`と`decision_id`を持つCaseだけCloseされる |
-| 失敗時 | 状態を変更せず不足Evidenceを表示する |
-| 再実行時 | 既に`closed`なら成功扱いにし、重複更新しない |
-| Security | Case参照だけを扱い、Trace本文を取得しない |
-| 権限 | Close承認者だけに対象Table更新権限を委任する |
-| Retention | Close後も監査期間中は削除しない |
-| ファイルパス | `poc/src/close_poc_quality_case.py` |
+| 目的 | 修正後の固定再評価Evidenceを検証し、条件を満たすCaseだけCloseする。 呼出元はPoC担当者または承認済みClose Job。 |
+| 入力 | 対象Quality Case、再評価Run、Decision Log、Threshold Policy。 Triggerは修正Deploy後の再評価完了時。 |
+| 処理 | Caseを再読し、再評価Runと承認者を検証して、Close判断とEvidence参照を同一処理で更新する。 最新値だけでなくCaseに固定した基準を使い、Evidenceなしの手動Closeを拒否する。 再評価Trace／Run IDをClose Evidenceとして関連付ける。 |
+| 出力 | poc_quality_casesの状態とpoc_decision_log。 case_statusがclosedとなり、判断理由が記録される。 後続はPoC振り返りと本番要件への反映。 |
+| 失敗・再実行 | 条件不足なら状態を維持し、拒否理由を返す。 既にClose済みなら同じ結果を返し、二重Decisionを作らない。 |
 
 ```python
 """固定Caseの再評価Evidenceが揃ったPoC Quality CaseだけをCloseする。"""
@@ -2631,14 +3268,17 @@ Production Monitoringは「本番導入後に考える機能」ではない。�
 
 PoC章で成立性を確認した契約とDataset責務をBaselineとして固定し、次の順で本番統制を追加する。
 
-1. PoCの品質結果、未実装Gap、ID／Chunk／Citation契約を本番Baselineとして承認する。
-2. Manifest／Version Registry、Service Principal、Workspace割当、`run_as`、GRANTを構築する。
-3. Staging／Scanner／登録Command／検証後Move／Quarantine／Replayを構築する。
-4. PoC PipelineへManifest ID、監査列、Error分類、承認Pointer付きGoldを追加する。
-5. Search Sync、Corpus Snapshot、Release単位Index、Reconciliationを自動化する。
-6. RAG Release Manifest、ACL、Identity伝播、回答検証、Agent Server／Appsを構築する。
-7. Training／Holdout、ACL等Golden Test、Judge対人間誤差、負荷、Retry、Monitoring Dry Run、Alert、Rollback、Runbookを検証する。
-8. prodへ同一ArtifactをDeployし、Pilot Gateを通して利用範囲を段階拡大する。
+1. Workspace管理者がProduction MonitoringのBeta利用可否、System Tables、SQL Warehouse、Serverless Budget Policyを確認する。
+2. Platform管理者がAnswer／Judge用Model Service、AI GatewayのRate Limit、利用権限を準備する。
+3. Identity／Manifest担当がService Principal、Workspace割当、`run_as`、UC GRANTを構築する。
+4. MLflow Bootstrap SPがRealtime／Evaluation／Labelingの3 Experimentを別IDで作り、Realtimeだけを作成時にUC Trace Locationへ固定する。
+5. Prompt Registry SchemaとEvaluationDataset Schemaを作成し、登録・実行・Review権限を分離する。
+6. Staging／Scanner／登録Command／検証後Move／Quarantine／Replayと本番Medallionを構築する。
+7. Search Sync、Corpus Snapshot、Release単位Index、Reconciliationを自動化する。
+8. RAG Release Manifest、ACL、Identity伝播、回答検証、Agent Server／Appsを構築する。
+9. Scorer／JudgeをEvaluation Experimentで検証し、承認済みJudgeだけをRealtime Experimentへ登録する。
+10. UC Trace Table、Monitoring SQL Warehouse、Budget Policy、Sampling、AlertをSmoke Testし、Staging Dry Runを行う。
+11. prodへ同一ArtifactをDeployし、Pilot Gateを通して利用範囲を段階拡大する。
 
 最初からUIや複雑な再検索へ着手せず、文書が正しく解析され、期待文書を検索できることを先に確認する。Retrievalが成立していない状態で回答Promptだけを改善しても、根拠不足をLLMが補う挙動を強化する可能性がある。
 
@@ -2646,14 +3286,16 @@ PoC章で成立性を確認した契約とDataset責務をBaselineとして固�
 
 | 実行順 | 工程 | 主な実装 |
 | --- | --- | --- |
-| 1 | PoC Baseline固定 | 共通契約、Prompt、PoC評価結果、Git Commit |
-| 2 | Identity／Manifest | Terraform、Manifest DDL、DAB Resources |
-| 3 | 登録・審査・承認 | Registration、Approval、Command Executor |
-| 4 | 本番Medallion | Bronze、Attempt、Error、Silver、Manifest連携Gold |
-| 5 | 公開・照合 | Search Sync、Snapshot、Index、Reconciliation |
-| 6 | 本番RAG Runtime | Release Manifest、LangGraph、Agent Server、Apps |
-| 7 | 本番Gate | Invariant、Security Golden、Holdout、Judge Validation、負荷、Monitoring Dry Run、Rollback Test |
-| 8 | prod導入 | Monitoring開始、Alert、Runbook、Pilot Release |
+| 1 | Workspace機能 | Beta有効化、Warehouse、Budget Policy、System Tables |
+| 2 | Model／Identity | Model Service、AI Gateway、SP、UC Grant |
+| 3 | MLflow Bootstrap | 3 Experiment、UC Trace Location、Prompt／Dataset Schema |
+| 4 | 登録・審査・承認 | Registration、Approval、Command Executor |
+| 5 | 本番Medallion | Bronze、Attempt、Error、Silver、Manifest連携Gold |
+| 6 | 公開・照合 | Search Sync、Snapshot、Index、Reconciliation |
+| 7 | 本番RAG Runtime | Release Manifest、LangGraph、Agent Server、Apps |
+| 8 | 本番Gate | Invariant、Security Golden、Holdout、Judge Validation、負荷 |
+| 9 | Monitoring Dry Run | UC Trace、Scorer、Sampling、Alert、停止・再開、Rollback Test |
+| 10 | prod導入 | Monitoring開始、Runbook、Pilot Release |
 
 #### 4.2.3 本番Project構成
 
@@ -2670,6 +3312,7 @@ internal-docs-rag/
 │       ├── variables.tf
 │       ├── workspace_assignments.tf
 │       ├── bootstrap_permissions.tf
+│       ├── production_mlflow_permissions.tf
 │       └── runtime_grants.tf
 ├── packages/
 │   └── internal-rag-common/
@@ -2710,6 +3353,8 @@ internal-docs-rag/
 │   ├── quality/
 │   │   ├── databricks.yml
 │   │   ├── resources/
+│   │   │   ├── workspace_bootstrap_job.yml
+│   │   │   ├── production_preflight_job.yml
 │   │   │   ├── evaluation_job.yml
 │   │   │   ├── optimization_job.yml
 │   │   │   ├── review_queue_job.yml
@@ -2718,6 +3363,8 @@ internal-docs-rag/
 │   │   ├── dashboards/
 │   │   │   └── rag_operations.lvdash.json
 │   │   ├── src/
+│   │   │   ├── bootstrap_production_mlflow.py
+│   │   │   ├── smoke_test_production_workspace.py
 │   │   │   ├── create_operational_monitoring_assets.sql
 │   │   │   ├── triage_operational_signals.sql
 │   │   │   ├── register_prompts.py
@@ -2767,6 +3414,614 @@ internal-docs-rag/
 
 `quality` Bundleのうち、`seed_evaluation_dataset.py`、`evaluate_rag.py`、`release_gate.py`、`register_monitoring.py`は本番導入／Pilotまでに完成させる。`create_review_queue.py`、`sync_review_assessments.py`、`sync_evaluation_dataset.py`、`align_judge.py`は、本番後の定期Reviewと継続改善で初めて自動運用する。PoC用`poc_scorers.py`の決定論的判定は共通PackageまたはQuality Bundleへ移し、同じ定義を再利用する。
 
+##### 4.2.3.1 本番Workspace・MLflow Bootstrap
+
+本番ではExperimentを1つにまとめない。Realtime Trace、Release評価、Labeling Sessionは保持期間、書込主体、参照者、UC Trace要否が異なるため、別Experiment IDにする。DABの`experiments` ResourceはExperiment自体を宣言できるが、現行SchemaにはUC `trace_location`を指定するFieldがない。このため、本番3 ExperimentはDABとSDKの両方で重複作成せず、**MLflow SDK Bootstrapだけ**が作成する。DABはBootstrap Jobと後続Jobを定義し、作成済みIDをBundle変数として受け取る。
+
+```mermaid
+flowchart TD
+    ADMIN["Workspace・UC管理者"] --> IAC["Terraform<br/>Identity・Schema・Warehouse・Grant"]
+    IAC --> MODEL["Unity AI Gateway<br/>Answer・Judge・Reflection Model Service"]
+    IAC --> JOB["workspace_bootstrap_job.yml"]
+    JOB --> SDK["bootstrap_production_mlflow.py"]
+    SDK --> EXP["Realtime・Evaluation・Labeling Experiment"]
+    SDK --> UCT["Realtime UC Trace Table 4表"]
+    EXP --> IDS["CI/CD保護変数<br/>3 Experiment ID"]
+    IDS --> BUNDLE["Quality・Realtime Bundle"]
+    BUNDLE --> SMOKE["Production Preflight Job"]
+    SMOKE --> UI["Experiment UI・Catalog Explorer・Jobs UI"]
+```
+
+| Experiment | 物理名 | 保存対象 | Trace Storage | 書込主体 | 主な読取主体 |
+| --- | --- | --- | --- | --- | --- |
+| Realtime | `/Shared/llmops/prod/internal-rag-realtime` | 本番Request Trace、Production Monitoring Feedback | UC Trace Table 4表 | Realtime App SP、Monitoring Job Identity | LLMOps、Security、Reviewer |
+| Evaluation | `/Shared/llmops/prod/internal-rag-evaluation` | Evaluation Run、Release Gate、Judge検証 | Experiment既定Storage | Quality SP | Quality Owner、Release Manager |
+| Labeling | `/Shared/llmops/prod/internal-rag-labeling` | Labeling Session側へ複製されたTraceとAssessment | Experiment既定Storage | Quality SP、Reviewer | Domain Expert、Quality Owner |
+
+UC Trace LocationはExperiment作成時にしか関連付けられず、後から別Table Prefixへ付け替えられない。既存の同名Experimentを名前だけで再利用せず、Bootstrapの初回出力IDをCI/CDの環境別設定へ固定する。再実行時は期待IDが一致する場合だけ再利用し、同名・別IDならFail Closedにする。
+
+**構築順序と担当**
+
+| 順序 | 主体 | 作業 | 完了Evidence |
+| --- | --- | --- | --- |
+| 1 | Workspace Admin | Production Monitoring BetaをPreviewsで許可し、SQL WarehouseとServerless Budget Policyを準備する | Preview状態、Warehouse ID、Policy ID |
+| 2 | UC Admin | Trace／Prompt／Dataset用Schema、Bootstrap SPの`CREATE TABLE`、Model Serviceの`EXECUTE`を付与する | UC Grant結果 |
+| 3 | MLflow Bootstrap SP | 3 Experimentを作成し、RealtimeへUC Trace Location、Monitoring Warehouse ID、Budget Policy Tagを設定する | 3 Experiment ID、4 UC Trace Table |
+| 4 | Platform IaC | Bootstrap出力IDを入力にExperiment ACLとUC Trace Tableの明示的`SELECT`／`MODIFY`を付与する | Terraform Plan／Apply、Grant結果 |
+| 5 | CI/CD | IDを`BUNDLE_VAR_realtime_experiment_id`等へ保存し、Quality／Realtime Bundleへ注入する | Deploy Log、Bundle Summary |
+| 6 | Quality SP | Prompt、EvaluationDataset、Scorerを作成しSmoke Testを実行する | Smoke Test Run、Trace ID、Dataset件数 |
+
+`bundles/quality/src/bootstrap_production_mlflow.py`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | 3 Experimentを作成し、Realtime ExperimentだけをUC Trace LocationとMonitoring前提へ関連付ける |
+| 呼出元／Trigger | Platform Bootstrap完了後に`workspace_bootstrap_job`から1回実行。設定変更時は期待ID付きで再実行 |
+| 読取対象 | Experiment名、UC Catalog／Schema／Prefix、Warehouse ID、Budget Policy ID、既知のExperiment ID |
+| 更新対象 | MLflow Experiment、Realtime Experiment Tag、UC Trace Table |
+| 主な処理順序 | Backend固定→既存ID衝突検査→Realtime作成→Evaluation作成→Labeling作成→Warehouse／Policy設定→ID出力 |
+| 重要な判定 | Realtimeの同名Experimentを期待IDなしで再利用しない。UC Trace Locationを後付けしない |
+| Traceとの関係 | Bootstrap自身は業務Traceを作らず、後続App Traceの保存先を作る |
+| 正常終了時 | 3 IDをJSONで出力し、Realtime用4 UC Tableが作成される |
+| 失敗／Retry | 途中結果を削除しない。出力済みIDを次回の`--expected-*-id`へ渡し、一致するResourceだけ再利用する |
+| 後続処理 | `production_mlflow_permissions.tf`、Bundle Deploy、`smoke_test_production_workspace.py` |
+
+```python
+"""本番MLflow ExperimentとUC Trace Locationを重複なくBootstrapする。"""
+
+import argparse
+import json
+
+import mlflow
+from mlflow.entities.trace_location import UnityCatalog
+from mlflow.tracking import MlflowClient
+from mlflow.tracing import set_databricks_monitoring_sql_warehouse_id
+
+
+def parse_args() -> argparse.Namespace:
+    """環境固有値をSourceへ埋め込まず、Bootstrap Jobから必須入力として受け取る。"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tracking-uri", required=True)
+    parser.add_argument("--registry-uri", required=True)
+    parser.add_argument("--realtime-experiment-name", required=True)
+    parser.add_argument("--evaluation-experiment-name", required=True)
+    parser.add_argument("--labeling-experiment-name", required=True)
+    parser.add_argument("--trace-catalog", required=True)
+    parser.add_argument("--trace-schema", required=True)
+    parser.add_argument("--trace-table-prefix", required=True)
+    parser.add_argument("--monitoring-sql-warehouse-id", required=True)
+    parser.add_argument("--serverless-budget-policy-id")
+    parser.add_argument("--expected-realtime-id")
+    parser.add_argument("--expected-evaluation-id")
+    parser.add_argument("--expected-labeling-id")
+    return parser.parse_args()
+
+
+def get_existing_experiment(name: str, expected_id: str | None):
+    """既存ExperimentはBootstrapが記録した期待IDと一致する場合だけ再利用する。"""
+    experiment = mlflow.get_experiment_by_name(name)
+    if experiment is None:
+        return None
+    if not expected_id or experiment.experiment_id != expected_id:
+        raise ValueError(
+            f"Experiment name collision: name={name}, "
+            f"actual_id={experiment.experiment_id}, expected_id={expected_id}"
+        )
+    return experiment
+
+
+def ensure_experiment(
+    name: str,
+    expected_id: str | None,
+    trace_location: UnityCatalog | None = None,
+):
+    """未作成時だけExperimentを作り、既存時はID一致を検証する。"""
+    existing = get_existing_experiment(name, expected_id)
+    if existing is not None:
+        return existing
+    return mlflow.set_experiment(
+        experiment_name=name,
+        trace_location=trace_location,
+    )
+
+
+def main() -> None:
+    """作成順を固定し、後続IaCへ渡す不変Experiment IDを出力する。"""
+    args = parse_args()
+    mlflow.set_tracking_uri(args.tracking_uri)
+    mlflow.set_registry_uri(args.registry_uri)
+
+    realtime = ensure_experiment(
+        args.realtime_experiment_name,
+        args.expected_realtime_id,
+        UnityCatalog(
+            catalog_name=args.trace_catalog,
+            schema_name=args.trace_schema,
+            table_prefix=args.trace_table_prefix,
+        ),
+    )
+    evaluation = ensure_experiment(
+        args.evaluation_experiment_name,
+        args.expected_evaluation_id,
+    )
+    labeling = ensure_experiment(
+        args.labeling_experiment_name,
+        args.expected_labeling_id,
+    )
+
+    # UC Traceを読むMonitoring Jobが使うWarehouse IDをExperiment Tagへ永続化する。
+    set_databricks_monitoring_sql_warehouse_id(
+        sql_warehouse_id=args.monitoring_sql_warehouse_id,
+        experiment_id=realtime.experiment_id,
+    )
+    if args.serverless_budget_policy_id:
+        MlflowClient().set_experiment_tag(
+            realtime.experiment_id,
+            "mlflow.workload_creation_policy_id",
+            args.serverless_budget_policy_id,
+        )
+
+    print(
+        json.dumps(
+            {
+                "realtime_experiment_id": realtime.experiment_id,
+                "evaluation_experiment_id": evaluation.experiment_id,
+                "labeling_experiment_id": labeling.experiment_id,
+                "trace_location": (
+                    f"{args.trace_catalog}.{args.trace_schema}."
+                    f"{args.trace_table_prefix}"
+                ),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**正常時の出力例**
+
+```json
+{"evaluation_experiment_id":"2849001122334455","labeling_experiment_id":"2849001122334466","realtime_experiment_id":"2849001122334477","trace_location":"main.llmops_trace.internal_rag_prod"}
+```
+
+`bundles/quality/resources/workspace_bootstrap_job.yml`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | Bootstrap Sourceへ管理済みResource IDを渡し、実行Identityと依存Packageを固定する |
+| Trigger／変数解決 | Platform IaC後に手動またはCIがRun。`${var.*}`は環境別CI変数、Warehouse IDはTerraform Output |
+| DeployとRunの差 | DeployはJob定義だけを作成し、Experimentは作らない。Run時にPythonがExperimentを作る |
+| 正常／失敗／Retry | Job出力JSONをCI Variable Storeへ保存。再Runは保存済み期待IDを渡す |
+| 後続処理 | Terraform ACL第2段、Quality／Realtime Bundle Deploy |
+
+```yaml
+# 本番ExperimentをMLflow SDKで一度だけ作成するBootstrap Job。
+resources:
+  jobs:
+    workspace_bootstrap_job:
+      name: internal-rag-production-mlflow-bootstrap
+      # 人の個人権限ではなく、UC Schema作成権限を限定付与したBootstrap SPで実行する。
+      run_as:
+        service_principal_name: ${var.mlflow_bootstrap_sp_application_id}
+      tasks:
+        - task_key: bootstrap_mlflow
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/bootstrap_production_mlflow.py
+            parameters:
+              - --tracking-uri
+              - databricks
+              - --registry-uri
+              - databricks-uc
+              - --realtime-experiment-name
+              - ${var.realtime_experiment_name}
+              - --evaluation-experiment-name
+              - ${var.evaluation_experiment_name}
+              - --labeling-experiment-name
+              - ${var.labeling_experiment_name}
+              - --trace-catalog
+              - ${var.trace_catalog}
+              - --trace-schema
+              - ${var.trace_schema}
+              - --trace-table-prefix
+              - ${var.trace_table_prefix}
+              - --monitoring-sql-warehouse-id
+              - ${var.monitoring_sql_warehouse_id}
+              - --serverless-budget-policy-id
+              - ${var.serverless_budget_policy_id}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - "mlflow[databricks]>=3.14,<4"
+```
+
+初回Runでは`--expected-*-id`を省略する。CI/CDは出力JSONを環境別の保護Variable Storeへ保存し、2回目以降は3つの期待IDを追加Parameterとして渡す。後続Bundleには`realtime_experiment_id`、`evaluation_experiment_id`、`labeling_experiment_id`を必須変数として注入し、Source内でExperiment名を再検索しない。
+
+`infra/databricks/production_mlflow_permissions.tf`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | Bootstrap後に確定したExperiment IDへRole別ACLを付与する |
+| 読取／更新 | CIが渡す3 IDとGroup／SP Application IDを読み、Workspace Experiment ACLを更新する |
+| 重要な判定 | Realtime AppにEvaluation／Labeling編集権限を与えず、ReviewerにRealtime書込権限を与えない |
+| Transaction／Retry | Terraform Stateを正本に同じACLへ収束させる。ID未設定時はPlanを失敗させる |
+
+```hcl
+# MLflow SDK Bootstrapが出力したIDをCIから受け取り、Experimentを再作成せずACLだけを管理する。
+variable "realtime_experiment_id" { type = string }
+variable "evaluation_experiment_id" { type = string }
+variable "labeling_experiment_id" { type = string }
+variable "realtime_app_sp_application_id" { type = string }
+variable "quality_sp_application_id" { type = string }
+variable "monitoring_sp_application_id" { type = string }
+variable "reviewer_group_name" { type = string }
+variable "trace_catalog" { type = string }
+variable "trace_schema" { type = string }
+variable "trace_table_prefix" { type = string }
+
+locals {
+  # MLflowがRealtime Experiment作成時に生成する4つのUC OTel Table名を固定する。
+  trace_tables = toset([
+    "${var.trace_catalog}.${var.trace_schema}.${var.trace_table_prefix}_otel_spans",
+    "${var.trace_catalog}.${var.trace_schema}.${var.trace_table_prefix}_otel_annotations",
+    "${var.trace_catalog}.${var.trace_schema}.${var.trace_table_prefix}_otel_logs",
+    "${var.trace_catalog}.${var.trace_schema}.${var.trace_table_prefix}_otel_metrics",
+  ])
+}
+
+resource "databricks_permissions" "realtime_experiment" {
+  experiment_id = var.realtime_experiment_id
+  access_control {
+    service_principal_name = var.realtime_app_sp_application_id
+    permission_level       = "CAN_EDIT"
+  }
+  access_control {
+    service_principal_name = var.quality_sp_application_id
+    permission_level       = "CAN_EDIT"
+  }
+  access_control {
+    group_name       = var.reviewer_group_name
+    permission_level = "CAN_READ"
+  }
+}
+
+resource "databricks_permissions" "evaluation_experiment" {
+  experiment_id = var.evaluation_experiment_id
+  access_control {
+    service_principal_name = var.quality_sp_application_id
+    permission_level       = "CAN_EDIT"
+  }
+  access_control {
+    group_name       = var.reviewer_group_name
+    permission_level = "CAN_READ"
+  }
+}
+
+resource "databricks_permissions" "labeling_experiment" {
+  experiment_id = var.labeling_experiment_id
+  access_control {
+    service_principal_name = var.quality_sp_application_id
+    permission_level       = "CAN_EDIT"
+  }
+  access_control {
+    group_name       = var.reviewer_group_name
+    permission_level = "CAN_EDIT"
+  }
+}
+
+# Appは本番Traceを書き、Monitoring SPはTraceを読み書きしてFeedbackを追加する。
+resource "databricks_grant" "realtime_app_trace_tables" {
+  for_each  = local.trace_tables
+  table     = each.value
+  principal = var.realtime_app_sp_application_id
+  privileges = ["SELECT", "MODIFY"]
+}
+
+resource "databricks_grant" "monitoring_trace_tables" {
+  for_each  = local.trace_tables
+  table     = each.value
+  principal = var.monitoring_sp_application_id
+  privileges = ["SELECT", "MODIFY"]
+}
+
+# ReviewerはTrace Evidenceを読むだけで、UC Trace Tableを直接変更しない。
+resource "databricks_grant" "reviewer_trace_tables" {
+  for_each  = local.trace_tables
+  table     = each.value
+  principal = var.reviewer_group_name
+  privileges = ["SELECT"]
+}
+```
+
+UC Trace Tableには`ALL PRIVILEGES`だけで済ませず、`<prefix>_otel_spans`、`_otel_annotations`、`_otel_logs`、`_otel_metrics`の各表へRealtime App SPとMonitoring Identityの`SELECT, MODIFY`を明示付与する。Reviewerは必要な表の`SELECT`だけ、Monitoring SQL WarehouseにはMonitoring Identityの`CAN USE`、Realtime Experimentには同Identityの`CAN EDIT`が必要である。最初のScorer登録者がMonitoring Jobの実行Identityになるため、個人Userではなく退役手順を管理したQuality SPを使う。
+
+**本番設定値の注入元**
+
+| 設定 | CI／DAB変数 | Runtime名 | 利用先 |
+| --- | --- | --- | --- |
+| Realtime Experiment ID | `realtime_experiment_id` | `MLFLOW_EXPERIMENT_ID` | Agent Server／Realtime App |
+| Evaluation Experiment ID | `evaluation_experiment_id` | `MLFLOW_EVALUATION_EXPERIMENT_ID` | Evaluation、Release Gate |
+| Labeling Experiment ID | `labeling_experiment_id` | `MLFLOW_LABELING_EXPERIMENT_ID` | Review Queue、Assessment同期 |
+| Answer Model Service | `answer_model_service` | `RAG_ANSWER_MODEL_SERVICE` | `rag_release_manifest.model_service`、App |
+| Judge Model Service | `judge_model_service` | `RAG_JUDGE_MODEL_SERVICE` | Evaluation、Monitoring、Alignment検証 |
+| Prompt Optimization Reflection | `prompt_optimization_reflection_model` | `PROMPT_OPTIMIZATION_REFLECTION_MODEL` | `GepaPromptOptimizer`。`databricks:/<service>`形式 |
+| Judge Alignment Reflection | `judge_alignment_reflection_model` | `JUDGE_ALIGNMENT_REFLECTION_MODEL` | `MemAlignOptimizer`。`databricks:/<service>`形式 |
+| Monitoring Warehouse | `monitoring_sql_warehouse_id` | Experiment Tagへ永続化 | UC Trace検索、Production Monitoring |
+| Budget Policy | `serverless_budget_policy_id` | `mlflow.workload_creation_policy_id` | Monitoring Serverless Job |
+
+`bundles/quality/src/smoke_test_production_workspace.py`は次を1つでも満たさなければPilotを開始しない。Model Serviceの最小推論、3 Experiment ID一致、Prompt Version読取、EvaluationDataset Record照合、Realtime Traceの作成、4 UC Trace Tableの`SELECT`、Feedback／Expectation登録、AI Search Golden Query、AI Gateway Usage参照、Monitoring Warehouse／Budget Policy Tag、登録Scorer数上限未満を検証する。Inference LoggingはSmoke Testで無条件に有効化せず、採用時だけ専用Schema、Masking、Retention、`SELECT`権限を別審査する。
+
+| 検証 | 理由 | 失敗時 |
+| --- | --- | --- |
+| Answer／Judge Model Service推論 | `EXECUTE`とRouteを実Requestで確認する | App／自動評価開始不可 |
+| Realtime TraceとUC 4表 | Experiment名だけでなく物理保存とGrantを確認する | Pilot開始不可 |
+| Prompt／Dataset | 固定Versionと固定CaseがRelease Gateから読めることを確認する | RAG／評価開始不可 |
+| Feedback／Expectation | Reviewer WorkflowがAssessmentを書けることを確認する | Review開始不可 |
+| Monitoring前提 | Preview、Warehouse Tag、Policy、Scorer上限、Judge権限を確認する | `register()`／`start()`禁止 |
+| AI Gateway | 推論、429方針、Usage権限、Route Tagを確認する | 利用範囲拡大不可 |
+
+Smoke Testは検査専用Traceへ`bootstrap.smoke_test=true`を付け、業務品質集計から除外する。UC Traceは個別Trace削除APIを前提にせず、保持期限に基づくTable Lifecycleで削除する。Smoke TestのRun ID、Trace ID、Git Commit、3 Experiment ID、実行SP、実行時刻、判定をRun LogとDecision Logへ記録する。
+
+`bundles/quality/src/smoke_test_production_workspace.py`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | Pilot開始前に本番Resourceの最小Read／Write／InferenceとID接続を検証する |
+| 呼出元／Trigger | ACL第2段と全Bundle Deploy後、`production_preflight_job`から実行 |
+| 読取対象 | 3 Experiment、Prompt、EvaluationDataset、Model Service、AI Search、UC Trace 4表、Monitoring Tag |
+| 更新対象 | Realtime ExperimentのSmoke TraceとAssessment、Preflight Job Run Log |
+| 主な処理順序 | ID一致→Tag確認→Prompt／Dataset→Index→Answer／Judge推論→Smoke Trace→Assessment→UC 4表参照 |
+| 重要な判定 | Defaultや名前検索へFallbackしない。UC Table、Warehouse Tag、Policy条件の不足でFail Closed |
+| 正常／失敗／Retry | JSON Evidenceを出力。Test TraceはTagで除外し再実行可能。業務ManifestやDatasetを更新しない |
+| 後続処理 | Monitoring登録、Staging Dry Run、Pilot Go／No-Go |
+
+```python
+"""本番開始前にWorkspace、MLflow、Gateway、Searchの接続を検証する。"""
+
+import argparse
+import json
+
+import mlflow
+from databricks.ai_search.client import AISearchClient
+from databricks_openai import DatabricksOpenAI
+from mlflow.entities import AssessmentSource, AssessmentSourceType
+from mlflow.genai.datasets import get_dataset
+
+
+def parse_args() -> argparse.Namespace:
+    """CIがBootstrap出力とRelease固定値をすべて明示的に渡す。"""
+    parser = argparse.ArgumentParser()
+    for name in (
+        "realtime-experiment-id",
+        "evaluation-experiment-id",
+        "labeling-experiment-id",
+        "prompt-uri",
+        "dataset-name",
+        "answer-model-service",
+        "judge-model-service",
+        "index-name",
+        "trace-catalog",
+        "trace-schema",
+        "trace-table-prefix",
+    ):
+        parser.add_argument(f"--{name}", required=True)
+    parser.add_argument("--default-budget-policy-allowed", required=True)
+    return parser.parse_args()
+
+
+def require_experiment(experiment_id: str) -> None:
+    """Bootstrap IDが存在し、実行Identityから参照できることを確認する。"""
+    if mlflow.get_experiment(experiment_id) is None:
+        raise ValueError(f"MLflow experiment is unavailable: {experiment_id}")
+
+
+@mlflow.trace(name="production_workspace_smoke_test")
+def write_smoke_trace(args: argparse.Namespace) -> dict:
+    """Model Serviceを最小呼出しし、UCへ書く検査Traceを作成する。"""
+    client = DatabricksOpenAI()
+    headers = {
+        "Databricks-Ai-Gateway-Request-Tags": json.dumps(
+            {
+                "application": "internal-rag",
+                "environment": "production-preflight",
+            }
+        )
+    }
+    answer = client.chat.completions.create(
+        model=args.answer_model_service,
+        messages=[{"role": "user", "content": "Reply only with OK."}],
+        max_tokens=8,
+        extra_headers=headers,
+    )
+    judge = client.chat.completions.create(
+        model=args.judge_model_service,
+        messages=[{"role": "user", "content": "Reply only with yes."}],
+        max_tokens=8,
+        extra_headers=headers,
+    )
+    mlflow.update_current_trace(
+        tags={"bootstrap.smoke_test": "true", "environment": "prod"}
+    )
+    return {
+        "answer": answer.choices[0].message.content,
+        "judge": judge.choices[0].message.content,
+    }
+
+
+def main() -> None:
+    """全Prerequisiteを検証し、合格EvidenceをJSON出力する。"""
+    args = parse_args()
+    mlflow.set_tracking_uri("databricks")
+    mlflow.set_registry_uri("databricks-uc")
+    for experiment_id in (
+        args.realtime_experiment_id,
+        args.evaluation_experiment_id,
+        args.labeling_experiment_id,
+    ):
+        require_experiment(experiment_id)
+
+    realtime = mlflow.set_experiment(experiment_id=args.realtime_experiment_id)
+    tags = realtime.tags or {}
+    if not tags.get("mlflow.monitoring.sqlWarehouseId"):
+        raise ValueError("Monitoring SQL Warehouse ID tag is missing")
+    if (
+        args.default_budget_policy_allowed.lower() != "true"
+        and not tags.get("mlflow.workload_creation_policy_id")
+    ):
+        raise ValueError("Monitoring budget policy tag is missing")
+
+    prompt = mlflow.genai.load_prompt(args.prompt_uri)
+    dataset = get_dataset(name=args.dataset_name)
+    if dataset.to_df().empty:
+        raise ValueError("EvaluationDataset has no records")
+    AISearchClient().get_index(index_name=args.index_name)
+
+    model_result = write_smoke_trace(args)
+    trace_id = mlflow.get_last_active_trace_id()
+    source = AssessmentSource(
+        source_type=AssessmentSourceType.CODE,
+        source_id="production-workspace-smoke-test",
+    )
+    mlflow.log_feedback(
+        trace_id=trace_id,
+        name="workspace_smoke_test",
+        value=True,
+        rationale="Production prerequisites passed",
+        source=source,
+    )
+    mlflow.log_expectation(
+        trace_id=trace_id,
+        name="expected_smoke_result",
+        value="pass",
+        source=source,
+    )
+
+    # 4表すべてを実際にSELECTし、UC GrantとSQL実行経路を検証する。
+    trace_tables = [
+        f"{args.trace_catalog}.{args.trace_schema}."
+        f"{args.trace_table_prefix}_otel_{suffix}"
+        for suffix in ("spans", "annotations", "logs", "metrics")
+    ]
+    for table_name in trace_tables:
+        spark.table(table_name).limit(1).collect()
+
+    print(
+        json.dumps(
+            {
+                "status": "pass",
+                "trace_id": trace_id,
+                "prompt_version": str(prompt.version),
+                "dataset_rows": len(dataset.to_df()),
+                "trace_tables": trace_tables,
+                **model_result,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`bundles/quality/resources/production_preflight_job.yml`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | Bootstrap／Grant／Bundle Deploy後の本番Smoke Testを管理対象Quality SPで実行する |
+| 変数解決 | CIが3 Experiment ID、固定Prompt／Dataset／Model／Index／Trace PrefixをBundle変数として注入する |
+| Deploy／Run | DeployはJob定義のみ作成し、RunがSmoke TraceとAssessmentを生成する |
+| 重要判定 | すべての値をTask Parameterへ明示し、SourceのDefaultや名前検索を許さない |
+| 正常／失敗／Retry | 全検査成功時だけ後続Monitoring登録を許可。失敗時はPilot GateをFail Closedにする |
+
+```yaml
+# 本番Resourceの最小Read／Write／InferenceをPilot前に検証するPreflight Job。
+resources:
+  jobs:
+    production_preflight_job:
+      name: internal-rag-production-preflight
+      run_as:
+        # 最初のMonitoring登録Identityと同じ管理対象Quality SPで権限を検証する。
+        service_principal_name: ${var.quality_sp_application_id}
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: smoke_test_production_workspace
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/smoke_test_production_workspace.py
+            parameters:
+              - --realtime-experiment-id
+              - ${var.realtime_experiment_id}
+              - --evaluation-experiment-id
+              - ${var.evaluation_experiment_id}
+              - --labeling-experiment-id
+              - ${var.labeling_experiment_id}
+              - --prompt-uri
+              - ${var.answer_prompt_uri}
+              - --dataset-name
+              - ${var.holdout_dataset_name}
+              - --answer-model-service
+              - ${var.answer_model_service}
+              - --judge-model-service
+              - ${var.judge_model_service}
+              - --index-name
+              - ${var.index_name_current}
+              - --trace-catalog
+              - ${var.trace_catalog}
+              - --trace-schema
+              - ${var.trace_schema}
+              - --trace-table-prefix
+              - ${var.trace_table_prefix}
+              - --default-budget-policy-allowed
+              - ${var.default_budget_policy_allowed}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies:
+              - "mlflow[databricks]>=3.14,<4"
+              - databricks-openai
+              - databricks-ai-search
+```
+
+SQL Warehouseの`CAN USE`、Production Monitoring Beta、AI Gateway Usage反映はWorkspace／System Table側の後続Taskで検証し、全Task成功後だけ`register_monitoring.py`を実行可能にする。Usage Tableは反映遅延があるため、Request ID付きで上限時間を設けてPollし、即時0件だけをGateway障害と誤判定しない。
+
+##### 4.2.3.2 Unity AI Gatewayの事前設定
+
+Unity AI GatewayはModel ServiceをUnity Catalog Securableとして公開し、複数DestinationへのRoute、Fallback、Rate Limit、Usage／Cost Attributionを統制する。新規実装ではOpenAI互換`/ai-gateway/mlflow/v1`とModel Service FQNを利用する。Legacy Model Serving Endpoint向けAI Gateway設定やDAB `model_serving_endpoints`の旧Endpoint設定を同じResourceとして扱わない。
+
+| 設定 | 実体 | 作成主体 | 本システムの方針 | 確認Evidence |
+| --- | --- | --- | --- | --- |
+| Model Service | UCの`catalog.schema.service` Securable | Platform管理者 | Answer、Judge、Reflectionを用途別Serviceへ分離 | Catalog Explorer、最小推論 |
+| Destination／Traffic | Model Service内のDestinationとWeight | Platform管理者、Model Risk Owner | 最大5 Destination以内。Pilot前は単一Route、Canary時だけSession Affinity付きSplit | Gateway設定Export、Trace Route Tag |
+| Fallback | Model Serviceの優先Route | Platform管理者 | Model品質が異なるFallbackは自動許可せず、事前Holdout合格した組だけ設定 | 障害訓練結果 |
+| Rate Limit | Service単位QPM／TPMと必要最小限のGroup上限 | Platform管理者 | 429を返し、Applicationは指数Backoffと上限回数を使用 | Rate Limit設定、429 Smoke Test |
+| Usage Tracking | `system.ai_gateway.usage` System Table | Databricksが生成 | Request、Token、Route、TagをCost／利用量集計に使用 | System Table Query、Dashboard |
+| Cost Attribution | Request Tag、Budget、Billing Tag | App／Platform | `rag_release_id`、Application、EnvironmentをPayloadではなくTagで付与 | Usage／Billing結合 |
+| Inference Logging | 任意の専用UC Inference Table | Model Risk／Security承認後だけ | **Default無効**。Prompt／Response保存が必要な限定用途だけ有効化 | DPIA、Schema Grant、Retention Job |
+| Payload Masking | App前処理＋許可List | Security、Application Owner | Logging前にToken、個人情報、署名URL、Raw ACLを除去。Trace Maskingと別に検証 | Masking Golden Test |
+| System Table権限 | `USE CATALOG`等の参照Grant | Account／Metastore Admin | Dashboard SPに必要なViewの`SELECT`だけ付与 | Grant一覧 |
+
+`system.ai_gateway.usage`はGatewayを経由したRequestから生成される課金対象のSystem Tableであり、Queryを書くだけではデータは増えない。AppはModel Service FQNを`model`へ指定し、Workspace認証でGatewayを経由する。DashboardはRaw System Tableを一般利用者へ開放せず、Environment、Service、Release、日付で集約した管理Viewを参照する。
+
+Inference Loggingを採用する場合も、MLflow UC Trace Tableと同じものではない。前者はGateway推論Payloadの任意Log、後者はApplication／AgentのSpanとAssessmentである。金融機関向けDefaultはUC TraceへMask済みの最小Evidenceを残し、Inference Loggingは無効とする。例外的に有効化する場合は専用Schema、列Mask、Row Filter、保持期限、削除Job、閲覧承認、Incident時の保全手順をRelease前に定義する。
+
+**Model Service事前確認の順序**
+
+1. Platform管理者がSystem-provided Model APIまたは外部Model Destinationを確認する。
+2. Answer／Judge用Model ServiceをUIまたはUnity Catalog REST APIで作成する。現行DABに存在しないModel Service Resourceを架空定義しない。
+3. App SP／Quality SPへ`USE CATALOG`、`USE SCHEMA`、対象Serviceの`EXECUTE`を付与する。
+4. QPM／TPM、Fallback、Traffic Routeを承認済み設定へ固定する。
+5. App SPで最小推論、Quality SPでJudge最小推論を実行する。
+6. `system.ai_gateway.usage`へRequestが現れ、Request TagとRouteを照合できることを確認する。
+7. 429、Primary Destination障害、Fallback、Cost上限のDry Runを行う。
+
 #### 4.2.4 本番Source File
 
 ##### 4.2.4.1 共通のRAG入出力契約
@@ -2789,22 +4044,15 @@ internal-docs-rag/
 
 `packages/internal-rag-common/src/internal_rag_common/rag_contracts.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoCでは`poc/src/evaluate_poc.py`の小規模Datasetを使い、本番導入時に本SourceでUC Training／Holdoutへ移行する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にFamily Hash Split、Identity Fixture、Lineage、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: 構造化RAGデータ／出力: 共通Pydantic契約 |
-| 関連Job／Pipeline | 全Bundle。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 同じ型と検証規則を利用する。不正入力をValidation Errorにする。 |
-| ファイルパス | `packages/internal-rag-common/src/internal_rag_common/rag_contracts.py` |
-| 実行主体 | 全Bundle |
-| 入力 | 構造化RAGデータ |
-| 出力 | 共通Pydantic契約 |
-| 必要な理由 | Bundle間Schemaを一致させるため |
-| 正常終了時 | 同じ型と検証規則を利用する |
-| 失敗時 | 不正入力をValidation Errorにする |
-| 再実行時 | 入力修正後に再生成する |
+| 目的 | RAGの検索Evidence、判断、内部State、外部ResultをPydantic型として全Bundleへ提供する。 呼出元はRealtime Agent、Evaluation Job、Test Module。 |
+| 入力 | 検索結果、Identity、Release情報。 TriggerはRequest処理、評価Record変換、Test生成時。 |
+| 処理 | Field制約を検証し、内部RagStateから公開可能なRagResultへ変換する。 未知Field禁止と必須ID制約で権限外情報の混入を防ぐ。 Span入出力Schemaと一致させる。 |
+| 出力 | 検証済みPython Object。 共通SchemaのObjectを返す。 後続はrag_graph.py、agent.py、evaluate_rag.py。 |
+| 失敗・再実行 | ValidationErrorで不正な結果を公開しない。 純粋な型変換なので同じ入力から再生成できる。 |
 
 ```python
 """RAGの検索結果、状態遷移、引用、最終結果を全Bundleで共有するデータ契約として定義するModule。入力値をPydanticで検証し、不正なACLや識別子を後続処理へ渡さない。
@@ -3160,22 +4408,15 @@ class RagResult(BaseModel):
 
 `bundles/quality/src/register_prompts.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoCでは`poc/src/poc_scorers.py`と`evaluate_poc.py`を使い、本番導入時に本Sourceへ移行する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にUC Holdout、Identity Fixture、Security Gate、Scorer／Judge Version固定を追加する。 |
-| 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
-| 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/register_prompts.py` |
-| 実行主体 | Quality SP |
-| 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
-| 出力 | 評価、Dataset、Prompt／Judge候補 |
-| 必要な理由 | 品質改善を本番実行から分離するため |
-| 正常終了時 | Version付き成果物を保存する |
-| 失敗時 | Releaseへ昇格しない |
-| 再実行時 | 安定Case IDで冪等再評価する |
+| 目的 | 用途別の初期Prompt VersionをPrompt Registryへ登録する。 呼出元はQuality Bootstrap Job。 |
+| 入力 | Git管理Template、Prompt FQN、Registry URI、Git Commit。 Triggerは初回BootstrapまたはTemplate追加時。 |
+| 処理 | Templateを検証し用途別Promptを登録する。Aliasは変更しない。 検索判断、Rewrite、回答、検証を別Promptに分ける。 登録RunへVersionとCommitを記録する。 |
+| 出力 | MLflow Prompt Version。 候補Prompt Versionを作る。 後続はHoldout評価とRelease Manifest作成。 |
+| 失敗・再実行 | AliasとRelease Manifestを変更しない。 Template hashを照合して不要な再登録を避ける。 |
 
 ```python
 """検索判定、Query Rewrite、回答生成、回答検証の初期PromptをMLflow Prompt Registryへ登録するModule。Promptの本番Alias切替やモデルWeight更新は行わない。
@@ -3247,14 +4488,8 @@ def register_prompt(name: str, template: str) -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     prompt = mlflow.genai.register_prompt(
         name=name,
@@ -3274,14 +4509,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     for name, template in PROMPTS.items():
         register_prompt(name, template)
@@ -3327,6 +4556,21 @@ Pipelineの`configuration`には、`internal_docs.source_path`、`internal_docs.
 ###### 4.2.4.3.1 文書管理台帳の準備と文書登録Workflow
 
 `document_source_manifest`という名前であるが、JSONやYAMLのManifest Fileではない。Unity Catalogの`main.llmops` Schemaで管理するDelta Tableであり、論理文書の現在状態、最新のACL／Title／公開範囲、有効期間、現在公開する文書VersionへのPointerを保持する。Pipelineは`SELECT`だけを行い、利用者やRealtime Agentから直接更新させない。
+
+Version Registryも独立したDatabricks Serviceではない。Delta Table`main.llmops.document_version_registry`として、文書Versionごとの取込、Parse、Prep、Chunk、審査状態を履歴化する。Document Manifestが「現在公開する版」を示すのに対し、Version Registryは公開されていない版を含む処理・審査履歴を保持するため、この登録工程から必要になる。
+
+```mermaid
+flowchart TD
+    CMD["Registration・Approval Command"] --> EXEC["apply_manifest_commands.py"]
+    EXEC --> MAN["Document Manifest<br/>現在値と公開Pointer"]
+    EXEC --> REG["Version Registry<br/>Version処理・審査履歴"]
+    REG --> PIPE["Bronze・Attempt・Silver"]
+    MAN --> GOLD["Gold Current<br/>承認Pointer一致だけ公開"]
+    PIPE --> GOLD
+    GOLD --> SNAP["Corpus Snapshot・Index Release"]
+    SNAP --> REL["RAG Release Manifest"]
+    REL --> AGENT["Realtime RAG"]
+```
 
 **4.2.4.3.1.1 Service Principalの準備とBootstrap**
 
@@ -3374,7 +4618,7 @@ Schema Migration SPが自分自身へ`USE CATALOG`、`CREATE TABLE`、Warehouse�
 | Reconciliation SP | `sp-internal-docs-reconciliation` | Account／IdP管理者がIaCで作成・割当 | Reconciliation Job | `${var.reconciliation_sp_application_id}` | Manifest／Current／Volume参照、候補表書込。自動承認・削除は禁止 |
 | Search Publish SP | `sp-internal-docs-search-publish` | Account／IdP管理者がIaCで作成・割当 | Search Sync Publish、AI Search Index更新 | `${var.search_publish_sp_application_id}` | Gold参照、Sync Table／Index更新。Manifest更新は禁止 |
 | Quality SP | `sp-internal-docs-quality` | Account／IdP管理者がQuality Bundle用に作成・割当 | Evaluation、Optimization、Review同期、Release Gate | Quality Bundleの`${var.quality_sp_application_id}` | EvaluationDataset、Experiment、Prompt／Release管理。Manifest公開Pointerは禁止 |
-| Realtime Agent SP | Databricks Appsが生成する専用名 | App作成時にDatabricksが自動作成・同じWorkspaceへ関連付け | Streamlit／Agent Server | `${resources.apps.internal_rag_app.service_principal_client_id}`でGrant先を参照し、Jobの`run_as`には使わない | Gold／AI Search／Model endpointの参照だけ |
+| Realtime Agent SP | Databricks Appsが生成する専用名 | App作成時にDatabricksが自動作成・同じWorkspaceへ関連付け | Streamlit／Agent Server | `${resources.apps.internal_rag_app.service_principal_client_id}`でGrant先を参照し、Jobの`run_as`には使わない | Gold／AI Searchの参照とModel Service`EXECUTE`だけ |
 | Bundle Deploy Identity | 組織CI/CD用Identity | Platform管理者が別途作成・割当 | Terraform／DAB Validate・Deploy | `DATABRICKS_CLIENT_ID`とFederationで認証 | Resource作成権限と`roles/servicePrincipal.user`。業務Data権限は原則付与しない |
 
 修正前後の参照監査結果は次のとおりである。「作成」「Workspace割当」はDAB内ではなく前述のTerraformまたはApps Control Planeが担当する。
@@ -3405,22 +4649,15 @@ Realtime AgentのService PrincipalはDatabricks AppsがAppごとに自動作成�
 
 `infra/identity/main.tf`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Account情報、環境名、IdP Application ID／出力: Service PrincipalとID Output |
-| 関連Job／Pipeline | Account／IdP管理者のIaC Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | StateとIdentityを一致させる。Application Deployを開始しない。 |
-| ファイルパス | `infra/identity/main.tf` |
-| 実行主体 | Account／IdP管理者のIaC Deploy Identity |
-| 入力 | Account情報、環境名、IdP Application ID |
-| 出力 | Service PrincipalとID Output |
-| 必要な理由 | DAB前に実行Identityを準備するため |
-| 正常終了時 | StateとIdentityを一致させる |
-| 失敗時 | Application Deployを開始しない |
-| 再実行時 | Stateを再読し差分確認後に再Applyする |
+| 目的 | Account層のWorkload Service Principalを作成または既存IdP Applicationへ関連付ける。 呼出元はPlatform CI/CD。 |
+| 入力 | Account情報、環境名、外部Application ID Map。 TriggerはApplication Bundle導入前とIdentity変更時。 |
+| 処理 | 役割別Principalをfor_eachで作成する。 人用IdentityをJobへ流用しない。 Bootstrap監査はPlan／Stateで保持する。 |
+| 出力 | Service PrincipalとTerraform State。 Application IDをoutputs.tfへ渡す。 後続はworkspace_assignments.tf。 |
+| 失敗・再実行 | Apply失敗時はDABへ未確定IDを渡さない。 Stateを再読し既存Principalはimportする。 |
 
 ```hcl
 # Terraform本体とProviderのVersion要件を定義する。
@@ -3450,7 +4687,6 @@ provider "databricks" {
   account_id = var.account_id
 }
 
-# 複数Resourceで再利用する設定値をまとめる。
 locals {
   # workload_service_principalsに関するTerraform設定を定義する。
   workload_service_principals = {
@@ -3475,7 +4711,6 @@ locals {
   }
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_service_principal" "workload" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.account
@@ -3495,43 +4730,30 @@ resource "databricks_service_principal" "workload" {
 
 `infra/identity/variables.tf`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Account情報、環境名、IdP Application ID／出力: Service PrincipalとID Output |
-| 関連Job／Pipeline | Account／IdP管理者のIaC Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | StateとIdentityを一致させる。Application Deployを開始しない。 |
-| ファイルパス | `infra/identity/variables.tf` |
-| 実行主体 | Account／IdP管理者のIaC Deploy Identity |
-| 入力 | Account情報、環境名、IdP Application ID |
-| 出力 | Service PrincipalとID Output |
-| 必要な理由 | DAB前に実行Identityを準備するため |
-| 正常終了時 | StateとIdentityを一致させる |
-| 失敗時 | Application Deployを開始しない |
-| 再実行時 | Stateを再読し差分確認後に再Applyする |
+| 目的 | Account Identity IaCの非Secret入力と検証条件を定義する。 呼出元はinfra/identity/main.tf。 |
+| 入力 | tfvars／CIのAccount情報とApplication ID。 TriggerはTerraform plan時。 |
+| 処理 | 型、Default、Validationを定義する。 Secret値をStateへ渡さない。 Trace更新なし。 |
+| 出力 | Terraform入力Schema。 main.tfへ検証済み入力を渡す。 後続はmain.tfとoutputs.tf。 |
+| 失敗・再実行 | Validation Errorでplanを停止する。 同じtfvarsから同じPlanを生成する。 |
 
 ```hcl
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "account_host" {
-  # 変数・出力・Resourceの用途を説明する。
   description = "Databricks Account Console URL"
   # 入力変数の型を定義する。
   type        = string
 }
 
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "account_id" {
-  # 変数・出力・Resourceの用途を説明する。
   description = "Databricks Account ID"
   # 入力変数の型を定義する。
   type        = string
 }
 
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "environment" {
-  # 変数・出力・Resourceの用途を説明する。
   description = "dev、stg、prodのいずれか"
   # 入力変数の型を定義する。
   type        = string
@@ -3544,9 +4766,7 @@ variable "environment" {
   }
 }
 
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "external_application_ids" {
-  # 変数・出力・Resourceの用途を説明する。
   description = "IdP管理SPを使う論理名とApplication ID。Databricks-managed SPでは空Map"
   # 入力変数の型を定義する。
   type        = map(string)
@@ -3557,27 +4777,19 @@ variable "external_application_ids" {
 
 `infra/identity/outputs.tf`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Account情報、環境名、IdP Application ID／出力: Service PrincipalとID Output |
-| 関連Job／Pipeline | Account／IdP管理者のIaC Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | StateとIdentityを一致させる。Application Deployを開始しない。 |
-| ファイルパス | `infra/identity/outputs.tf` |
-| 実行主体 | Account／IdP管理者のIaC Deploy Identity |
-| 入力 | Account情報、環境名、IdP Application ID |
-| 出力 | Service PrincipalとID Output |
-| 必要な理由 | DAB前に実行Identityを準備するため |
-| 正常終了時 | StateとIdentityを一致させる |
-| 失敗時 | Application Deployを開始しない |
-| 再実行時 | Stateを再読し差分確認後に再Applyする |
+| 目的 | Service PrincipalのApplication IDを後続IaC／DABへ公開する。 呼出元はTerraform apply後のCI/CD。 |
+| 入力 | main.tfのService Principal Resource。 TriggerはIdentity Bootstrap成功後。 |
+| 処理 | 役割名をKeyとしてIDを出力する。 SecretやTokenを出力しない。 Trace更新なし。 |
+| 出力 | Application IDのOutput Map。 CIがDAB変数へ注入できる。 後続はinfra/databricksとrun_as。 |
+| 失敗・再実行 | Resource未作成ならPipelineを停止する。 State由来の同じ値を再利用する。 |
 
 ```hcl
 # 後続のDAB／CI/CDへ渡す作成済みIDを出力する。
 output "service_principal_application_ids" {
-  # 変数・出力・Resourceの用途を説明する。
   description = "DAB run_asとUnity Catalog GRANTへ渡すApplication ID"
   # Outputとして返す値を指定する。
   value = {
@@ -3589,7 +4801,6 @@ output "service_principal_application_ids" {
 
 # 後続のDAB／CI/CDへ渡す作成済みIDを出力する。
 output "service_principal_scim_ids" {
-  # 変数・出力・Resourceの用途を説明する。
   description = "Workspace Assignmentで使うDatabricks Account SCIM ID"
   # Outputとして返す値を指定する。
   value = {
@@ -3616,22 +4827,15 @@ Service Principalを削除すると、所有Resource、Jobの`run_as`、Grant、
 
 `infra/databricks/versions.tf`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Workspace情報とApplication／SCIM ID／出力: Workspace割当、Entitlement、Grant |
-| 関連Job／Pipeline | Platform管理者のIaC Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 最小権限をStateへ反映する。後続Jobを起動しない。 |
-| ファイルパス | `infra/databricks/versions.tf` |
-| 実行主体 | Platform管理者のIaC Deploy Identity |
-| 入力 | Workspace情報とApplication／SCIM ID |
-| 出力 | Workspace割当、Entitlement、Grant |
-| 必要な理由 | 権限管理をアプリDABから分離するため |
-| 正常終了時 | 最小権限をStateへ反映する |
-| 失敗時 | 後続Jobを起動しない |
-| 再実行時 | 段階Flagを維持して再Applyする |
+| 目的 | Workspace Bootstrap用TerraformとProviderのVersion境界を固定する。 呼出元はPlatform CI/CD。 |
+| 入力 | Terraform CLIとProvider Registry。 Triggerは初回BootstrapとProvider更新時。 |
+| 処理 | required_versionとrequired_providersを宣言する。 未検証Major更新を避ける。 Trace更新なし。 |
+| 出力 | Lock Fileで固定されるProvider。 再現可能なVersionでPlanする。 後続はvariables.tfとWorkspace Resource。 |
+| 失敗・再実行 | 不一致ならinit／planを停止する。 Lock Fileを再利用する。 |
 
 ```hcl
 # Terraform本体とProviderのVersion要件を定義する。
@@ -3672,54 +4876,34 @@ provider "databricks" {
 
 `infra/databricks/variables.tf`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Workspace情報とApplication／SCIM ID／出力: Workspace割当、Entitlement、Grant |
-| 関連Job／Pipeline | Platform管理者のIaC Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 最小権限をStateへ反映する。後続Jobを起動しない。 |
-| ファイルパス | `infra/databricks/variables.tf` |
-| 実行主体 | Platform管理者のIaC Deploy Identity |
-| 入力 | Workspace情報とApplication／SCIM ID |
-| 出力 | Workspace割当、Entitlement、Grant |
-| 必要な理由 | 権限管理をアプリDABから分離するため |
-| 正常終了時 | 最小権限をStateへ反映する |
-| 失敗時 | 後続Jobを起動しない |
-| 再実行時 | 段階Flagを維持して再Applyする |
+| 目的 | Workspace割当、UC Grant、MLflow権限の環境別入力を宣言する。 呼出元はinfra/databricks配下のResource。 |
+| 入力 | CI tfvars、Identity Output、Catalog／Schema／Group名。 Triggerはplan時とEnvironment切替時。 |
+| 処理 | Workspace ID、Principal ID、Securable名を型付きで受ける。 環境間ID混在と空Principalを防ぐ。 Trace更新なし。 |
+| 出力 | Terraform入力Schema。 全Bootstrap Resourceが同じ入力を参照する。 後続はWorkspace AssignmentとGrant。 |
+| 失敗・再実行 | Validation失敗時は権限変更しない。 同じStateとtfvarsへ収束する。 |
 
 ```hcl
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "account_host" { type = string }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "account_id" { type = string }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "workspace_host" { type = string }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "catalog_name" { type = string }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "schema_name" { type = string }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "admin_warehouse_id" { type = string }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "bundle_deployer_group_name" { type = string }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "service_principal_application_ids" { type = map(string) }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "service_principal_scim_ids" { type = map(string) }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "enable_runtime_grants" {
-  # 変数・出力・Resourceの用途を説明する。
   description = "Manifest初期化後に運用SPのBase Table Grantを作る"
   # 入力変数の型を定義する。
   type        = bool
   # 入力が省略された場合の既定値を設定する。
   default     = false
 }
-# 環境またはCI/CDから受け取る入力変数を宣言する。
 variable "enable_pipeline_grants" {
-  # 変数・出力・Resourceの用途を説明する。
   description = "Pipeline初回成功後にSilver／Gold／Sync Table Grantを作る"
   # 入力変数の型を定義する。
   type        = bool
@@ -3730,25 +4914,17 @@ variable "enable_pipeline_grants" {
 
 `infra/databricks/workspace_assignments.tf`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Workspace情報とApplication／SCIM ID／出力: Workspace割当、Entitlement、Grant |
-| 関連Job／Pipeline | Platform管理者のIaC Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 最小権限をStateへ反映する。後続Jobを起動しない。 |
-| ファイルパス | `infra/databricks/workspace_assignments.tf` |
-| 実行主体 | Platform管理者のIaC Deploy Identity |
-| 入力 | Workspace情報とApplication／SCIM ID |
-| 出力 | Workspace割当、Entitlement、Grant |
-| 必要な理由 | 権限管理をアプリDABから分離するため |
-| 正常終了時 | 最小権限をStateへ反映する |
-| 失敗時 | 後続Jobを起動しない |
-| 再実行時 | 段階Flagを維持して再Applyする |
+| 目的 | Workload Principalを対象Workspaceへ割り当てる。 呼出元はPlatform CI/CD。 |
+| 入力 | Workspace IDとPrincipal ID Map。 TriggerはIdentity作成後、UC Grant前。 |
+| 処理 | PrincipalごとにWorkspace Assignmentを作る。 権限付与より先にWorkspace所属を成立させる。 Trace更新なし。 |
+| 出力 | permission_assignment Resource。 Principalが対象Workspaceで解決できる。 後続はbootstrap_permissions.tf。 |
+| 失敗・再実行 | 失敗時は後続GrantとDAB Deployを止める。 for_eachとStateで重複作成しない。 |
 
 ```hcl
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_permission_assignment" "workload" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -3761,7 +4937,6 @@ resource "databricks_permission_assignment" "workload" {
   permissions            = ["USER"]
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_entitlements" "workload" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -3791,7 +4966,6 @@ data "databricks_group" "bundle_deployers" {
   display_name = var.bundle_deployer_group_name
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_access_control_rule_set" "bundle_deployer_can_use_run_identity" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.account
@@ -3816,31 +4990,22 @@ resource "databricks_access_control_rule_set" "bundle_deployer_can_use_run_ident
 
 `infra/databricks/bootstrap_permissions.tf`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Workspace情報とApplication／SCIM ID／出力: Workspace割当、Entitlement、Grant |
-| 関連Job／Pipeline | Platform管理者のIaC Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 最小権限をStateへ反映する。後続Jobを起動しない。 |
-| ファイルパス | `infra/databricks/bootstrap_permissions.tf` |
-| 実行主体 | Platform管理者のIaC Deploy Identity |
-| 入力 | Workspace情報とApplication／SCIM ID |
-| 出力 | Workspace割当、Entitlement、Grant |
-| 必要な理由 | 権限管理をアプリDABから分離するため |
-| 正常終了時 | 最小権限をStateへ反映する |
-| 失敗時 | 後続Jobを起動しない |
-| 再実行時 | 段階Flagを維持して再Applyする |
+| 目的 | Bootstrap IdentityへDDLに必要な最小権限を付与する。 呼出元はPlatform CI/CD。 |
+| 入力 | Catalog／Schema／Volume名、Migration Principal。 TriggerはWorkspace割当後、初回DDL前。 |
+| 処理 | Catalog利用、Schema作成、Volume操作を付与する。 Runtime PrincipalへDDL権限を広げない。 Trace更新なし。 |
+| 出力 | UC Grant。 Migration Jobだけが管理Tableを作れる。 後続は00_create_document_manifest.sql。 |
+| 失敗・再実行 | Grant失敗時はDDL Jobを開始しない。 StateとGrant一覧へ収束する。 |
 
 ```hcl
-# 複数Resourceで再利用する設定値をまとめる。
 locals {
   # schema_migration_application_idに関するTerraform設定を定義する。
   schema_migration_application_id = var.service_principal_application_ids["schema_migration"]
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "schema_migration_catalog" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider   = databricks.workspace
@@ -3852,7 +5017,6 @@ resource "databricks_grant" "schema_migration_catalog" {
   privileges = ["USE_CATALOG"]
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "schema_migration_schema" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider   = databricks.workspace
@@ -3864,7 +5028,6 @@ resource "databricks_grant" "schema_migration_schema" {
   privileges = ["USE_SCHEMA", "CREATE_TABLE", "CREATE_VOLUME"]
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_permissions" "schema_migration_warehouse" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider         = databricks.workspace
@@ -3886,151 +5049,91 @@ resource "databricks_permissions" "schema_migration_warehouse" {
 
 `bundles/ingestion/databricks.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 環境別DAB変数とResource定義／出力: Job／Pipeline／App設定 |
-| 関連Job／Pipeline | Bundle Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Validate後にDeployする。既存Resourceを維持する。 |
-| ファイルパス | `bundles/ingestion/databricks.yml` |
-| 実行主体 | Bundle Deploy Identity |
-| 入力 | 環境別DAB変数とResource定義 |
-| 出力 | Job／Pipeline／App設定 |
-| 必要な理由 | 実行Identityと環境差分を宣言するため |
-| 正常終了時 | Validate後にDeployする |
-| 失敗時 | 既存Resourceを維持する |
-| 再実行時 | 同じTargetで再Validate／Deployする |
+| 目的 | Ingestion Bundleの変数、Include、Target、run_as契約を定義する。 呼出元はDAB validate／deploy／run。 |
+| 入力 | Terraform Output、CI変数、Resource YAML。 TriggerはEnvironment Deploy時。 |
+| 処理 | 変数を宣言しResource YAMLをincludeする。 個人IdentityへのFallbackを許さない。 Trace更新なし。 |
+| 出力 | Pipeline、Job、環境別設定。 全Resourceを同じEnvironment設定でDeployする。 後続はManifest Job、Pipeline、Publish Job。 |
+| 失敗・再実行 | 未解決参照ならvalidateを失敗させる。 同じResource Keyを更新する。 |
 
 ```yaml
-# Bundle自体の識別情報を定義する。
 bundle:
-  # Databricks上で表示・参照するResource名を設定する。
   name: internal-docs-ingestion
 
-# 別YAMLのResource定義をBundleへ読み込む。
 include:
   - resources/*.yml
 
 # 環境ごとに差し替えるBundle変数を宣言する。
 variables:
-  # schema_migration_sp_application_idに関する設定値を定義する。
   schema_migration_sp_application_id:
-    # descriptionに関する設定値を定義する。
     description: ManifestやVersion Registryを初期作成するSPのApplication ID
-  # document_registration_sp_application_idに関する設定値を定義する。
   document_registration_sp_application_id:
-    # descriptionに関する設定値を定義する。
     description: 文書仮登録と未公開管理属性更新を行うSPのApplication ID
-  # document_approval_sp_application_idに関する設定値を定義する。
   document_approval_sp_application_id:
-    # descriptionに関する設定値を定義する。
     description: Version審査確定と公開Pointer更新を行うSPのApplication ID
-  # manifest_command_executor_sp_application_idに関する設定値を定義する。
   manifest_command_executor_sp_application_id:
-    # descriptionに関する設定値を定義する。
     description: 検証済み登録／承認CommandをManifestへ反映する非対話SPのApplication ID
-  # ingestion_sp_application_idに関する設定値を定義する。
   ingestion_sp_application_id:
-    # descriptionに関する設定値を定義する。
     description: Lakeflow PipelineとVersion Registry Syncを実行するSPのApplication ID
-  # reconciliation_sp_application_idに関する設定値を定義する。
   reconciliation_sp_application_id:
-    # descriptionに関する設定値を定義する。
     description: Manifest、Volume、Gold、Indexの差分候補を作るSPのApplication ID
-  # search_publish_sp_application_idに関する設定値を定義する。
   search_publish_sp_application_id:
-    # descriptionに関する設定値を定義する。
     description: Gold CurrentをSearch Sync TableとAI Searchへ反映するSPのApplication ID
-  # catalog_nameに関する設定値を定義する。
   catalog_name:
-    # 変数未指定時に使う既定値を設定する。
     default: main
-  # schema_nameに関する設定値を定義する。
   schema_name:
-    # 変数未指定時に使う既定値を設定する。
     default: llmops
-  # admin_warehouse_idに関する設定値を定義する。
   admin_warehouse_id:
-    # descriptionに関する設定値を定義する。
     description: Schema Migration SQL Taskが使用するWarehouse ID
-  # schema_migration_groupに関する設定値を定義する。
   schema_migration_group:
-    # descriptionに関する設定値を定義する。
     description: Migration Jobを起動できる管理Group
-  # document_registrars_groupに関する設定値を定義する。
   document_registrars_group:
-    # descriptionに関する設定値を定義する。
     description: Registration Jobを起動できる登録者Group
-  # document_approvers_groupに関する設定値を定義する。
   document_approvers_group:
-    # descriptionに関する設定値を定義する。
     description: Approval Jobを起動できる承認者Group
-  # ingestion_operators_groupに関する設定値を定義する。
   ingestion_operators_group:
-    # descriptionに関する設定値を定義する。
     description: Ingestion系Jobを運用できるGroup
-  # search_operators_groupに関する設定値を定義する。
   search_operators_group:
-    # descriptionに関する設定値を定義する。
     description: Search Publish／Index Jobを運用できるGroup
-  # source_pathに関する設定値を定義する。
   source_path:
-    # descriptionに関する設定値を定義する。
     description: 監視対象Volume Path
-  # image_output_pathに関する設定値を定義する。
   image_output_path:
-    # descriptionに関する設定値を定義する。
     description: ai_parse_documentの画像出力Volume Path
-  # git_commitに関する設定値を定義する。
   git_commit:
-    # descriptionに関する設定値を定義する。
     description: CI/CDが注入するDeploy対象Git Commit SHA
-  # bundle_versionに関する設定値を定義する。
   bundle_version:
-    # descriptionに関する設定値を定義する。
     description: CI/CDが注入する不変Build／Bundle Version
 
-# dev／staging／prodなどDeploy先環境を定義する。
 targets:
-  # devに関する設定値を定義する。
   dev:
-    # 変数未指定時に使う既定値を設定する。
     default: true
     # Deploy先Workspace内の配置設定を定義する。
     workspace:
-      # hostに関する設定値を定義する。
       host: https://<dev-workspace-host>
       # Bundle ArtifactとStateを配置するWorkspace Pathを設定する。
       root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
-  # stgに関する設定値を定義する。
   stg:
     # Deploy先Workspace内の配置設定を定義する。
     workspace:
-      # hostに関する設定値を定義する。
       host: https://<stg-workspace-host>
       # Bundle ArtifactとStateを配置するWorkspace Pathを設定する。
       root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
-  # prodに関する設定値を定義する。
   prod:
     # 開発用Prefixや権限制御を適用するBundle Modeを設定する。
     mode: production
     # Deploy先Workspace内の配置設定を定義する。
     workspace:
-      # hostに関する設定値を定義する。
       host: https://<prod-workspace-host>
       # Bundle ArtifactとStateを配置するWorkspace Pathを設定する。
       root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
-    # Bundleが作成・更新するDatabricks Resourceを定義する。
     resources:
       # Lakeflow Job Resourceを定義する。
       jobs:
-        # manifest_command_executor_jobに関する設定値を定義する。
         manifest_command_executor_job:
-          # scheduleに関する設定値を定義する。
           schedule:
-            # pause_statusに関する設定値を定義する。
             pause_status: UNPAUSED
 ```
 
@@ -4059,68 +5162,108 @@ Quality Bundleは`quality_sp_application_id`を自身の`databricks.yml`へ宣�
 
 `bundles/quality/databricks.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 環境別DAB変数とResource定義／出力: Job／Pipeline／App設定 |
-| 関連Job／Pipeline | Bundle Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Validate後にDeployする。既存Resourceを維持する。 |
-| ファイルパス | `bundles/quality/databricks.yml` |
-| 実行主体 | Bundle Deploy Identity |
-| 入力 | 環境別DAB変数とResource定義 |
-| 出力 | Job／Pipeline／App設定 |
-| 必要な理由 | 実行Identityと環境差分を宣言するため |
-| 正常終了時 | Validate後にDeployする |
-| 失敗時 | 既存Resourceを維持する |
-| 再実行時 | 同じTargetで再Validate／Deployする |
+| 目的 | Quality BundleのExperiment、Model Service、Dataset、監視参照を一元化する。 呼出元はDAB validate／deploy／run。 |
+| 入力 | Bootstrap出力、CI変数、Resource YAML。 TriggerはQuality環境Deploy時。 |
+| 処理 | 三Experiment IDと用途別Model Serviceを各Jobへ注入する。 名前FallbackとModel用途混同を禁止する。 各Jobを指定Experimentへ記録する。 |
+| 出力 | Quality Jobの環境変数。 全Taskが承認済みResourceを参照する。 後続はEvaluation、Monitoring、改善Job。 |
+| 失敗・再実行 | 必須変数欠落時は起動しない。 Resource KeyとCase IDで冪等化する。 |
 
 ```yaml
-# Bundle自体の識別情報を定義する。
 bundle:
-  # Databricks上で表示・参照するResource名を設定する。
   name: internal-docs-quality
 
-# 別YAMLのResource定義をBundleへ読み込む。
 include:
   - resources/*.yml
 
 # 環境ごとに差し替えるBundle変数を宣言する。
 variables:
-  # quality_sp_application_idに関する設定値を定義する。
   quality_sp_application_id:
-    # descriptionに関する設定値を定義する。
     description: Evaluation、Optimization、Review、Release Jobを実行するSPのApplication ID
+  # ExperimentとUC Trace Tableを初回作成する限定Bootstrap SPを指定する。
+  mlflow_bootstrap_sp_application_id:
+    description: MLflow ExperimentとUC Trace Locationを初回作成するSPのApplication ID
+  # 本番Realtime Trace専用ExperimentのWorkspace Pathを指定する。
+  realtime_experiment_name:
+    description: Realtime Experimentの環境別Path
+  # Release評価とOptimization Run専用ExperimentのWorkspace Pathを指定する。
+  evaluation_experiment_name:
+    description: Evaluation Experimentの環境別Path
+  # Labeling Session側TraceとAssessment専用ExperimentのWorkspace Pathを指定する。
+  labeling_experiment_name:
+    description: Labeling Experimentの環境別Path
+  # Bootstrap後にCIが保存した3つの不変Experiment IDを後続Jobへ渡す。
+  realtime_experiment_id:
+    description: Realtime Experiment ID
+  evaluation_experiment_id:
+    description: Evaluation Experiment ID
+  labeling_experiment_id:
+    description: Labeling Experiment ID
+  # UC Trace 4表を作成するCatalog、Schema、共通Table Prefixを指定する。
+  trace_catalog:
+    description: UC Trace Tableを配置するCatalog
+  trace_schema:
+    description: UC Trace Tableを配置するSchema
+  trace_table_prefix:
+    description: Realtime Experiment用OTel Table Prefix
+  # UC Trace QueryとProduction Monitoringが使うSQL Warehouseを指定する。
+  monitoring_sql_warehouse_id:
+    description: Monitoring SQL Warehouse ID
+  # Defaultを使えないWorkspaceでMonitoring Serverless費用を統制するPolicyを指定する。
+  serverless_budget_policy_id:
+    description: MLflow Monitoring用Serverless Budget Policy ID
+    default: ""
+  default_budget_policy_allowed:
+    description: Workspace Default Monitoring Budget Policyを使用できるか
+    default: "false"
+  # Runtimeと評価で使用する用途別Model Service FQNを別々に指定する。
+  answer_model_service:
+    description: RAG回答生成用Unity AI Gateway Model Service FQN
+  judge_model_service:
+    description: 評価用Unity AI Gateway Model Service FQN
+  prompt_optimization_reflection_model:
+    description: GepaPromptOptimizer用databricks:/Model Service URI
+  judge_alignment_reflection_model:
+    description: MemAlignOptimizer用databricks:/Model Service URI
+  # Release Gateが固定して読むPrompt、Dataset、Indexを明示する。
+  answer_prompt_uri:
+    description: Release Gateで検証済みの不変Answer Prompt Version URI
+  holdout_dataset_name:
+    description: 最終判定専用MLflow EvaluationDataset FQN
+    default: main.llmops.internal_rag_holdout
+  index_name_current:
+    description: PreflightとReleaseがQueryする現行AI Search Index FQN
+  # Operational MonitoringのSQL実行面と通知先を環境別に注入する。
+  sql_warehouse_id:
+    description: Operational Monitoring SQL Warehouse ID
+  ops_group_email:
+    description: 個人ではない運用Group Mail
+  ops_system_destination_id:
+    description: 管理者作成済みSystem Destination ID
 
 # Job／Pipelineを実行する非対話Identityを指定する。
 run_as:
   # 実行または権限付与対象のService Principal Application IDを指定する。
   service_principal_name: ${var.quality_sp_application_id}
 
-# dev／staging／prodなどDeploy先環境を定義する。
 targets:
-  # devに関する設定値を定義する。
   dev:
-    # 変数未指定時に使う既定値を設定する。
     default: true
     # Deploy先Workspace内の配置設定を定義する。
     workspace:
-      # hostに関する設定値を定義する。
       host: https://<dev-workspace-host>
-  # stgに関する設定値を定義する。
   stg:
     # Deploy先Workspace内の配置設定を定義する。
     workspace:
-      # hostに関する設定値を定義する。
       host: https://<stg-workspace-host>
-  # prodに関する設定値を定義する。
   prod:
     # 開発用Prefixや権限制御を適用するBundle Modeを設定する。
     mode: production
     # Deploy先Workspace内の配置設定を定義する。
     workspace:
-      # hostに関する設定値を定義する。
       host: https://<prod-workspace-host>
 ```
 
@@ -4147,22 +5290,15 @@ Realtime BundleはAppsが作成したIdentityを`${resources.apps.internal_rag_a
 
 `bundles/ingestion/src/00_create_document_manifest.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 上流Datasetまたは管理Table／出力: Table／View／検証結果 |
-| 関連Job／Pipeline | 対応するPipeline／Migration／Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 期待Schemaまたは0件の違反を得る。公開せずPipeline／Gateを停止する。 |
-| ファイルパス | `bundles/ingestion/src/00_create_document_manifest.sql` |
-| 実行主体 | 対応するPipeline／Migration／Quality SP |
-| 入力 | 上流Datasetまたは管理Table |
-| 出力 | Table／View／検証結果 |
-| 必要な理由 | 表変換と公開条件を宣言的に表すため |
-| 正常終了時 | 期待Schemaまたは0件の違反を得る |
-| 失敗時 | 公開せずPipeline／Gateを停止する |
-| 再実行時 | Checkpointまたは物理Attemptから再評価する |
+| 目的 | 文書登録・承認・監査・Version状態の正本TableとVolumeを作る。 呼出元はManifest Schema Migration Task。 |
+| 入力 | Catalog／Schema、既存DDL Version。 Triggerは初回DeployとMigration時。 |
+| 処理 | VolumeとDelta Tableを依存順に作る。 情報制約へ依存せずPointerと技術状態を分離する。 CommandとAudit Eventを監査Evidenceにする。 |
+| 出力 | Manifest、Registry、Command／Audit Table、Volume。 登録・承認Workflowの正本が揃う。 後続はManifest JobとPipeline。 |
+| 失敗・再実行 | DDL失敗時はExecutorとPipelineを止める。 IF NOT EXISTSと追加Migrationで再適用する。 |
 
 ```sql
 -- Unity Catalog配下の管理対象Delta TableをSchema Migration SPが作成する。
@@ -4404,31 +5540,21 @@ COMMENT 'Volume、Manifest、Current、Indexの差分と対応状況';
 
 `bundles/ingestion/resources/document_manifest_job.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 環境別DAB変数とResource定義／出力: Job／Pipeline／App設定 |
-| 関連Job／Pipeline | Bundle Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Validate後にDeployする。既存Resourceを維持する。 |
-| ファイルパス | `bundles/ingestion/resources/document_manifest_job.yml` |
-| 実行主体 | Bundle Deploy Identity |
-| 入力 | 環境別DAB変数とResource定義 |
-| 出力 | Job／Pipeline／App設定 |
-| 必要な理由 | 実行Identityと環境差分を宣言するため |
-| 正常終了時 | Validate後にDeployする |
-| 失敗時 | 既存Resourceを維持する |
-| 再実行時 | 同じTargetで再Validate／Deployする |
+| 目的 | 台帳DDL、Command適用、Registry同期、整合性検査をJob化する。 呼出元はDAB Deploy後のSchedule／手動Run。 |
+| 入力 | Bundle変数、Manifest Python／SQL Source。 Triggerは初期化、Command到着、定期同期。 |
+| 処理 | Migration、Executor、Registry Sync、Invariant Testを順序付ける。 人用入力TaskとBase更新Taskを別Principalにする。 Command IDとRun IDをAuditへ残す。 |
+| 出力 | Lakeflow JobとTask Run。 ManifestとRegistryが整合する。 後続はPipelineとReconciliation。 |
+| 失敗・再実行 | 失敗後は公開Pointerを変えない。 Command IDで再適用を防ぐ。 |
 
 ```yaml
-# Bundleが作成・更新するDatabricks Resourceを定義する。
 resources:
   # Lakeflow Job Resourceを定義する。
   jobs:
-    # document_manifest_init_jobに関する設定値を定義する。
     document_manifest_init_job:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-manifest-init
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4446,18 +5572,12 @@ resources:
       tasks:
         # Taskを一意に識別するKeyを設定する。
         - task_key: create_manifest_tables
-          # sql_taskに関する設定値を定義する。
           sql_task:
-            # PipelineへSource Fileを追加する。
             file:
-              # 参照するSource FileまたはWorkspace Pathを設定する。
               path: ../src/00_create_document_manifest.sql
-            # warehouse_idに関する設定値を定義する。
             warehouse_id: ${var.admin_warehouse_id}
 
-    # document_registration_jobに関する設定値を定義する。
     document_registration_job:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-submit-registration
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4473,37 +5593,21 @@ resources:
           level: CAN_MANAGE_RUN
       # Sourceへ渡す固定引数またはBundle変数を列挙する。
       parameters:
-        # Databricks上で表示・参照するResource名を設定する。
         - name: staging_uri
-          # 変数未指定時に使う既定値を設定する。
           default: ''
-        # Databricks上で表示・参照するResource名を設定する。
         - name: source_uri
-          # 変数未指定時に使う既定値を設定する。
           default: ''
-        # Databricks上で表示・参照するResource名を設定する。
         - name: source_title
-          # 変数未指定時に使う既定値を設定する。
           default: ''
-        # Databricks上で表示・参照するResource名を設定する。
         - name: scan_request_id
-          # 変数未指定時に使う既定値を設定する。
           default: ''
-        # Databricks上で表示・参照するResource名を設定する。
         - name: allowed_principals_json
-          # 変数未指定時に使う既定値を設定する。
           default: '[]'
-        # Databricks上で表示・参照するResource名を設定する。
         - name: data_classification
-          # 変数未指定時に使う既定値を設定する。
           default: internal
-        # Databricks上で表示・参照するResource名を設定する。
         - name: publication_scope
-          # 変数未指定時に使う既定値を設定する。
           default: internal
-        # Databricks上で表示・参照するResource名を設定する。
         - name: policy_version
-          # 変数未指定時に使う既定値を設定する。
           default: acl-v1
       # Job内で実行するTaskと依存順を定義する。
       tasks:
@@ -4532,15 +5636,11 @@ resources:
         - environment_key: default
           # EnvironmentへInstallするDependencyを定義する。
           spec:
-            # environment_versionに関する設定値を定義する。
             environment_version: '3'
-            # dependenciesに関する設定値を定義する。
             dependencies:
               - databricks-sdk==0.65.0
 
-    # document_version_registry_sync_jobに関する設定値を定義する。
     document_version_registry_sync_job:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-sync-version-registry
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4570,14 +5670,10 @@ resources:
         - environment_key: default
           # EnvironmentへInstallするDependencyを定義する。
           spec:
-            # environment_versionに関する設定値を定義する。
             environment_version: '3'
-            # dependenciesに関する設定値を定義する。
             dependencies: []
 
-    # document_approval_jobに関する設定値を定義する。
     document_approval_job:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-submit-approval
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4593,25 +5689,15 @@ resources:
           level: CAN_MANAGE_RUN
       # Sourceへ渡す固定引数またはBundle変数を列挙する。
       parameters:
-        # Databricks上で表示・参照するResource名を設定する。
         - name: document_id
-          # 変数未指定時に使う既定値を設定する。
           default: ''
-        # Databricks上で表示・参照するResource名を設定する。
         - name: document_version_id
-          # 変数未指定時に使う既定値を設定する。
           default: ''
-        # Databricks上で表示・参照するResource名を設定する。
         - name: expected_manifest_version
-          # 変数未指定時に使う既定値を設定する。
           default: '-1'
-        # Databricks上で表示・参照するResource名を設定する。
         - name: expected_registry_version
-          # 変数未指定時に使う既定値を設定する。
           default: '-1'
-        # Databricks上で表示・参照するResource名を設定する。
         - name: review_request_id
-          # 変数未指定時に使う既定値を設定する。
           default: ''
       # Job内で実行するTaskと依存順を定義する。
       tasks:
@@ -4637,14 +5723,10 @@ resources:
         - environment_key: default
           # EnvironmentへInstallするDependencyを定義する。
           spec:
-            # environment_versionに関する設定値を定義する。
             environment_version: '3'
-            # dependenciesに関する設定値を定義する。
             dependencies: []
 
-    # manifest_command_executor_jobに関する設定値を定義する。
     manifest_command_executor_job:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-apply-manifest-commands
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4652,13 +5734,9 @@ resources:
         service_principal_name: ${var.manifest_command_executor_sp_application_id}
       # 同じJobの並行Run上限を設定し二重適用を防ぐ。
       max_concurrent_runs: 1
-      # scheduleに関する設定値を定義する。
       schedule:
-        # quartz_cron_expressionに関する設定値を定義する。
         quartz_cron_expression: '0 * * * * ?'
-        # timezone_idに関する設定値を定義する。
         timezone_id: UTC
-        # pause_statusに関する設定値を定義する。
         pause_status: PAUSED
       # Job内で実行するTaskと依存順を定義する。
       tasks:
@@ -4680,14 +5758,10 @@ resources:
         - environment_key: default
           # EnvironmentへInstallするDependencyを定義する。
           spec:
-            # environment_versionに関する設定値を定義する。
             environment_version: '3'
-            # dependenciesに関する設定値を定義する。
             dependencies: []
 
-    # document_reconciliation_jobに関する設定値を定義する。
     document_reconciliation_job:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-reconcile-manifest
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4717,39 +5791,27 @@ resources:
         - environment_key: default
           # EnvironmentへInstallするDependencyを定義する。
           spec:
-            # environment_versionに関する設定値を定義する。
             environment_version: '3'
-            # dependenciesに関する設定値を定義する。
             dependencies: []
 ```
 
 `bundles/ingestion/resources/document_pipeline.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 環境別DAB変数とResource定義／出力: Job／Pipeline／App設定 |
-| 関連Job／Pipeline | Bundle Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Validate後にDeployする。既存Resourceを維持する。 |
-| ファイルパス | `bundles/ingestion/resources/document_pipeline.yml` |
-| 実行主体 | Bundle Deploy Identity |
-| 入力 | 環境別DAB変数とResource定義 |
-| 出力 | Job／Pipeline／App設定 |
-| 必要な理由 | 実行Identityと環境差分を宣言するため |
-| 正常終了時 | Validate後にDeployする |
-| 失敗時 | 既存Resourceを維持する |
-| 再実行時 | 同じTargetで再Validate／Deployする |
+| 目的 | BronzeからGold CurrentまでのLakeflow SDPを定義する。 呼出元はDAB DeployとPipeline Update。 |
+| 入力 | SQL／Python Source、Volume、Manifest。 TriggerはFile到着、Schedule、Refresh。 |
+| 処理 | Sourceを読みBronze、Attempt、Silver、Goldを構築する。 AI Functionを一度だけ物理化し未承認版をGoldへ出さない。 Event Logへ品質Evidenceを残す。 |
+| 出力 | Streaming Table、Materialized View、Event Log。 Silver履歴とGold Currentを更新する。 後続はSearch Publish Job。 |
+| 失敗・再実行 | Error Tableを残し失敗版をGoldへ進めない。 Checkpointから再開する。 |
 
 ```yaml
-# Bundleが作成・更新するDatabricks Resourceを定義する。
 resources:
   # Lakeflow Spark Declarative Pipeline Resourceを定義する。
   pipelines:
-    # internal_docs_pipelineに関する設定値を定義する。
     internal_docs_pipeline:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-medallion-pipeline
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4761,77 +5823,49 @@ resources:
       schema: ${var.schema_name}
       # Serverless Computeを使用するか設定する。
       serverless: true
-      # continuousに関する設定値を定義する。
       continuous: false
       # 開発ModeでPipelineを実行するか設定する。
       development: false
       # Pipeline／Jobへ読み込むSource FileやLibraryを列挙する。
       libraries:
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/01_bronze_ingestion.sql
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/01b_deduplicate_versions.py
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/02_document_parse.sql
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/03_search_prep.sql
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/04_chunks_silver.sql
-        # PipelineへSource Fileを追加する。
         - file:
-            # 参照するSource FileまたはWorkspace Pathを設定する。
             path: ../src/05_gold_current.sql
       # Source Fileから参照するPipeline設定値を定義する。
       configuration:
-        # internal_docs.source_pathに関する設定値を定義する。
         internal_docs.source_path: ${var.source_path}
-        # internal_docs.image_output_pathに関する設定値を定義する。
         internal_docs.image_output_path: ${var.image_output_path}
-        # internal_docs.ai_parse_document_versionに関する設定値を定義する。
         internal_docs.ai_parse_document_version: '1'
-        # internal_docs.ai_prep_search_versionに関する設定値を定義する。
         internal_docs.ai_prep_search_version: '1'
-        # internal_docs.chunk_schema_versionに関する設定値を定義する。
         internal_docs.chunk_schema_version: chunk-v1
 ```
 
 `bundles/ingestion/resources/search_publish_job.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 環境別DAB変数とResource定義／出力: Job／Pipeline／App設定 |
-| 関連Job／Pipeline | Bundle Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Validate後にDeployする。既存Resourceを維持する。 |
-| ファイルパス | `bundles/ingestion/resources/search_publish_job.yml` |
-| 実行主体 | Bundle Deploy Identity |
-| 入力 | 環境別DAB変数とResource定義 |
-| 出力 | Job／Pipeline／App設定 |
-| 必要な理由 | 実行Identityと環境差分を宣言するため |
-| 正常終了時 | Validate後にDeployする |
-| 失敗時 | 既存Resourceを維持する |
-| 再実行時 | 同じTargetで再Validate／Deployする |
+| 目的 | Gold CurrentをSearch Sync TableとCorpus Snapshotへ公開する。 呼出元はDAB Deploy後のSchedule。 |
+| 入力 | Gold Current、Manifest、Publish Python。 TriggerはPipeline成功後またはPointer変更後。 |
+| 処理 | Publish後に件数、ACL、Versionを検証する。 検査合格前にIndex Routeを切り替えない。 Snapshot IDを後続Trace Tagへ渡す。 |
+| 出力 | Search Sync Table、Corpus Snapshot。 同期対象とSnapshotを確定する。 後続はSearch Index Job。 |
+| 失敗・再実行 | 旧公開状態を維持する。 Snapshot IDとPrimary KeyでMERGEする。 |
 
 ```yaml
-# Bundleが作成・更新するDatabricks Resourceを定義する。
 resources:
   # Lakeflow Job Resourceを定義する。
   jobs:
-    # search_sync_publish_jobに関する設定値を定義する。
     search_sync_publish_job:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-publish-search-sync
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4861,39 +5895,27 @@ resources:
         - environment_key: default
           # EnvironmentへInstallするDependencyを定義する。
           spec:
-            # environment_versionに関する設定値を定義する。
             environment_version: '3'
-            # dependenciesに関する設定値を定義する。
             dependencies: []
 ```
 
 `bundles/ingestion/resources/search_index_job.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 環境別DAB変数とResource定義／出力: Job／Pipeline／App設定 |
-| 関連Job／Pipeline | Bundle Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Validate後にDeployする。既存Resourceを維持する。 |
-| ファイルパス | `bundles/ingestion/resources/search_index_job.yml` |
-| 実行主体 | Bundle Deploy Identity |
-| 入力 | 環境別DAB変数とResource定義 |
-| 出力 | Job／Pipeline／App設定 |
-| 必要な理由 | 実行Identityと環境差分を宣言するため |
-| 正常終了時 | Validate後にDeployする |
-| 失敗時 | 既存Resourceを維持する |
-| 再実行時 | 同じTargetで再Validate／Deployする |
+| 目的 | AI Search Indexの作成・同期・Readiness検証を定義する。 呼出元はDAB Deploy後のRelease Pipeline。 |
+| 入力 | Search Sync Table、Index設定、Python Source。 TriggerはSearch Sync成功後。 |
+| 処理 | 作成、Sync待機、Schema／件数／最小検索を検証する。 ReadyかつSnapshot一致だけを候補にする。 Index Release IDを後続Traceへ渡す。 |
+| 出力 | AI Search IndexとRelease状態。 検証済みIndexが候補になる。 後続はRelease ManifestとGate。 |
+| 失敗・再実行 | Current Routeを変更しない。 index_release_idで既存Indexを再利用する。 |
 
 ```yaml
-# Bundleが作成・更新するDatabricks Resourceを定義する。
 resources:
   # Lakeflow Job Resourceを定義する。
   jobs:
-    # search_index_update_jobに関する設定値を定義する。
     search_index_update_job:
-      # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-update-search-index
       # Job／Pipelineを実行する非対話Identityを指定する。
       run_as:
@@ -4923,9 +5945,7 @@ resources:
         - environment_key: default
           # EnvironmentへInstallするDependencyを定義する。
           spec:
-            # environment_versionに関する設定値を定義する。
             environment_version: '3'
-            # dependenciesに関する設定値を定義する。
             dependencies:
               - databricks-sdk==0.65.0
               - databricks-vectorsearch
@@ -4933,25 +5953,17 @@ resources:
 
 `infra/databricks/runtime_grants.tf`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Workspace情報とApplication／SCIM ID／出力: Workspace割当、Entitlement、Grant |
-| 関連Job／Pipeline | Platform管理者のIaC Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 最小権限をStateへ反映する。後続Jobを起動しない。 |
-| ファイルパス | `infra/databricks/runtime_grants.tf` |
-| 実行主体 | Platform管理者のIaC Deploy Identity |
-| 入力 | Workspace情報とApplication／SCIM ID |
-| 出力 | Workspace割当、Entitlement、Grant |
-| 必要な理由 | 権限管理をアプリDABから分離するため |
-| 正常終了時 | 最小権限をStateへ反映する |
-| 失敗時 | 後続Jobを起動しない |
-| 再実行時 | 段階Flagを維持して再Applyする |
+| 目的 | 各Workload Principalへ最小UC権限を付与する。 呼出元はPlatform CI/CD。 |
+| 入力 | Principal ID、Table／Volume／Model Service名。 TriggerはSchema作成後、Bundle起動前。 |
+| 処理 | 役割別MapからSecurable単位でGrantする。 Base Manifest更新とIndex更新を専用Principalに限定する。 Trace表は明示SELECT／MODIFYを使う。 |
+| 出力 | UC Grants。 必要操作だけ実行できる。 後続は各Job run_asとSmoke Test。 |
+| 失敗・再実行 | 不足GrantではPreflightを失敗させる。 Terraform planでDriftを検出する。 |
 
 ```hcl
-# 複数Resourceで再利用する設定値をまとめる。
 locals {
   # runtime_principal_keysに関するTerraform設定を定義する。
   runtime_principal_keys = toset([
@@ -5262,7 +6274,6 @@ locals {
   }
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "runtime_catalog" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -5277,7 +6288,6 @@ resource "databricks_grant" "runtime_catalog" {
   privileges = ["USE_CATALOG"]
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "runtime_schema" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -5299,7 +6309,6 @@ resource "databricks_grant" "runtime_schema" {
   ] : ["USE_SCHEMA"]
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "workflow_actor_schema" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -5314,7 +6323,6 @@ resource "databricks_grant" "workflow_actor_schema" {
   privileges = ["USE_SCHEMA"]
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "workflow_actor_view" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -5329,7 +6337,6 @@ resource "databricks_grant" "workflow_actor_view" {
   privileges = ["SELECT"]
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "base_table" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -5344,7 +6351,6 @@ resource "databricks_grant" "base_table" {
   privileges = each.value.privileges
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "volume" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -5359,7 +6365,6 @@ resource "databricks_grant" "volume" {
   privileges = each.value.privileges
 }
 
-# 作成・割当・権限付与するInfrastructure Resourceを定義する。
 resource "databricks_grant" "pipeline_table" {
   # Databricks Account／Workspaceへの接続Providerを定義する。
   provider = databricks.workspace
@@ -5400,22 +6405,15 @@ Unity CatalogのTable権限は列ごとの`MODIFY`を分離できないため、
 
 `bundles/ingestion/src/submit_document_registration.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 登録Job入力と認証済みActor／出力: 登録Command |
-| 関連Job／Pipeline | Document Registration SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | pending Commandを保存する。認証不明時は保存しない。 |
-| ファイルパス | `bundles/ingestion/src/submit_document_registration.py` |
-| 実行主体 | Document Registration SP |
-| 入力 | 登録Job入力と認証済みActor |
-| 出力 | 登録Command |
-| 必要な理由 | 登録者へBase Table権限を与えないため |
-| 正常終了時 | pending Commandを保存する |
-| 失敗時 | 認証不明時は保存しない |
-| 再実行時 | 同じ業務Requestの重複を確認して再投入する |
+| 目的 | 認証済み登録要求をCommand Tableへ追加しBase更新をExecutorへ委譲する。 呼出元はDocument Registration Job。 |
+| 入力 | Actor View、Path、Hash、Metadata、既存Command。 Triggerは担当者の登録申請時。 |
+| 処理 | 入力を正規化しActor権限と重複Keyを検証してpending CommandをMERGEする。 Client申告Actorを信用せず承認Pointerを変更しない。 Command IDを監査Evidenceにする。 |
+| 出力 | document_registration_commands。 一意なCommand IDを返す。 後続はapply_manifest_commands.py。 |
+| 失敗・再実行 | Manifestを変更せず拒否する。 idempotency_keyで二重登録を防ぐ。 |
 
 ```python
 """認証済み登録者の文書登録要求をCommand Tableへ保存するModule。Document Registration SPのJobから実行し、Base Manifest、公開Pointer、監視対象Volumeは更新しない。
@@ -5452,14 +6450,8 @@ def resolve_authenticated_actor(
     Raises:
         PermissionError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     actors = (
         spark.table(AUTHENTICATED_ACTOR_VIEW)
@@ -5491,14 +6483,8 @@ def append_registration_command(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     requested_by, evidence_id = resolve_authenticated_actor(
         spark,
@@ -5542,14 +6528,8 @@ def parse_args() -> argparse.Namespace:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--staging-uri", required=True)
@@ -5570,14 +6550,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     command_id = append_registration_command(spark, parse_args())
     print(json.dumps({"command_id": command_id}))
@@ -5593,22 +6567,15 @@ if __name__ == "__main__":
 
 `bundles/ingestion/src/register_document.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 検証済み登録Command、Staging File、Scan結果／出力: Manifestのdraft行と監視対象Volumeの原文書 |
-| 関連Job／Pipeline | Manifest Command Executor SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | draft登録と配置を確認する。安全側の途中状態とErrorを残す。 |
-| ファイルパス | `bundles/ingestion/src/register_document.py` |
-| 実行主体 | Manifest Command Executor SP |
-| 入力 | 検証済み登録Command、Staging File、Scan結果 |
-| 出力 | Manifestのdraft行と監視対象Volumeの原文書 |
-| 必要な理由 | 未公開登録とFile配置を固定Codeで適用するため |
-| 正常終了時 | draft登録と配置を確認する |
-| 失敗時 | 安全側の途中状態とErrorを残す |
-| 再実行時 | 同じCommandのdraftを再利用しMoveから再開する |
+| 目的 | 登録CommandとScan結果から未公開Document VersionをManifestへ反映する。 呼出元はCommand Executorの登録Handler。 |
+| 入力 | Command、Staging File、Scan結果、Manifest、Registry。 Triggerはpending CommandのClaim時。 |
+| 処理 | 再検証しHashからVersion IDを作り安全なPathへ配置してdraftをMERGEする。 承認Pointerは更新しない。 Command／Audit IDで監査する。 |
+| 出力 | 監視Volume、Manifest、Registry、Audit Event。 draft Versionを作成する。 後続はBronze取込と承認Workflow。 |
+| 失敗・再実行 | File配置とTable更新を確定しない。 既存Versionと配置先を再利用する。 |
 
 ```python
 """検証済み文書登録CommandをManifestと監視対象Volumeへ反映するModule。
@@ -5681,14 +6648,8 @@ def execution_identity(spark: SparkSession) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return str(spark.sql("SELECT current_user()").first()[0])
 
@@ -5706,14 +6667,8 @@ def validate_paths(request: RegistrationRequest) -> None:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     if request.staging_uri == request.source_uri:
         raise ValueError("staging_uri must be outside the monitored source path")
@@ -5737,14 +6692,8 @@ def validate_principals(principals: list[str], workspace: WorkspaceClient) -> No
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     if not principals or len(principals) != len(set(principals)):
         raise ValueError("allowed_principals must be non-empty and unique")
@@ -5804,14 +6753,8 @@ def assert_staging_file(request: RegistrationRequest) -> None:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     file_info = find_file(request.staging_uri)
     if file_info is None or file_info.size <= 0 or file_info.size > MAX_FILE_BYTES:
@@ -5832,14 +6775,8 @@ def assert_external_scan(spark: SparkSession, request: RegistrationRequest) -> N
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     scan = spark.table(SCAN_RESULTS_TABLE).where(
         (F.col("scan_request_id") == request.scan_request_id)
@@ -6014,14 +6951,8 @@ def move_to_monitored_volume(request: RegistrationRequest) -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     dbutils.fs.mv(request.staging_uri, request.source_uri, True)
 
@@ -6036,14 +6967,8 @@ def apply_registration_command(spark: SparkSession, command: Row) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     # 再実行しても同じ論理文書を参照できるよう、Command IDから決定的に採番する。
     document_id = f"DOC-{uuid5(NAMESPACE_URL, command.command_id)}"
@@ -6091,22 +7016,15 @@ def apply_registration_command(spark: SparkSession, command: Row) -> str:
 
 `bundles/ingestion/src/replay_unregistered_source.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 上流Dataset、Command、環境設定／出力: 次工程の履歴または管理状態 |
-| 関連Job／Pipeline | Ingestion系の責務別Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 監査可能な状態へ遷移する。公開経路へ進めず停止する。 |
-| ファイルパス | `bundles/ingestion/src/replay_unregistered_source.py` |
-| 実行主体 | Ingestion系の責務別Service Principal |
-| 入力 | 上流Dataset、Command、環境設定 |
-| 出力 | 次工程の履歴または管理状態 |
-| 必要な理由 | 取込・審査・公開の責務を分離するため |
-| 正常終了時 | 監査可能な状態へ遷移する |
-| 失敗時 | 公開経路へ進めず停止する |
-| 再実行時 | 既存状態を再読して冪等に再実行する |
+| 目的 | 隔離済み未登録Fileを新しい登録済みPathへ戻す。 呼出元はReconciliation対応Job。 |
+| 入力 | Quarantine、Manifest、対象File、再投入先。 Triggerは再投入承認時。 |
+| 処理 | CaseとHashを検証し一意PathへCopyして再取込対象にする。 元Fileを上書きせず承認しない。 Case IDとReplay IDを残す。 |
+| 出力 | 新Source PathとReplay Audit。 Auto Loaderが新規Eventとして検知する。 後続はBronze取込。 |
+| 失敗・再実行 | Quarantineと旧公開状態を維持する。 replay_idとHashでCopyを再利用する。 |
 
 ```python
 """隔離された未登録Fileを新しい一意Pathで通常登録経路へ戻すModule。同じPathのAuto Loader再検知には依存せず、公開や承認は行わない。
@@ -6140,14 +7058,8 @@ def prepare_replay(spark: SparkSession, source_uri: str) -> tuple[str, str]:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     exists = spark.table(UNREGISTERED_TABLE).where(
         F.col("source_uri") == source_uri
@@ -6171,14 +7083,8 @@ def main(source_uri: str) -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     staging_uri, new_source_uri = prepare_replay(spark, source_uri)
     print({"staging_uri": staging_uri, "source_uri": new_source_uri})
@@ -6192,22 +7098,15 @@ Replayは同じPathの上書きやAuto Loaderの偶然の再検知に依存し�
 
 `bundles/ingestion/src/sync_document_version_registry.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 上流Dataset、Command、環境設定／出力: 次工程の履歴または管理状態 |
-| 関連Job／Pipeline | Ingestion系の責務別Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 監査可能な状態へ遷移する。公開経路へ進めず停止する。 |
-| ファイルパス | `bundles/ingestion/src/sync_document_version_registry.py` |
-| 実行主体 | Ingestion系の責務別Service Principal |
-| 入力 | 上流Dataset、Command、環境設定 |
-| 出力 | 次工程の履歴または管理状態 |
-| 必要な理由 | 取込・審査・公開の責務を分離するため |
-| 正常終了時 | 監査可能な状態へ遷移する |
-| 失敗時 | 公開経路へ進めず停止する |
-| 再実行時 | 既存状態を再読して冪等に再実行する |
+| 目的 | Pipeline各層の結果をVersion Registryへ集約する。 呼出元はRegistry Sync Task。 |
+| 入力 | Bronze、Error、Silver、Scan、Registry。 TriggerはPipeline Update後。 |
+| 処理 | Versionごとに各層到達状況を集約し状態をMERGEする。 技術成功を承認とみなさない。 Run IDとError参照を保持する。 |
+| 出力 | document_version_registry。 最新技術状態を確認できる。 後続は承認HandlerとDashboard。 |
+| 失敗・再実行 | 公開Pointerを維持する。 document_version_idで同じ状態へ収束する。 |
 
 ```python
 """Bronze、Parse／Prep、Chunk、Scan結果からVersion単位の技術状態をVersion Registryへ同期するModule。公開Version Pointerは更新しない。
@@ -6240,14 +7139,8 @@ def build_version_status(spark: SparkSession):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     bronze = spark.table(BRONZE_TABLE).select(
         "document_id", "document_version_id", "content_hash"
@@ -6337,14 +7230,8 @@ def sync_registry(spark: SparkSession) -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     source = build_version_status(spark)
     target = DeltaTable.forName(spark, REGISTRY_TABLE)
@@ -6400,14 +7287,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     sync_registry(spark)
 
@@ -6422,22 +7303,15 @@ Version Registry Sync JobはManifestの`intake_scan_request_id`から信頼済�
 
 `bundles/ingestion/src/submit_document_approval.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 審査対象と認証済み承認者／出力: 承認Command |
-| 関連Job／Pipeline | Document Approval SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | pending Commandを保存する。認証不明時は保存しない。 |
-| ファイルパス | `bundles/ingestion/src/submit_document_approval.py` |
-| 実行主体 | Document Approval SP |
-| 入力 | 審査対象と認証済み承認者 |
-| 出力 | 承認Command |
-| 必要な理由 | 承認者へBase Table権限を与えないため |
-| 正常終了時 | pending Commandを保存する |
-| 失敗時 | 認証不明時は保存しない |
-| 再実行時 | 最新Versionを再読して再提出する |
+| 目的 | 審査結果をApproval Commandとして保存する。 呼出元はDocument Approval Job。 |
+| 入力 | Actor View、文書／Version ID、判断、理由。 Triggerは承認／却下時。 |
+| 処理 | Actor権限と対象Versionを検証しpending Commandを作る。 登録者と承認者を分離しPointerを直接変更しない。 Command IDを監査Evidenceにする。 |
+| 出力 | document_approval_commands。 Executor処理可能なIDを返す。 後続はapply_manifest_commands.py。 |
+| 失敗・再実行 | Manifestを変更せず拒否する。 同じ判断Keyを再利用する。 |
 
 ```python
 """認証済み承認者の審査結果をApproval Command Tableへ保存するModule。Document Approval SPで実行し、Base Manifestを直接更新しない。
@@ -6474,14 +7348,8 @@ def resolve_authenticated_approver(
     Raises:
         PermissionError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     actors = (
         spark.table(AUTHENTICATED_ACTOR_VIEW)
@@ -6513,14 +7381,8 @@ def append_approval_command(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     approved_by, evidence_id = resolve_authenticated_approver(
         spark,
@@ -6564,14 +7426,8 @@ def parse_args() -> argparse.Namespace:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--document-id", required=True)
@@ -6589,14 +7445,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     command_id = append_approval_command(spark, parse_args())
     print(json.dumps({"command_id": command_id}))
@@ -6610,22 +7460,15 @@ if __name__ == "__main__":
 
 `bundles/ingestion/src/approve_document_version.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 承認Command、Silver、Error、Version Registry／出力: Registry承認状態とManifest公開Pointer |
-| 関連Job／Pipeline | Manifest Command Executor SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 承認VersionだけをPointerへ設定する。旧Pointerを維持して停止する。 |
-| ファイルパス | `bundles/ingestion/src/approve_document_version.py` |
-| 実行主体 | Manifest Command Executor SP |
-| 入力 | 承認Command、Silver、Error、Version Registry |
-| 出力 | Registry承認状態とManifest公開Pointer |
-| 必要な理由 | 公開条件を再検証するため |
-| 正常終了時 | 承認VersionだけをPointerへ設定する |
-| 失敗時 | 旧Pointerを維持して停止する |
-| 再実行時 | 適用済み段階を成功扱いし未完了段階から再開する |
+| 目的 | 承認Commandを技術状態と照合し公開Pointerを原子的に切り替える。 呼出元はCommand Executorの承認Handler。 |
+| 入力 | Command、Registry、Silver、Error、Manifest。 Triggerはpending承認CommandのClaim時。 |
+| 処理 | Version存在と技術成功を検証し承認時だけPointerを切り替える。 Parse／Prep失敗と職務分離違反はFail Closedする。 Approval／Audit IDを保持する。 |
+| 出力 | Registry審査状態、Manifest Pointer、Audit Event。 次回Gold Refreshで承認版を公開する。 後続はGold Current。 |
+| 失敗・再実行 | 旧Pointerを維持する。 適用履歴を再読し二重切替を防ぐ。 |
 
 ```python
 """検証済み承認CommandをVersion RegistryとManifestへ反映するModule。
@@ -6661,14 +7504,8 @@ def execution_identity(spark: SparkSession) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return str(spark.sql("SELECT current_user()").first()[0])
 
@@ -6692,14 +7529,8 @@ def assert_version_is_publishable(
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     manifest = spark.table(MANIFEST_TABLE).where(
         (F.col("document_id") == document_id)
@@ -6760,14 +7591,8 @@ def approve_registry(
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
         RuntimeError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     actor = execution_identity(spark)
     current = spark.table(REGISTRY_TABLE).where(
@@ -6848,14 +7673,8 @@ def publish_manifest_pointer(
     Raises:
         RuntimeError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     actor = execution_identity(spark)
     source = spark.createDataFrame(
@@ -6903,14 +7722,8 @@ def apply_approval_command(spark: SparkSession, command: Row) -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     assert_version_is_publishable(
         spark,
@@ -6934,22 +7747,15 @@ def apply_approval_command(spark: SparkSession, command: Row) -> None:
 
 `bundles/ingestion/src/apply_manifest_commands.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: pendingまたは再開可能なCommand／出力: Base Table更新、監査Event、Command状態 |
-| 関連Job／Pipeline | Manifest Command Executor SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Commandをappliedへ遷移させる。failedまたはprocessingを保持する。 |
-| ファイルパス | `bundles/ingestion/src/apply_manifest_commands.py` |
-| 実行主体 | Manifest Command Executor SP |
-| 入力 | pendingまたは再開可能なCommand |
-| 出力 | Base Table更新、監査Event、Command状態 |
-| 必要な理由 | 人の要求と物理更新を分離するため |
-| 正常終了時 | Commandをappliedへ遷移させる |
-| 失敗時 | failedまたはprocessingを保持する |
-| 再実行時 | 期限切れprocessingを再Claimし冪等Handlerで再開する |
+| 目的 | 登録・承認CommandをClaimし固定Handlerで正本へ反映する。 呼出元はManifest Command Executor Job。 |
+| 入力 | pending Command、Actor View、Handler設定、Audit。 TriggerはSchedule／手動Run。 |
+| 処理 | Claimし型別Handlerを呼び成功／再試行／恒久失敗へ遷移する。 任意SQLと任意Actorを受け付けない。 Command IDと変更前後Hashを残す。 |
+| 出力 | Command状態、Manifest／Registry、Audit Event。 各Commandを一度だけappliedにする。 後続は登録・承認HandlerとInvariant Test。 |
+| 失敗・再実行 | 失敗分類と再試行回数を記録する。 Claim leaseとCommand IDで多重実行を防ぐ。 |
 
 ```python
 """登録・承認CommandをClaimし、固定HandlerでBase Tableへ反映して監査Eventを残すModule。非対話Executor Jobだけが実行し、人間の自由入力値を監査Actorとして採用しない。
@@ -6985,14 +7791,8 @@ def execution_identity(spark: SparkSession) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return str(spark.sql("SELECT current_user()").first()[0])
 
@@ -7019,14 +7819,8 @@ def update_command_status(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     source = spark.createDataFrame(
         [(command_id, from_status, to_status, failure_reason)],
@@ -7078,11 +7872,7 @@ def append_audit_event(
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
     Retry:
         `action`と`command_id`から決定したEvent IDを再利用し、同一Eventを重複Appendしない。
@@ -7161,11 +7951,7 @@ def process_registration_commands(
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
     Retry:
         `pending`またはLease期限切れの`processing`を再Claimし、永続状態から処理を再開する。
@@ -7240,11 +8026,7 @@ def process_approval_commands(
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
     Retry:
         `pending`またはLease期限切れの`processing`を再Claimし、公開済み状態を再検証する。
@@ -7312,14 +8094,8 @@ def parse_args() -> argparse.Namespace:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--git-commit", required=True)
@@ -7333,14 +8109,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     args = parse_args()
     process_registration_commands(spark, args)
@@ -7388,22 +8158,15 @@ Command Executorは`processed_at`を30分の処理Leaseとして使う。Process
 
 `bundles/ingestion/tests/manifest_invariants.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 上流Datasetまたは管理Table／出力: Table／View／検証結果 |
-| 関連Job／Pipeline | 対応するPipeline／Migration／Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 期待Schemaまたは0件の違反を得る。公開せずPipeline／Gateを停止する。 |
-| ファイルパス | `bundles/ingestion/tests/manifest_invariants.sql` |
-| 実行主体 | 対応するPipeline／Migration／Quality SP |
-| 入力 | 上流Datasetまたは管理Table |
-| 出力 | Table／View／検証結果 |
-| 必要な理由 | 表変換と公開条件を宣言的に表すため |
-| 正常終了時 | 期待Schemaまたは0件の違反を得る |
-| 失敗時 | 公開せずPipeline／Gateを停止する |
-| 再実行時 | Checkpointまたは物理Attemptから再評価する |
+| 目的 | Manifest、Registry、Commandの不変条件違反を0行Queryで検出する。 呼出元はManifest JobとCI。 |
+| 入力 | Manifest、Registry、Command、Audit。 TriggerはMigration／Command適用後。 |
+| 処理 | 重複ID、無効Pointer、承認不一致、未監査適用を列挙する。 情報制約へ依存せず実データを検査する。 違反種別とIDをRun Evidenceにする。 |
+| 出力 | 違反行Result。 全Queryが0行になる。 後続はPipeline起動。 |
+| 失敗・再実行 | Jobと公開を停止する。 読取専用で再実行できる。 |
 
 ```sql
 -- 正常時に0行を返す。document_id重複。
@@ -7556,22 +8319,15 @@ SCIM Principalの存在確認はSQLだけでは完結しないため、登録時
 
 `bundles/ingestion/src/01_bronze_ingestion.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: 監視対象VolumeとManifest／出力: Bronze、未登録、Preflight Error |
-| 関連Job／Pipeline | Ingestion Pipeline SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Bronzeへ追記する。不適格行を隔離する。 |
-| ファイルパス | `bundles/ingestion/src/01_bronze_ingestion.sql` |
-| 実行主体 | Ingestion Pipeline SP |
-| 入力 | 監視対象VolumeとManifest |
-| 出力 | Bronze、未登録、Preflight Error |
-| 必要な理由 | 登録済み原文書だけを履歴化するため |
-| 正常終了時 | Bronzeへ追記する |
-| 失敗時 | 不適格行を隔離する |
-| 再実行時 | Checkpointから未処理Eventだけを再開する |
+| 目的 | Source Eventを登録済みBronzeと未登録Quarantineへ分岐する。 呼出元はLakeflow SDP。 |
+| 入力 | Volume、document_source_manifest。 TriggerはFile到着／Refresh。 |
+| 処理 | File MetadataをManifestへPath＋HashでJOINしPreflight結果で分ける。 台帳document_idを採用し未登録Pathを公開しない。 Event LogとVersion列を残す。 |
+| 出力 | source_events、bronze、unregistered_source。 登録済みはBronze、未登録はError履歴へ入る。 後続はVersion重複排除。 |
+| 失敗・再実行 | 不正FileをGoldへ進めない。 CheckpointとEvent Keyで重複を防ぐ。 |
 
 ```sql
 -- Bronze層。
@@ -7687,22 +8443,15 @@ PreflightはAI Functionを呼び出す前に判定できる拡張子、空File�
 
 `bundles/ingestion/src/01b_deduplicate_versions.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: 上流Dataset、Command、環境設定／出力: 次工程の履歴または管理状態 |
-| 関連Job／Pipeline | Ingestion系の責務別Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 監査可能な状態へ遷移する。公開経路へ進めず停止する。 |
-| ファイルパス | `bundles/ingestion/src/01b_deduplicate_versions.py` |
-| 実行主体 | Ingestion系の責務別Service Principal |
-| 入力 | 上流Dataset、Command、環境設定 |
-| 出力 | 次工程の履歴または管理状態 |
-| 必要な理由 | 取込・審査・公開の責務を分離するため |
-| 正常終了時 | 監査可能な状態へ遷移する |
-| 失敗時 | 公開経路へ進めず停止する |
-| 再実行時 | 既存状態を再読して冪等に再実行する |
+| 目的 | 同じdocument_version_idの代表Eventだけを下流へ渡す。 呼出元はLakeflow Python Dataset。 |
+| 入力 | internal_docs_bronze。 TriggerはBronze Update時。 |
+| 処理 | WatermarkとVersion IDでStreaming重複排除する。 document_idではなく内容VersionをKeyにする。 Pipeline Metricで重複数を確認する。 |
+| 出力 | internal_docs_unique_versions。 AI Parse対象がVersionごとに一行になる。 後続はParse Attempt。 |
+| 失敗・再実行 | 状態管理不能時はUpdateを失敗させる。 Checkpoint Stateで既処理Versionを除外する。 |
 
 ```python
 """Bronzeの文書Versionを安定KeyでStreaming重複排除するLakeflow Python Source。追記型履歴を維持し、公開判定は行わない。
@@ -7727,14 +8476,8 @@ def internal_docs_unique_versions() -> DataFrame:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return spark.readStream.table("internal_docs_bronze").dropDuplicates(
         ["document_id", "document_version_id"]
@@ -7757,22 +8500,15 @@ def internal_docs_unique_versions() -> DataFrame:
 
 `bundles/ingestion/src/02_document_parse.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: 重複排除済みBronze／出力: Parse Attempt、成功、Error |
-| 関連Job／Pipeline | Ingestion Pipeline SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Attemptから相互排他的に分岐する。Version付きErrorを保持する。 |
-| ファイルパス | `bundles/ingestion/src/02_document_parse.sql` |
-| 実行主体 | Ingestion Pipeline SP |
-| 入力 | 重複排除済みBronze |
-| 出力 | Parse Attempt、成功、Error |
-| 必要な理由 | AI Function重複実行を防ぐため |
-| 正常終了時 | Attemptから相互排他的に分岐する |
-| 失敗時 | Version付きErrorを保持する |
-| 再実行時 | 物理Attemptを再利用する |
+| 目的 | Versionごとにai_parse_documentを一度実行し成功とErrorへ分ける。 呼出元はLakeflow SDP SQL。 |
+| 入力 | internal_docs_unique_versions。 TriggerはUnique Version到着時。 |
+| 処理 | AI Function出力を物理保持し同じ結果から成功／失敗へ分岐する。 Temporary View再計算を避け相互排他にする。 AttemptとError列をEvidenceにする。 |
+| 出力 | parse_attempts、parsed、parse_errors。 成功VersionだけParsedへ進む。 後続はSearch Prep。 |
+| 失敗・再実行 | 失敗VersionをPrep／Goldへ進めない。 Attempt TableとCheckpointで重複実行を防ぐ。 |
 
 ```sql
 -- Silver前段のPipeline内部Dataset。
@@ -7940,22 +8676,15 @@ WHERE attempt.parsed_document IS NULL
 
 `bundles/ingestion/src/03_search_prep.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: Parse成功結果／出力: Prep Attempt、成功、Error |
-| 関連Job／Pipeline | Ingestion Pipeline SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Attemptから相互排他的に分岐する。Version付きErrorを保持する。 |
-| ファイルパス | `bundles/ingestion/src/03_search_prep.sql` |
-| 実行主体 | Ingestion Pipeline SP |
-| 入力 | Parse成功結果 |
-| 出力 | Prep Attempt、成功、Error |
-| 必要な理由 | AI Function重複実行を防ぐため |
-| 正常終了時 | Attemptから相互排他的に分岐する |
-| 失敗時 | Version付きErrorを保持する |
-| 再実行時 | 物理Attemptを再利用する |
+| 目的 | Parse成功版へai_prep_searchを一度実行し成功とErrorへ分ける。 呼出元はLakeflow SDP SQL。 |
+| 入力 | internal_docs_parsed。 TriggerはParsed Version到着時。 |
+| 処理 | Prep出力を物理保持しError有無で分岐する。 同じParse結果の再評価を避け空Chunkも失敗扱いにする。 AttemptとErrorをEvidenceにする。 |
+| 出力 | prep_attempts、prepared、prep_errors。 成功VersionだけChunk展開へ進む。 後続はSilver Chunk。 |
+| 失敗・再実行 | 失敗VersionをGoldへ流さない。 Version KeyとCheckpointで重複を防ぐ。 |
 
 ```sql
 -- Silver前段のPipeline内部Dataset。
@@ -8041,22 +8770,15 @@ Parse失敗Versionはこの一覧へ現れない。Prep失敗VersionもSilver Ch
 
 `bundles/ingestion/src/04_chunks_silver.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: Prep成功結果／出力: Silver Chunk履歴 |
-| 関連Job／Pipeline | Ingestion Pipeline SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 安定ID付きChunkを追記する。不正結果をSilverへ出さない。 |
-| ファイルパス | `bundles/ingestion/src/04_chunks_silver.sql` |
-| 実行主体 | Ingestion Pipeline SP |
-| 入力 | Prep成功結果 |
-| 出力 | Silver Chunk履歴 |
-| 必要な理由 | 検索用ChunkをVersion履歴化するため |
-| 正常終了時 | 安定ID付きChunkを追記する |
-| 失敗時 | 不正結果をSilverへ出さない |
-| 再実行時 | 同じVersion Keyの重複を作らない |
+| 目的 | Prep結果を検索・回答用途のChunk履歴へ展開する。 呼出元はLakeflow SDP SQL。 |
+| 入力 | internal_docs_prepared。 TriggerはPrepared Version到着時。 |
+| 処理 | variant_explodeで行化し論理／Version Chunk IDを生成する。 位置IDと文書Version＋位置Keyを分ける。 Retriever Spanがchunk_version_idを参照する。 |
+| 出力 | internal_docs_chunks_silver。 未承認版を含む成功Chunk履歴を残す。 後続はGold Current。 |
+| 失敗・再実行 | 不正VariantをGoldへ出さない。 chunk_version_idで重複排除する。 |
 
 ```sql
 -- Silver層。
@@ -8141,22 +8863,15 @@ FROM identified_chunks AS identified;
 
 `bundles/ingestion/src/05_gold_current.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: SilverとManifest現在値／出力: Gold Current Materialized View |
-| 関連Job／Pipeline | Ingestion Pipeline SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Pointer一致Versionだけを返す。条件不一致Versionを除外する。 |
-| ファイルパス | `bundles/ingestion/src/05_gold_current.sql` |
-| 実行主体 | Ingestion Pipeline SP |
-| 入力 | SilverとManifest現在値 |
-| 出力 | Gold Current Materialized View |
-| 必要な理由 | 承認済みCurrentだけを公開するため |
-| 正常終了時 | Pointer一致Versionだけを返す |
-| 失敗時 | 条件不一致Versionを除外する |
-| 再実行時 | Manifest最新値からBatch再計算する |
+| 目的 | SilverとManifestを照合し公開可能なCurrent Chunkだけを作る。 呼出元はLakeflow SDP SQL。 |
+| 入力 | chunks_silver、document_source_manifest。 TriggerはSilver／Manifest更新時。 |
+| 処理 | ManifestへJOINし承認Version、非削除、有効期間でFilterする。 新規取込だけでは公開せずPointer一致を必須にする。 Realtime TraceがGold由来Versionを記録する。 |
+| 出力 | internal_docs_current_mv。 承認済みCurrent行だけを公開する。 後続はSearch Sync Publish。 |
+| 失敗・再実行 | 条件不成立行をViewから除外し履歴は残す。 RefreshでManifest最新値へ収束する。 |
 
 ```sql
 -- Gold層。
@@ -8285,22 +9000,15 @@ Search Syncが読む`internal_docs_current_mv`の列と`SEARCH_COLUMNS`は変更
 
 `bundles/ingestion/tests/pipeline_invariants.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 上流Datasetまたは管理Table／出力: Table／View／検証結果 |
-| 関連Job／Pipeline | 対応するPipeline／Migration／Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 期待Schemaまたは0件の違反を得る。公開せずPipeline／Gateを停止する。 |
-| ファイルパス | `bundles/ingestion/tests/pipeline_invariants.sql` |
-| 実行主体 | 対応するPipeline／Migration／Quality SP |
-| 入力 | 上流Datasetまたは管理Table |
-| 出力 | Table／View／検証結果 |
-| 必要な理由 | 表変換と公開条件を宣言的に表すため |
-| 正常終了時 | 期待Schemaまたは0件の違反を得る |
-| 失敗時 | 公開せずPipeline／Gateを停止する |
-| 再実行時 | Checkpointまたは物理Attemptから再評価する |
+| 目的 | Medallion分岐、公開条件、ACL上書きを検証する。 呼出元はPipeline Validation TaskとCI。 |
+| 入力 | Bronze、Attempt、Error、Silver、Gold、Manifest。 TriggerはPipeline／Pointer切替後。 |
+| 処理 | 未登録混入、成功／Error重複、失敗Gold混入、未承認公開、ACL不一致を検査する。 Version KeyとManifest条件を照合する。 違反IDをRun Log／Caseへ渡す。 |
+| 出力 | 違反行Result。 全Queryが0行になる。 後続はPublish処理。 |
+| 失敗・再実行 | Search Publishを止める。 読取専用で再実行できる。 |
 
 ```sql
 -- 未登録分岐、成功表とError表の相互排他、Error VersionのGold混入、Manifest公開条件、ACL最新値を検証する。
@@ -8393,22 +9101,15 @@ AI Search公式資料はDelta Sync SourceをDelta Tableとして説明してお�
 
 `bundles/ingestion/src/publish_search_sync_table.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Gold CurrentとSnapshot ID／出力: Search Sync TableとSnapshot Member |
-| 関連Job／Pipeline | Search Publish SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | CurrentをMERGEし旧ChunkをDELETEする。Invariant違反でIndex前に停止する。 |
-| ファイルパス | `bundles/ingestion/src/publish_search_sync_table.py` |
-| 実行主体 | Search Publish SP |
-| 入力 | Gold CurrentとSnapshot ID |
-| 出力 | Search Sync TableとSnapshot Member |
-| 必要な理由 | Index同期用物理境界を作るため |
-| 正常終了時 | CurrentをMERGEし旧ChunkをDELETEする |
-| 失敗時 | Invariant違反でIndex前に停止する |
-| 再実行時 | 同じSnapshotを再利用し全Currentを再MERGEする |
+| 目的 | Gold CurrentをSearch Sync Tableへ反映しCorpus Snapshotを登録する。 呼出元はSearch Publish Job。 |
+| 入力 | Gold Current、既存Sync、Snapshot設定。 TriggerはGold検証合格後。 |
+| 処理 | Stage、MERGE、削除反映、件数Hash付きSnapshot確定を行う。 Snapshot確定中に入力Versionが変わらないことを検証する。 snapshot_idを後続Traceへ渡す。 |
+| 出力 | internal_docs_search_sync、corpus_snapshot_registry。 SyncとSnapshotが同じGold状態になる。 後続はSearch Index作成。 |
+| 失敗・再実行 | 旧Snapshot／Routeを維持する。 snapshot_idとchunk_version_idで収束する。 |
 
 ```python
 """Gold Currentを検索同期用Delta TableとCorpus Snapshotへ反映するModule。
@@ -8457,14 +9158,8 @@ def register_snapshot_members(
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     members = (
         current.select("document_id", "document_version_id")
@@ -8522,14 +9217,8 @@ def publish_current_snapshot(
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     current_without_snapshot = spark.table(CURRENT_VIEW).select(*SEARCH_COLUMNS)
     register_snapshot_members(
@@ -8582,22 +9271,15 @@ Auto Loaderの追加・更新検知だけでは、Volumeから消えたFileを�
 
 `bundles/ingestion/src/reconcile_source_manifest.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Volume、Manifest、Gold、Sync／出力: Reconciliation候補 |
-| 関連Job／Pipeline | Reconciliation SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 差分候補だけを記録する。自動削除せず停止する。 |
-| ファイルパス | `bundles/ingestion/src/reconcile_source_manifest.py` |
-| 実行主体 | Reconciliation SP |
-| 入力 | Volume、Manifest、Gold、Sync |
-| 出力 | Reconciliation候補 |
-| 必要な理由 | Driftを検出するため |
-| 正常終了時 | 差分候補だけを記録する |
-| 失敗時 | 自動削除せず停止する |
-| 再実行時 | 同じIssue Keyを冪等MERGEする |
+| 目的 | Volume、Manifest、Gold、Search Syncの差分を候補化する。 呼出元は定期Reconciliation Job。 |
+| 入力 | Volume、Manifest、Gold、Sync、既存候補。 TriggerはSchedule／Incident調査時。 |
+| 処理 | Snapshot化し未登録、欠落、孤立、ACL不一致を分類してMERGEする。 差分を自動削除・承認しない。 TraceはID参照しData状態はSnapshotで保持する。 |
+| 出力 | reconciliation_candidatesとSignal。 担当付き候補を作る。 後続はReplay、Manifest修正、Quality Case。 |
+| 失敗・再実行 | 公開状態を変更しない。 fingerprintで同じ差分を集約する。 |
 
 ```python
 """Volume、Manifest、Gold、Search Syncの差分を候補Tableへ記録するModule。
@@ -8631,14 +9313,8 @@ def execution_identity(spark: SparkSession) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return str(spark.sql("SELECT current_user()").first()[0])
 
@@ -8653,14 +9329,8 @@ def load_observed_files(spark: SparkSession):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return (
         spark.read.format("binaryFile")
@@ -8683,14 +9353,8 @@ def build_candidates(spark: SparkSession, observed_files):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     manifest = spark.table(MANIFEST_TABLE).where(F.col("is_deleted") == F.lit(False))
     observed = observed_files.select("source_uri", "content_hash").dropDuplicates(
@@ -8722,14 +9386,8 @@ def record_candidates(spark: SparkSession, observed_files) -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     actor = execution_identity(spark)
     source = (
@@ -8776,14 +9434,8 @@ def assert_lifecycle_consistency(spark: SparkSession) -> None:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     current = spark.table(CURRENT_TABLE).select("document_id").dropDuplicates()
     manifest = spark.table(MANIFEST_TABLE)
@@ -8810,14 +9462,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     observed_files = load_observed_files(spark)
     observed_files.createOrReplaceTempView("observed_internal_doc_files")
@@ -8837,22 +9483,15 @@ Reconciliation Jobは`pending`候補の作成までとし、Source消失だけ�
 
 `bundles/ingestion/src/create_search_index.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: Search Sync TableとIndex設定／出力: AI Search IndexとGate結果 |
-| 関連Job／Pipeline | Search Publish SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | ONLINEとGolden／ACL Gateを確認する。旧Indexを維持する。 |
-| ファイルパス | `bundles/ingestion/src/create_search_index.py` |
-| 実行主体 | Search Publish SP |
-| 入力 | Search Sync TableとIndex設定 |
-| 出力 | AI Search IndexとGate結果 |
-| 必要な理由 | 承認済みCurrentを検索公開するため |
-| 正常終了時 | ONLINEとGolden／ACL Gateを確認する |
-| 失敗時 | 旧Indexを維持する |
-| 再実行時 | 既存状態を再読し作成またはSyncから再開する |
+| 目的 | Search Sync SnapshotからAI Search Indexを作成・検証する。 呼出元はSearch Index Job。 |
+| 入力 | Search Sync、Release設定、Vector Search SDK。 Triggerは新Index Release作成時。 |
+| 処理 | 取得／作成、Sync待機、Schema／件数／ACL／最小Queryを検証する。 ReadyだけでなくSnapshot一致を必須にする。 index_release_idをRelease Manifestへ渡す。 |
+| 出力 | AI Search Indexとindex_release_registry。 検証済みIndexをcandidateにする。 後続はRelease Gate。 |
+| 失敗・再実行 | Current Routeを切り替えない。 index_release_idで既存Resourceを再利用する。 |
 
 ```python
 """Search Sync TableからRelease単位のAI Search Indexを作成・同期・検証するModule。Gate不合格時は本番Releaseを切り替えない。
@@ -8906,14 +9545,8 @@ def assert_expected_configuration(description: dict) -> None:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     delta = description.get("delta_sync_index_spec", {})
     actual = {
@@ -8947,14 +9580,8 @@ def create_or_validate_index(client: AISearchClient):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     if not client.endpoint_exists(ENDPOINT_NAME):
         client.create_endpoint_and_wait(
@@ -9002,14 +9629,8 @@ def run_golden_query_and_acl_regression(index, index_release_id: str) -> None:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     tests = [
         {
@@ -9062,14 +9683,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     client = AISearchClient()
     index = create_or_validate_index(client)
@@ -9093,6 +9708,8 @@ if __name__ == "__main__":
 
 ##### 4.2.4.6 RAG Release Manifest
 
+Release Manifestは、RAGを再現・Rollbackするための構成を一行に固定する本システム独自の管理資産である。物理的な実体はDelta Table`main.llmops.rag_release_manifest`のRecordで、Git Commit、解決済みPrompt Version、Model Route、Index Release、Corpus Snapshot、Scorer／Judge Versionを保持する。Runtimeが個別Resourceの最新値を都度選ばないよう、本番RAGを起動する前に必要になる。
+
 Prompt Alias、Index名、Codeを別々に切り替えると新旧構成が混在するため、Quality Bundleは`main.llmops.rag_release_manifest`へ次の不変Releaseを発行する。
 
 | 列 | 内容 |
@@ -9101,7 +9718,7 @@ Prompt Alias、Index名、Codeを別々に切り替えると新旧構成が混�
 | `git_commit`、`repository_url`、`build_id` | CI/CDが注入したCode来歴 |
 | `common_wheel_version` | 共通契約Package Version |
 | `sufficiency_prompt_uri`、`rewrite_prompt_uri`、`answer_prompt_uri`、`answer_validation_prompt_uri` | `prompts:/name/version`形式の不変URI |
-| `model_service`、`expected_model_route` | 生成Model Endpointと期待Route |
+| `model_service`、`expected_model_route` | 生成Model Service FQNと期待Destination／Route |
 | `search_endpoint_name`、`index_name`、`index_release_id`、`corpus_snapshot_id` | 検索基盤Release |
 | `embedding_model`、`query_embedding_model` | Index作成・Query用Embedding |
 | `ai_parse_document_version`、`ai_prep_search_version`、`chunk_schema_version` | 解析・Chunk来歴 |
@@ -9110,22 +9727,15 @@ Prompt Alias、Index名、Codeを別々に切り替えると新旧構成が混�
 
 `bundles/realtime/app/rag_release.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 認証済みRequestと固定Release／出力: SSE、回答、Citation、Trace |
-| 関連Job／Pipeline | Databricks Apps専用Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 検証済み回答または拒否を返す。安全なErrorへ変換する。 |
-| ファイルパス | `bundles/realtime/app/rag_release.py` |
-| 実行主体 | Databricks Apps専用Service Principal |
-| 入力 | 認証済みRequestと固定Release |
-| 出力 | SSE、回答、Citation、Trace |
-| 必要な理由 | ACL付きRAGを安全に提供するため |
-| 正常終了時 | 検証済み回答または拒否を返す |
-| 失敗時 | 安全なErrorへ変換する |
-| 再実行時 | 新Requestとして再実行する |
+| 目的 | Current Pointerから不変RAG Releaseを読み、`rag_graph.py`と`start_server.py`へ渡す。 |
+| 入力 | Release Pointer、Manifest、Prompt、Model Route、Index。App起動時とRequest開始時に読む。 |
+| 処理 | Pointerを一度解決し各Versionを照合する。Request途中で構成を変えず、不一致はFail ClosedとしてRoot Traceへ記録する。 |
+| 出力 | 検証済み`RagRelease`とCacheを返し、RAG GraphとEvaluationが使用する。 |
+| 失敗・再実行 | 推測FallbackはせずReadiness Errorにする。`release_id`単位のCacheを再利用する。 |
 
 ```python
 """Runtimeで不変RAG Release Manifestを読込み、Code、Prompt、Model、Index、Snapshot、ACL Policyを検証するModule。
@@ -9216,14 +9826,8 @@ def load_rag_release(rag_release_id: str) -> RagRelease:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
         RuntimeError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", rag_release_id):
         raise ValueError("Invalid rag_release_id")
@@ -9297,30 +9901,35 @@ Release Gate合格後に候補ManifestをInsertし、`rag_release_channels`の`p
 
 ##### 4.2.4.7 LangGraph
 
+```mermaid
+flowchart TD
+    USER["利用者"] --> APP["Databricks Apps<br/>Streamlit"]
+    APP --> SERVER["Agent Server<br/>@stream・SSE"]
+    SERVER --> GRAPH["rag_graph.py<br/>LangGraph"]
+    GRAPH --> ID["Identity・ACL Filter"]
+    GRAPH --> INDEX["AI Search Index"]
+    GRAPH --> MODEL["Answer Model Service"]
+    GRAPH --> TRACE["Realtime Experiment<br/>Trace・Span"]
+    TRACE --> UI["MLflow Traces UI"]
+```
+
 この実装は、リクエスト開始時に `rag_release_manifest` と実利用者の Entitlement をStateへ固定し、取得、決定論的検査、意味的十分性判定、再検索、回答、回答検証、拒否または人手確認をNodeとして分離する。検索のたびに過去Evidenceを捨てず、`SearchAttempt` と累積Evidenceを保持する。回答に渡すEvidenceだけはScore順、重複排除、Context上限で選び、採用されなかったChunkも監査履歴へ残す。
 
 エージェント側の想定出力は、同じ正常回答ケースを共通契約、Release、Graph、Identity、SSE、画面表示の順に追跡できるよう、IDを意図的に揃えている。Token、Raw Path、ACL式など本番で記録・表示してはいけない値はサンプルにも含めない。
 
-生成モデルは `ChatDatabricks(endpoint=release.model_service)` がManifestで固定されたServing endpointを呼ぶ。`similarity_search()` はAI Search、Query EmbeddingはIndexに設定されたEmbedding endpointを呼ぶ。PromptはAliasではなくManifestの不変Version URIから解決する。Serving endpoint内で複数Routeを使う場合は、Response metadataの実RouteとRequest IDをTraceへ残し、ResponseでRouteが返らない構成ではInference TableとRequest IDを後続Jobで結合する。
+生成モデルは`DatabricksOpenAI`のOpenAI互換Clientが、Manifestで固定されたUnity AI Gateway Model Service FQNを`model`へ指定して呼ぶ。したがって、Application CodeはLegacy Model Serving Endpoint固有URIを組み立てない。`similarity_search()`はAI Search、Query EmbeddingはIndexに設定されたEmbedding Resourceを呼ぶ。PromptはAliasではなくManifestの不変Version URIから解決する。Model Service内で複数DestinationへTraffic Split／Fallbackする場合はResponseのModel名とRequest IDをTraceへ残し、詳細RouteがResponseにない場合だけ`system.ai_gateway.usage`をRequest IDで後続照合する。Inference Loggingを前提にはしない。
 
 `bundles/realtime/app/rag_graph.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: 認証済みRequestと固定Release／出力: SSE、回答、Citation、Trace |
-| 関連Job／Pipeline | Databricks Apps専用Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 検証済み回答または拒否を返す。安全なErrorへ変換する。 |
-| ファイルパス | `bundles/realtime/app/rag_graph.py` |
-| 実行主体 | Databricks Apps専用Service Principal |
-| 入力 | 認証済みRequestと固定Release |
-| 出力 | SSE、回答、Citation、Trace |
-| 必要な理由 | ACL付きRAGを安全に提供するため |
-| 正常終了時 | 検証済み回答または拒否を返す |
-| 失敗時 | 安全なErrorへ変換する |
-| 再実行時 | 新Requestとして再実行する |
+| 目的 | ACL検索、再検索、回答、検証、拒否をLangGraphで実行し、Agent Serverから呼ばれる。 |
+| 入力 | 質問、Identity、Release、AI Search、Prompt、Model Service。Realtime Requestごとに読む。 |
+| 処理 | IdentityとReleaseを固定して検索、Judge、Rewrite、回答、検証を進める。ACL再検査を通らない回答は拒否し、AGENT配下へRETRIEVER／LLM Spanを作る。 |
+| 出力 | `RagResult`、Trace、進捗EventをAgent ServerとEvaluationへ返す。 |
+| 失敗・再実行 | 権限外Evidenceと部分回答を破棄する。同じReleaseとrequest_idを記録して比較可能にする。 |
 
 ```python
 """ACL付き検索、十分性判定、Query Rewrite、回答生成、Citation検証、拒否をLangGraphとして構築するModule。権限外Evidenceや未検証回答は返さない。
@@ -9331,13 +9940,13 @@ Release Gate合格後に候補ManifestをInsertし、`rag_release_channels`の`p
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import Any
 
 import mlflow
 from databricks.ai_search.client import AISearchClient
-from databricks_langchain import ChatDatabricks
-from langchain_core.messages import HumanMessage
+from databricks_openai import DatabricksOpenAI
 from langgraph.graph import END, START, StateGraph
 from mlflow.entities import SpanType
 
@@ -9363,11 +9972,11 @@ SENSITIVE_OUTPUT_PATTERNS = (
     re.compile(r"(?i)(secret|token|password)\s*[:=]"),
 )
 
-# LangGraphとChatDatabricksのModel呼び出しを自動記録し、業務判断Nodeは手動Spanで補う。
+# LangGraphのNodeを自動記録し、Model Service呼出しは明示的なLLM Spanで補う。
 mlflow.langchain.autolog()
 search_client = AISearchClient()
 _index_cache: dict[tuple[str, str], Any] = {}
-_model_cache: dict[str, ChatDatabricks] = {}
+_model_client: DatabricksOpenAI | None = None
 
 
 def stable_citation_id(chunk_version_id: str) -> str:
@@ -9379,14 +9988,8 @@ def stable_citation_id(chunk_version_id: str) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     digest = hashlib.sha256(chunk_version_id.encode("utf-8")).hexdigest()[:12]
     return f"SRC-{digest.upper()}"
@@ -9401,14 +10004,8 @@ def get_index(release: RagRelease):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     key = (release.search_endpoint_name, release.index_name)
     if key not in _index_cache:
@@ -9419,30 +10016,53 @@ def get_index(release: RagRelease):
     return _index_cache[key]
 
 
-def get_model(release: RagRelease) -> ChatDatabricks:
-    """ManifestのServing endpoint名から生成モデルClientを作る。この時点では推論しない。
+def get_model_client() -> DatabricksOpenAI:
+    """Workspace認証を使うOpenAI互換ClientをProcess内で再利用する。
 
     Args:
-        release: 処理に使用する`release`。
-
     Returns:
-        処理結果。
+        Unity AI Gateway Model Serviceを呼び出すClient。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
-    if release.model_service not in _model_cache:
-        _model_cache[release.model_service] = ChatDatabricks(
-            endpoint=release.model_service,
-            temperature=0.0,
-        )
-    return _model_cache[release.model_service]
+    global _model_client
+    if _model_client is None:
+        _model_client = DatabricksOpenAI()
+    return _model_client
+
+
+@mlflow.trace(name="invoke_model_service", span_type=SpanType.LLM)
+def invoke_model_service(release: RagRelease, instruction: str) -> tuple[str, Any]:
+    """Manifestで固定したModel Service FQNへ推論し、TextとResponse metadataを返す。"""
+    response = get_model_client().chat.completions.create(
+        model=release.model_service,
+        messages=[{"role": "user", "content": instruction}],
+        temperature=0.0,
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise ValueError("Model Service returned empty content")
+    record_model_route(response, release)
+    return content, response
+
+
+def invoke_structured_model(
+    release: RagRelease,
+    instruction: str,
+    response_type,
+):
+    """JSON Schemaを明示し、Pydantic Validationに失敗した出力をFail Closedにする。"""
+    schema = json.dumps(
+        response_type.model_json_schema(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    content, _ = invoke_model_service(
+        release,
+        f"{instruction}\n\nReturn JSON only. JSON Schema:\n{schema}",
+    )
+    return response_type.model_validate_json(content)
 
 
 def load_prompt(release: RagRelease, prompt_key: str, **values: str) -> str:
@@ -9456,14 +10076,8 @@ def load_prompt(release: RagRelease, prompt_key: str, **values: str) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     prompt_uri = release.prompt_uris[prompt_key]
     prompt = mlflow.genai.load_prompt(prompt_uri)
@@ -9483,23 +10097,11 @@ def record_model_route(response: Any, release: RagRelease) -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
-    metadata = getattr(response, "response_metadata", {}) or {}
-    actual_route = (
-        metadata.get("served_model_name")
-        or metadata.get("model_name")
-        or metadata.get("route")
-        or "NOT_REPORTED"
-    )
-    request_id = metadata.get("request_id") or metadata.get("databricks_request_id")
+    actual_route = getattr(response, "model", None) or "NOT_REPORTED"
+    request_id = getattr(response, "_request_id", None)
     tags = {
         "rag.expected_model_route": release.expected_model_route,
         "rag.actual_model_route": str(actual_route),
@@ -9522,14 +10124,8 @@ def parse_search_rows(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     documents: list[RetrievedDocument] = []
     for row in result.get("result", {}).get("data_array", []):
@@ -9573,14 +10169,8 @@ def validate_retrieved_document(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     failures: list[str] = []
     if not set(document.allowed_principals).intersection(state["allowed_principals"]):
@@ -9620,14 +10210,8 @@ def select_answer_evidence(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     best_by_chunk = {
         document.chunk_version_id: document for document in previous + current
@@ -9658,14 +10242,8 @@ def trace_retrieved_documents(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return [
         {
@@ -9693,14 +10271,8 @@ def retrieve_node(state: RagState, release: RagRelease) -> dict[str, Any]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     if not state["allowed_principals"]:
         return {
@@ -9802,14 +10374,8 @@ def update_attempt_reason(state: RagState, reason: str) -> list[SearchAttempt]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     attempts = list(state["search_attempts"])
     attempts[-1] = attempts[-1].model_copy(
@@ -9829,14 +10395,8 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     if state["next_step"] == "refuse" or not state["search_attempts"]:
         return {"next_step": "refuse"}
@@ -9889,14 +10449,7 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         question=state["original_question"],
         context=context,
     )
-    structured = get_model(release).with_structured_output(
-        SearchDecision,
-        include_raw=True,
-    ).invoke(
-        [HumanMessage(content=instruction)]
-    )
-    record_model_route(structured["raw"], release)
-    decision = SearchDecision.model_validate(structured["parsed"])
+    decision = invoke_structured_model(release, instruction, SearchDecision)
     if decision.sufficient and decision.recommended_action == "answer":
         next_step = "answer"
     elif decision.recommended_action == "human_review":
@@ -9927,14 +10480,8 @@ def rewrite_node(state: RagState, release: RagRelease) -> dict[str, Any]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     instruction = load_prompt(
         release,
@@ -9944,9 +10491,8 @@ def rewrite_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         missing_aspects="\n".join(state["missing_aspects"]),
         executed_queries="\n".join(state["executed_queries"]),
     )
-    response = get_model(release).invoke([HumanMessage(content=instruction)])
-    record_model_route(response, release)
-    rewritten = str(response.content).strip()
+    response_text, _ = invoke_model_service(release, instruction)
+    rewritten = response_text.strip()
     normalized = " ".join(rewritten.casefold().split())
     executed = {" ".join(query.casefold().split()) for query in state["executed_queries"]}
     if not rewritten or normalized in executed:
@@ -9975,14 +10521,8 @@ def answer_node(state: RagState, release: RagRelease) -> dict[str, Any]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     context = "\n\n".join(
         (
@@ -10001,8 +10541,7 @@ def answer_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         question=state["original_question"],
         context=context,
     )
-    response = get_model(release).invoke([HumanMessage(content=instruction)])
-    record_model_route(response, release)
+    response_text, _ = invoke_model_service(release, instruction)
     citations = [
         Citation(
             citation_id=document.citation_id,
@@ -10016,7 +10555,7 @@ def answer_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         for document in state["documents"]
     ]
     return {
-        "answer": str(response.content),
+        "answer": response_text,
         "citations": citations,
         "refused": False,
     }
@@ -10031,14 +10570,8 @@ def deterministic_answer_failures(state: RagState) -> list[str]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     failures: list[str] = []
     known_ids = {citation.citation_id for citation in state["citations"]}
@@ -10069,14 +10602,8 @@ def validate_answer_node(state: RagState, release: RagRelease) -> dict[str, Any]
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     failures = deterministic_answer_failures(state)
     if failures:
@@ -10102,14 +10629,7 @@ def validate_answer_node(state: RagState, release: RagRelease) -> dict[str, Any]
         context=context,
         answer=state["answer"],
     )
-    structured = get_model(release).with_structured_output(
-        AnswerValidation,
-        include_raw=True,
-    ).invoke(
-        [HumanMessage(content=instruction)]
-    )
-    record_model_route(structured["raw"], release)
-    validation = AnswerValidation.model_validate(structured["parsed"])
+    validation = invoke_structured_model(release, instruction, AnswerValidation)
     semantic_failures = validation.uncited_claims + validation.contradictions
     if not validation.grounded or semantic_failures:
         return {
@@ -10131,14 +10651,8 @@ def refuse_node(state: RagState) -> dict[str, Any]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return {
         "answer": (
@@ -10159,14 +10673,8 @@ def human_review_node(state: RagState) -> dict[str, Any]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return {
         "answer": (
@@ -10188,14 +10696,8 @@ def route_next(state: RagState) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return state["next_step"]
 
@@ -10209,14 +10711,8 @@ def build_graph(release: RagRelease):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     workflow = StateGraph(RagState)
     workflow.add_node("retrieve", lambda state: retrieve_node(state, release))
@@ -10274,14 +10770,8 @@ def initial_state(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return {
         "request_id": request_id,
@@ -10321,14 +10811,8 @@ def to_result(state: RagState) -> RagResult:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     documents = state["documents"]
     return RagResult(
@@ -10381,14 +10865,8 @@ def run_graph(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     mlflow.update_current_trace(
         tags={
@@ -10455,17 +10933,31 @@ MLflow Retrieval Scorer向けSpanは、検索Nodeの内部Stateをそのまま�
 
 | Node | 外部呼び出し | 主な判定 | 失敗時 |
 | --- | --- | --- | --- |
-| `retrieve` | AI Search、Embedding endpoint | ACL、Current、Snapshot、metadata、重複、Context上限 | 再検索または人手確認 |
-| `check` | Serving endpoint | 決定論的Gate後の意味的十分性 | 再検索、拒否、人手確認 |
-| `rewrite` | Serving endpoint | Query重複、最大回数 | 拒否 |
-| `answer` | Serving endpoint | Stable Citation付き回答生成 | Model Errorとして遮断 |
-| `validate_answer` | Application検査＋Serving endpoint | Citation実在、未引用Claim、禁止出力、支持・矛盾 | 人手確認 |
+| `retrieve` | AI Search、Embedding Resource | ACL、Current、Snapshot、metadata、重複、Context上限 | 再検索または人手確認 |
+| `check` | Model Service | 決定論的Gate後の意味的十分性 | 再検索、拒否、人手確認 |
+| `rewrite` | Model Service | Query重複、最大回数 | 拒否 |
+| `answer` | Model Service | Stable Citation付き回答生成 | Model Errorとして遮断 |
+| `validate_answer` | Application検査＋Model Service | Citation実在、未引用Claim、禁止出力、支持・矛盾 | 人手確認 |
 | `refuse` | なし | 内部理由を開示しない固定応答 | 終了 |
 | `human_review` | なし | 疑義ある回答を表示しない | Review候補化 |
 
-Model Serving endpointはモデルの実行面、AI Searchは検索面、Agent ServerはGraphとPolicyの実行面である。基盤モデルを変える場合はManifestが参照するServing endpointまたはそのRouteを変更し、Prompt、Index、Code、Model Routeをまとめた別の `rag_release_id` としてGateする。
+Model ServiceはモデルRouteと統制の実行面、AI Searchは検索面、Agent ServerはGraphとPolicyの実行面である。基盤モデルを変える場合はManifestが参照するModel ServiceまたはそのDestination Routeを変更し、Prompt、Index、Code、Model Routeをまとめた別の`rag_release_id`としてGateする。
 
 ##### 4.2.4.8 EvaluationDataset・Scorer
+
+本番評価では、開発用Training Datasetと、最終判定専用Holdout Datasetを別のUC EvaluationDatasetとして固定する。Evaluation Runは候補RAGを各Caseで実行し、Scorerが生成したAssessmentとDataset DigestをEvaluation Experimentへ保存する。これにより、どのケース、Release、Judge Versionで合否を判断したかをMLflow UIから追跡できる。
+
+```mermaid
+flowchart TD
+    CASE["承認済み評価Case"] --> DATA["UC EvaluationDataset<br/>Training・Holdout"]
+    DATA --> EVAL["evaluate_rag.py<br/>mlflow.genai.evaluate"]
+    EVAL --> RUN["Evaluation Run・Trace"]
+    RUN --> SCORE["Code Scorer・LLM Judge"]
+    SCORE --> ASSESS["Assessment"]
+    ASSESS --> GATE["Release Gate"]
+    PROD["Realtime Production Trace"] --> MON["Production Monitoring"]
+    MON --> ASSESS
+```
 
 Evaluation Caseは質問Familyと実行時Versionを分離する。`case_family_id` は質問の意味、業務目的、文書Familyから作り、Snapshotを含めない。Training／HoldoutはこのIDのHashで固定する。`case_instance_id` はFamily、Identity fixture、Corpus Snapshot、`expectation_version` を含む個別ケースIDであり、文書改訂で期待値が変わる場合は同じFamilyに新Instanceを追加する。
 
@@ -10473,22 +10965,15 @@ Datasetには期待回答だけでなく、Snapshot、Index Release、期待文�
 
 `bundles/quality/src/seed_evaluation_dataset.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
-| 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/seed_evaluation_dataset.py` |
-| 実行主体 | Quality SP |
-| 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
-| 出力 | 評価、Dataset、Prompt／Judge候補 |
-| 必要な理由 | 品質改善を本番実行から分離するため |
-| 正常終了時 | Version付き成果物を保存する |
-| 失敗時 | Releaseへ昇格しない |
-| 再実行時 | 安定Case IDで冪等再評価する |
+| 目的 | SnapshotとIdentity Fixtureを固定したTraining EvaluationDatasetを作る。 |
+| 入力 | Seed、Snapshot ID、Identity Fixture、Dataset FQN。BootstrapまたはCase追加時に読む。 |
+| 処理 | 入力をMaskし`case_id`でExpectationをmergeする。Holdout混入とACL条件欠落を拒否し、Dataset Digestを評価Runへ渡す。 |
+| 出力 | EvaluationDataset Recordを作成し、EvaluationとPrompt Optimizationが使用する。 |
+| 失敗・再実行 | 既存Datasetを破壊せず、`case_id`で冪等mergeする。 |
 
 ```python
 """SnapshotとIdentity Fixtureを固定した開発用EvaluationDatasetを作成するModule。Holdoutの恣意的な入替えは行わない。
@@ -10500,6 +10985,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import mlflow
@@ -10522,14 +11008,8 @@ def stable_id(prefix: str, values: list[str]) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -10545,14 +11025,8 @@ def stable_citation_id(chunk_version_id: str) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     digest = hashlib.sha256(chunk_version_id.encode("utf-8")).hexdigest()[:12]
     return f"SRC-{digest.upper()}"
@@ -10573,14 +11047,8 @@ def build_record(case: dict) -> tuple[str, dict]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     case_family_id = stable_id("family", case["family_key"])
     dataset_split, split_bucket = assign_split(case_family_id)
@@ -10635,16 +11103,12 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
-    experiment = mlflow.set_experiment("/Shared/llmops/internal-rag-evaluation")
+    experiment = mlflow.set_experiment(
+        experiment_id=os.environ["MLFLOW_EVALUATION_EXPERIMENT_ID"]
+    )
     cases = json.loads(
         Path("tests/seed_evaluation_cases.json").read_text(encoding="utf-8")
     )
@@ -10674,22 +11138,15 @@ Golden Setには通常質問だけでなく、文書Version競合、削除／失
 
 `bundles/quality/src/evaluate_rag.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
-| 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/evaluate_rag.py` |
-| 実行主体 | Quality SP |
-| 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
-| 出力 | 評価、Dataset、Prompt／Judge候補 |
-| 必要な理由 | 品質改善を本番実行から分離するため |
-| 正常終了時 | Version付き成果物を保存する |
-| 失敗時 | Releaseへ昇格しない |
-| 再実行時 | 安定Case IDで冪等再評価する |
+| 目的 | 固定Dataset上でRAGを実行し、Release Gate向け品質Evidenceを作る。 |
+| 入力 | Dataset、候補Release、Answer／Judge Model、Scorer。候補Release作成時に読む。 |
+| 処理 | 各RecordでRAGを実行しCode ScorerとJudgeを適用する。JudgeをAnswer Modelと分離し、Security失敗を平均点で相殺しない。 |
+| 出力 | Evaluation Run、Trace、Metricを作り、Release GateとReview Queueへ渡す。 |
+| 失敗・再実行 | 失敗Recordを保持してReleaseを昇格しない。過去Runを上書きしない。 |
 
 ```python
 """Retrieval、回答、拒否、ACL、Agent経路を階層別Scorerで評価するModule。評価不合格Releaseを昇格しない。
@@ -10699,6 +11156,7 @@ Golden Setには通常質問だけでなく、文書Version競合、削除／失
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 
@@ -10719,6 +11177,14 @@ from rag_graph import run_graph
 from rag_release import load_rag_release
 
 
+JUDGE_MODEL_SERVICE = os.environ["RAG_JUDGE_MODEL_SERVICE"]
+JUDGE_MODEL_URI = (
+    JUDGE_MODEL_SERVICE
+    if JUDGE_MODEL_SERVICE.startswith("databricks:/")
+    else f"databricks:/{JUDGE_MODEL_SERVICE}"
+)
+
+
 @scorer
 def expected_document_recall(outputs: dict, expectations: dict) -> Feedback:
     """必要文書のRecallを決定論的に計算し、空期待値は1.0として扱う。
@@ -10730,14 +11196,8 @@ def expected_document_recall(outputs: dict, expectations: dict) -> Feedback:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     expected = set(expectations.get("expected_document_ids", []))
     actual = set(outputs.get("retrieved_document_ids", []))
@@ -10756,14 +11216,8 @@ def expected_chunk_recall(outputs: dict, expectations: dict) -> Feedback:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     expected = set(expectations.get("expected_chunk_version_ids", []))
     actual = set(outputs.get("retrieved_chunk_version_ids", []))
@@ -10782,14 +11236,8 @@ def citation_ids_valid(outputs: dict, expectations: dict) -> Feedback:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     actual = {item["citation_id"] for item in outputs.get("citations", [])}
     expected = set(expectations.get("expected_citation_ids", []))
@@ -10813,14 +11261,8 @@ def refusal_reason_correct(outputs: dict, expectations: dict) -> Feedback:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     expected_refused = expectations["expected_refused"]
     expected_reason = expectations.get("expected_refusal_reason")
@@ -10842,14 +11284,8 @@ def routing_limits_valid(outputs: dict, expectations: dict) -> Feedback:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     maximum = expectations.get("expected_max_search_attempts", 3)
     attempts = outputs.get("search_attempts", [])
@@ -10872,14 +11308,8 @@ def security_and_release_valid(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     value = (
         outputs.get("acl_violation_count") == 0
@@ -10912,14 +11342,8 @@ def predict_fn(
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     identity = resolve_evaluation_fixture(identity_fixture_id)
     release = load_rag_release(rag_release_id)
@@ -10937,6 +11361,9 @@ def predict_fn(
 
 
 # 候補探索は`internal_rag_train`で行い、このRelease判定は未使用Holdoutだけで実行する。
+mlflow.set_experiment(
+    experiment_id=os.environ["MLFLOW_EVALUATION_EXPERIMENT_ID"]
+)
 dataset = get_dataset(name="main.llmops.internal_rag_holdout")
 results = mlflow.genai.evaluate(
     data=dataset,
@@ -10948,11 +11375,11 @@ results = mlflow.genai.evaluate(
         refusal_reason_correct,
         routing_limits_valid,
         security_and_release_valid,
-        RetrievalRelevance(),
-        RetrievalSufficiency(),
-        RetrievalGroundedness(),
-        RelevanceToQuery(),
-        Correctness(),
+        RetrievalRelevance(model=JUDGE_MODEL_URI),
+        RetrievalSufficiency(model=JUDGE_MODEL_URI),
+        RetrievalGroundedness(model=JUDGE_MODEL_URI),
+        RelevanceToQuery(model=JUDGE_MODEL_URI),
+        Correctness(model=JUDGE_MODEL_URI),
     ],
 )
 ```
@@ -10979,22 +11406,15 @@ Databricks Apps Proxyが付与する `X-Forwarded-Email`、`X-Forwarded-User`、
 
 `bundles/realtime/app/identity_context.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 認証済みRequestと固定Release／出力: SSE、回答、Citation、Trace |
-| 関連Job／Pipeline | Databricks Apps専用Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 検証済み回答または拒否を返す。安全なErrorへ変換する。 |
-| ファイルパス | `bundles/realtime/app/identity_context.py` |
-| 実行主体 | Databricks Apps専用Service Principal |
-| 入力 | 認証済みRequestと固定Release |
-| 出力 | SSE、回答、Citation、Trace |
-| 必要な理由 | ACL付きRAGを安全に提供するため |
-| 正常終了時 | 検証済み回答または拒否を返す |
-| 失敗時 | 安全なErrorへ変換する |
-| 再実行時 | 新Requestとして再実行する |
+| 目的 | Apps Proxy認証をServer側EntitlementとACL Scopeへ変換する。 |
+| 入力 | 信頼済みHeader、Group API、Policy。Requestの最初に読む。 |
+| 処理 | Headerを検証しUser／GroupをServer側で解決する。Client申告Scopeを信用せず、Mask済み主体IDをTraceへ記録する。 |
+| 出力 | 検索Filter用`IdentityContext`をRetrieverへ返す。 |
+| 失敗・再実行 | 検証失敗時は検索とModel呼出し前に拒否する。CacheはVersionとTTLで無効化する。 |
 
 ```python
 """Databricks Apps Proxyから受けた認証Contextを検証し、Server側のEntitlementへ解決するModule。Client申告のAccess Scopeは信用しない。
@@ -11056,14 +11476,8 @@ def resolve_production_identity(user_access_token: str | None) -> EntitlementCon
     Raises:
         PermissionError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     if not user_access_token:
         raise PermissionError("Trusted user identity is unavailable")
@@ -11144,22 +11558,15 @@ AI Search
 
 `bundles/realtime/app/agent.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: 認証済みRequestと固定Release／出力: SSE、回答、Citation、Trace |
-| 関連Job／Pipeline | Databricks Apps専用Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 検証済み回答または拒否を返す。安全なErrorへ変換する。 |
-| ファイルパス | `bundles/realtime/app/agent.py` |
-| 実行主体 | Databricks Apps専用Service Principal |
-| 入力 | 認証済みRequestと固定Release |
-| 出力 | SSE、回答、Citation、Trace |
-| 必要な理由 | ACL付きRAGを安全に提供するため |
-| 正常終了時 | 検証済み回答または拒否を返す |
-| 失敗時 | 安全なErrorへ変換する |
-| 再実行時 | 新Requestとして再実行する |
+| 目的 | `@stream`でGraph進捗と最終ResponseをSSEへ変換する。 |
+| 入力 | Request、Identity Header、Graph Event。Responses API Requestごとに読む。 |
+| 処理 | 入力検証後、安全な進捗だけをyieldする。Chain-of-ThoughtやRaw Chunkを配信せず、Root TraceとNode SpanをRealtime Experimentへ関連付ける。 |
+| 出力 | Responses API互換SSE EventをStreamlitと監視へ返す。 |
+| 失敗・再実行 | Error Eventを返し部分回答を完了扱いしない。再送は新request_idにする。 |
 
 ```python
 """MLflow Agent Serverのstream entrypointとしてRAG Graphを実行し、進捗と最終回答をResponses API Eventへ変換するModule。Chain-of-Thoughtは配信しない。
@@ -11206,14 +11613,8 @@ def get_user_question(request: ResponsesAgentRequest) -> str:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     for item in reversed(request.input):
         message = item.model_dump() if hasattr(item, "model_dump") else item
@@ -11235,14 +11636,8 @@ def trace_release_tags(release, identity) -> dict[str, str]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return {
         "rag.release_id": release.rag_release_id,
@@ -11272,14 +11667,8 @@ def citation_annotations(result) -> list[dict]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     annotations: list[dict] = []
     for citation in result.citations:
@@ -11311,14 +11700,8 @@ def classify_runtime_error(error: Exception) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     error_type = f"{type(error).__module__}.{type(error).__name__}".casefold()
     if "search" in error_type or "vector" in error_type:
@@ -11336,14 +11719,8 @@ async def safe_graph_updates(graph, state):
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     try:
         async for update in graph.astream(state, stream_mode="updates"):
@@ -11384,14 +11761,8 @@ async def stream_rag(
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     headers = get_request_headers()
     identity = resolve_production_identity(
@@ -11502,22 +11873,15 @@ MLflow 3.4以降の現行APIは `mlflow.genai.enable_git_model_versioning()` で
 
 `bundles/realtime/app/start_server.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 認証済みRequestと固定Release／出力: SSE、回答、Citation、Trace |
-| 関連Job／Pipeline | Databricks Apps専用Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 検証済み回答または拒否を返す。安全なErrorへ変換する。 |
-| ファイルパス | `bundles/realtime/app/start_server.py` |
-| 実行主体 | Databricks Apps専用Service Principal |
-| 入力 | 認証済みRequestと固定Release |
-| 出力 | SSE、回答、Citation、Trace |
-| 必要な理由 | ACL付きRAGを安全に提供するため |
-| 正常終了時 | 検証済み回答または拒否を返す |
-| 失敗時 | 安全なErrorへ変換する |
-| 再実行時 | 新Requestとして再実行する |
+| 目的 | BuildとRelease Readinessを検証してAgent Serverを起動する。 |
+| 入力 | 環境変数、Experiment ID、Git Commit、Release Pointer。Container起動時に読む。 |
+| 処理 | 必須値とResource整合性を確認し、合格後だけServerをListenさせる。 |
+| 出力 | Health Checkに応答するAgent Server ProcessをStreamlitへ提供する。 |
+| 失敗・再実行 | 不合格は非0終了する。外部状態を変更せず同じReleaseを再読して再起動できる。 |
 
 ```python
 """Agent Server Applicationを登録し、起動前にReleaseとResource整合性を検証するModule。Readiness不合格時は公開しない。
@@ -11550,14 +11914,8 @@ def validate_build_metadata() -> None:
     Raises:
         RuntimeError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     missing = [name for name in REQUIRED_BUILD_METADATA if not os.getenv(name)]
     if missing:
@@ -11572,14 +11930,8 @@ def configure_mlflow() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     mlflow.set_tracking_uri("databricks")
     mlflow.set_experiment(experiment_id=os.environ["MLFLOW_EXPERIMENT_ID"])
@@ -11602,14 +11954,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     agent_server.run(
         app_import_string="start_server:app",
@@ -11653,14 +11999,8 @@ def verify_git_versioning_in_ci() -> None:
     Raises:
         RuntimeError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     context = mlflow.genai.enable_git_model_versioning()
     if context.info is None or context.info.dirty:
@@ -11677,22 +12017,15 @@ StreamlitはApps Proxyから受け取ったUser Authorization Tokenをlocalhost�
 
 `bundles/realtime/app/streamlit_app.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
-| 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
-| 関連Table／Dataset | 入力: 認証済みRequestと固定Release／出力: SSE、回答、Citation、Trace |
-| 関連Job／Pipeline | Databricks Apps専用Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 検証済み回答または拒否を返す。安全なErrorへ変換する。 |
-| ファイルパス | `bundles/realtime/app/streamlit_app.py` |
-| 実行主体 | Databricks Apps専用Service Principal |
-| 入力 | 認証済みRequestと固定Release |
-| 出力 | SSE、回答、Citation、Trace |
-| 必要な理由 | ACL付きRAGを安全に提供するため |
-| 正常終了時 | 検証済み回答または拒否を返す |
-| 失敗時 | 安全なErrorへ変換する |
-| 再実行時 | 新Requestとして再実行する |
+| 目的 | Agent Server SSEを進捗と最終回答に分けて表示する。 |
+| 入力 | 質問、認証Context、SSE。利用者操作ごとに読む。 |
+| 処理 | SSEをParseして表示領域を更新する。完了前Tokenを確定回答扱いせず、許可されたCitation URLだけを表示する。 |
+| 出力 | 検証済み回答または拒否とtrace_idを画面へ出す。 |
+| 失敗・再実行 | 切断時は部分回答を破棄し、再送は新request_idで行う。 |
 
 ```python
 """Databricks Apps上のStreamlit UIからAgent Server SSEを逐次表示するModule。Progressと検証済み最終回答を分離する。
@@ -11724,14 +12057,8 @@ def stream_agent(question: str):
         PermissionError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
         RuntimeError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     user_token = st.context.headers.get("x-forwarded-access-token")
     request_id = st.context.headers.get("x-request-id")
@@ -11798,14 +12125,8 @@ def render_citations() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     citations = st.session_state.get("citations", [])
     if not citations:
@@ -11852,129 +12173,107 @@ if question := st.chat_input("技術文書について質問してください")
 
 ##### 4.2.4.13 Databricks Apps Resource
 
-`app.yaml` の `valueFrom` はResource Keyを値へ解決するだけであり、任意のManifest Resourceへ自動権限を与えるものではない。AppごとのService Principalへ、Serving endpointは `CAN_QUERY`、AI Search IndexはUI上のCan selectに相当するUC `SELECT`、Experimentは `CAN_EDIT`、SQL Warehouseは `CAN_USE` を付与する。Current／Rollback候補の両方をResourceとして宣言し、Runtime Health CheckがManifestのIndex／Model endpointが許可List内か、各ResourceがReadyかを確認してからReadinessを返す。
+`app.yaml`の`valueFrom`はApps Resource Keyを値へ解決するだけであり、Release Manifestが参照する任意Resourceへ自動権限を与えない。AI Search Index、Experiment、SQL Warehouseは対応するApps Resource Bindingを使う。一方、2026年8月時点のApps／DAB Resource BindingはUnity AI Gateway Model ServiceをSupported Resource Typeとして公開していないため、架空の`MODEL_SERVICE` Bindingを作らず、TerraformがApp Service Principalへ親Catalog／Schemaと対象Model Serviceの`EXECUTE`を直接付与する。Runtime Health CheckはManifestのIndex／Model Serviceが承認済みReleaseに含まれ、最小Query／Inferenceが成功することを確認してからReadinessを返す。
+
+`bundles/realtime/databricks.yml`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| このFileの責務 | Realtime App、Resource Binding、環境別Experiment／Index／Warehouse参照のBundle入口を定義する |
+| Trigger／変数解決 | CIがBootstrap出力とRelease候補を`BUNDLE_VAR_*`で注入し、`bundle validate/deploy`がResource YAMLへ展開する |
+| 重要な判定 | ExperimentをこのBundleで再作成せず、SDK BootstrapのIDだけを参照する |
+| 正常／失敗／Retry | 同Targetへ再DeployしてApp定義へ収束。Validate失敗時は稼働中Appを変更しない |
+| 後続処理 | `realtime_app.yml`がBinding、`app.yaml`が`valueFrom`をProcess Environmentへ解決する |
+
+```yaml
+# Realtime Applicationを独立DeployするBundleと環境固有参照を定義する。
+bundle:
+  name: internal-docs-realtime
+
+include:
+  - resources/*.yml
+
+variables:
+  # Workspace上のDatabricks Apps Resource名を環境別に指定する。
+  app_name:
+    description: Realtime RAG Databricks App名
+  # MLflow SDK Bootstrapが作成したRealtime Experiment IDをBindingへ渡す。
+  realtime_experiment_id:
+    description: Realtime Trace専用MLflow Experiment ID
+  # Current／Rollback候補のAI Search IndexをApp Resourceとして許可する。
+  index_name_current:
+    description: 現行AI Search Index FQN
+  index_name_previous:
+    description: Rollback用AI Search Index FQN
+  # Release Manifest照会に利用するRead-only SQL WarehouseをBindingする。
+  release_warehouse_id:
+    description: Release Manifest参照用SQL Warehouse ID
+
+targets:
+  dev:
+    default: true
+  stg: {}
+  prod:
+    mode: production
+```
 
 `bundles/realtime/resources/realtime_app.yml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 環境別DAB変数とResource定義／出力: Job／Pipeline／App設定 |
-| 関連Job／Pipeline | Bundle Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Validate後にDeployする。既存Resourceを維持する。 |
-| ファイルパス | `bundles/realtime/resources/realtime_app.yml` |
-| 実行主体 | Bundle Deploy Identity |
-| 入力 | 環境別DAB変数とResource定義 |
-| 出力 | Job／Pipeline／App設定 |
-| 必要な理由 | 実行Identityと環境差分を宣言するため |
-| 正常終了時 | Validate後にDeployする |
-| 失敗時 | 既存Resourceを維持する |
-| 再実行時 | 同じTargetで再Validate／Deployする |
+| 目的 | AppとExperiment／Index／Warehouse Binding、SP権限をDABで定義する。 |
+| 入力 | Bundle変数、Source Path、Bootstrap済みResource ID。Realtime Deploy時に解決する。 |
+| 処理 | Appを作成し既存ResourceをBindingする。Model Serviceの架空Bindingは作らず、App SPへ`EXECUTE`を別途付与する。 |
+| 出力 | Databricks AppとResource Bindingを作り、`app.yaml`とSmoke Testへ渡す。 |
+| 失敗・再実行 | Binding不能ならDeployを失敗させる。同じApp Keyを更新し、SP変更時はGrantを再適用する。 |
 
 ```yaml
-# Bundleが作成・更新するDatabricks Resourceを定義する。
 resources:
   # Databricks Apps Resourceを定義する。
   apps:
-    # internal_rag_appに関する設定値を定義する。
     internal_rag_app:
-      # Databricks上で表示・参照するResource名を設定する。
       name: ${var.app_name}
-      # descriptionに関する設定値を定義する。
       description: "Internal technical document RAG"
-      # source_code_pathに関する設定値を定義する。
       source_code_path: ../app
-      # user_api_scopesに関する設定値を定義する。
       user_api_scopes:
-        # iam.current-userに関する設定値を定義する。
         - iam.current-user:read
-        # iam.access-controlに関する設定値を定義する。
         - iam.access-control:read
-      # Bundleが作成・更新するDatabricks Resourceを定義する。
       resources:
-        # Databricks上で表示・参照するResource名を設定する。
-        - name: rag-model-current
-          # serving_endpointに関する設定値を定義する。
-          serving_endpoint:
-            # Databricks上で表示・参照するResource名を設定する。
-            name: ${var.model_endpoint_current}
-            # permissionに関する設定値を定義する。
-            permission: CAN_QUERY
-        # Databricks上で表示・参照するResource名を設定する。
-        - name: rag-model-previous
-          # serving_endpointに関する設定値を定義する。
-          serving_endpoint:
-            # Databricks上で表示・参照するResource名を設定する。
-            name: ${var.model_endpoint_previous}
-            # permissionに関する設定値を定義する。
-            permission: CAN_QUERY
-        # Databricks上で表示・参照するResource名を設定する。
         - name: rag-index-current
-          # uc_securableに関する設定値を定義する。
           uc_securable:
-            # securable_full_nameに関する設定値を定義する。
             securable_full_name: ${var.index_name_current}
-            # securable_typeに関する設定値を定義する。
             securable_type: TABLE
-            # permissionに関する設定値を定義する。
             permission: SELECT
-        # Databricks上で表示・参照するResource名を設定する。
         - name: rag-index-previous
-          # uc_securableに関する設定値を定義する。
           uc_securable:
-            # securable_full_nameに関する設定値を定義する。
             securable_full_name: ${var.index_name_previous}
-            # securable_typeに関する設定値を定義する。
             securable_type: TABLE
-            # permissionに関する設定値を定義する。
             permission: SELECT
-        # Databricks上で表示・参照するResource名を設定する。
         - name: rag-experiment
-          # experimentに関する設定値を定義する。
           experiment:
-            # experiment_idに関する設定値を定義する。
-            experiment_id: ${resources.experiments.rag_realtime.id}
-            # permissionに関する設定値を定義する。
+            experiment_id: ${var.realtime_experiment_id}
             permission: CAN_EDIT
-        # Databricks上で表示・参照するResource名を設定する。
         - name: release-warehouse
-          # sql_warehouseに関する設定値を定義する。
           sql_warehouse:
-            # idに関する設定値を定義する。
             id: ${var.release_warehouse_id}
-            # permissionに関する設定値を定義する。
             permission: CAN_USE
-
-  # experimentsに関する設定値を定義する。
-  experiments:
-    # rag_realtimeに関する設定値を定義する。
-    rag_realtime:
-      # Databricks上で表示・参照するResource名を設定する。
-      name: /Shared/llmops/${bundle.target}/internal-rag-realtime
 ```
 
 AI Search IndexはApps Resource／Model移行表の公式対応に従い、Bundleでは`uc_securable`、`securable_type: TABLE`、`permission: SELECT`としてBindingする。Apps UIでは`vector-search-index`のCan selectと表示される。Endpoint作成・Sync権限は`ingestion` Bundleだけへ分離する。
 
 `bundles/realtime/app/app.yaml`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 環境別DAB変数とResource定義／出力: Job／Pipeline／App設定 |
-| 関連Job／Pipeline | Bundle Deploy Identity。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Validate後にDeployする。既存Resourceを維持する。 |
-| ファイルパス | `bundles/realtime/app/app.yaml` |
-| 実行主体 | Bundle Deploy Identity |
-| 入力 | 環境別DAB変数とResource定義 |
-| 出力 | Job／Pipeline／App設定 |
-| 必要な理由 | 実行Identityと環境差分を宣言するため |
-| 正常終了時 | Validate後にDeployする |
-| 失敗時 | 既存Resourceを維持する |
-| 再実行時 | 同じTargetで再Validate／Deployする |
+| 目的 | App内のAgent Server／Streamlit Processと環境変数を定義する。 |
+| 入力 | Resource BindingとBundle環境変数。Deploy／Restart時に読む。 |
+| 処理 | `start.sh`へPort、Experiment、Model、Index、Releaseを渡す。必須値をDefaultへFallbackせずSecretを埋め込まない。 |
+| 出力 | 同じRelease設定で二つのProcessを起動する。 |
+| 失敗・再実行 | 必須値欠落時は起動しない。Restart時にBindingを再解決する。 |
 
 ```yaml
 # App ProcessまたはTaskが実行するCommandを設定する。
@@ -11982,59 +12281,35 @@ command: ["bash", "start.sh"]
 
 # Processへ渡す環境変数を定義する。
 env:
-  # Databricks上で表示・参照するResource名を設定する。
-  - name: RAG_MODEL_CURRENT
-    # valueFromに関する設定値を定義する。
-    valueFrom: rag-model-current
-  # Databricks上で表示・参照するResource名を設定する。
-  - name: RAG_MODEL_PREVIOUS
-    # valueFromに関する設定値を定義する。
-    valueFrom: rag-model-previous
-  # Databricks上で表示・参照するResource名を設定する。
   - name: RAG_INDEX_CURRENT
-    # valueFromに関する設定値を定義する。
     valueFrom: rag-index-current
-  # Databricks上で表示・参照するResource名を設定する。
   - name: RAG_INDEX_PREVIOUS
-    # valueFromに関する設定値を定義する。
     valueFrom: rag-index-previous
-  # Databricks上で表示・参照するResource名を設定する。
   - name: MLFLOW_EXPERIMENT_ID
-    # valueFromに関する設定値を定義する。
     valueFrom: rag-experiment
-  # Databricks上で表示・参照するResource名を設定する。
   - name: RELEASE_WAREHOUSE_ID
-    # valueFromに関する設定値を定義する。
     valueFrom: release-warehouse
-  # Databricks上で表示・参照するResource名を設定する。
   - name: RAG_RELEASE_ID
     # 環境変数や設定値の固定値を指定する。
     value: rag-release-prd-20260814
-  # Databricks上で表示・参照するResource名を設定する。
   - name: RAG_RELEASE_STATUS
     # 環境変数や設定値の固定値を指定する。
     value: production
-  # Databricks上で表示・参照するResource名を設定する。
   - name: ACL_POLICY_VERSION
     # 環境変数や設定値の固定値を指定する。
     value: acl-policy-v7
-  # Databricks上で表示・参照するResource名を設定する。
   - name: APP_GIT_COMMIT
     # 環境変数や設定値の固定値を指定する。
     value: 0123456789abcdef0123456789abcdef01234567
-  # Databricks上で表示・参照するResource名を設定する。
   - name: APP_GIT_REPOSITORY
     # 環境変数や設定値の固定値を指定する。
     value: ssh://git.example.internal/llmops/internal-rag.git
-  # Databricks上で表示・参照するResource名を設定する。
   - name: APP_BUILD_ID
     # 環境変数や設定値の固定値を指定する。
     value: build-20260814-001
-  # Databricks上で表示・参照するResource名を設定する。
   - name: APP_COMMON_WHEEL_VERSION
     # 環境変数や設定値の固定値を指定する。
     value: 1.8.0
-  # Databricks上で表示・参照するResource名を設定する。
   - name: APP_GIT_DIRTY
     # 環境変数や設定値の固定値を指定する。
     value: "false"
@@ -12044,22 +12319,15 @@ Commit、Build ID、Release IDはCIがTarget別のDeploy artifactへ埋め込み
 
 `bundles/realtime/app/start.sh`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: 認証済みRequestと固定Release／出力: SSE、回答、Citation、Trace |
-| 関連Job／Pipeline | Databricks Apps専用Service Principal。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | 検証済み回答または拒否を返す。安全なErrorへ変換する。 |
-| ファイルパス | `bundles/realtime/app/start.sh` |
-| 実行主体 | Databricks Apps専用Service Principal |
-| 入力 | 認証済みRequestと固定Release |
-| 出力 | SSE、回答、Citation、Trace |
-| 必要な理由 | ACL付きRAGを安全に提供するため |
-| 正常終了時 | 検証済み回答または拒否を返す |
-| 失敗時 | 安全なErrorへ変換する |
-| 再実行時 | 新Requestとして再実行する |
+| 目的 | Agent ServerとStreamlitを起動し、子Process終了をContainerへ伝播する。 |
+| 入力 | 環境変数とPython Source。Container起動時に読む。 |
+| 処理 | strict modeでServerをBackground起動しUIを開始する。一方の異常終了を隠さず`wait`で監視する。 |
+| 出力 | 両ProcessをDatabricks Apps Health Checkへ公開する。 |
+| 失敗・再実行 | 非0終了をAppsへ返す。外部状態を持たないため再起動できる。 |
 
 ```bash
 #!/usr/bin/env bash
@@ -12078,30 +12346,42 @@ exec streamlit run streamlit_app.py \
   --server.headless true
 ```
 
-`requirements.txt` は検証済みLockから生成し、少なくとも `mlflow>=3.6`、`databricks-sdk`、`databricks-ai-search`、`databricks-langchain`、`langgraph`、`pydantic>=2`、`requests`、`streamlit` と共通Wheelを固定する。Model endpointが `READY` でない、Indexが `ONLINE` でない、Manifest ResourceがApps許可List外、Prompt Versionが解決不能、Wheel Version不一致のいずれかではHealth Checkを失敗させる。
+`requirements.txt`は検証済みLockから生成し、少なくとも`mlflow[databricks]>=3.14,<4`、`databricks-sdk`、`databricks-ai-search`、`databricks-openai`、`langgraph`、`pydantic>=2`、`requests`、`streamlit`と共通Wheelを固定する。Model Serviceへの最小推論が失敗する、Indexが`ONLINE`でない、Manifest ResourceがApps許可List外、Prompt Versionが解決不能、Wheel Version不一致のいずれかではHealth Checkを失敗させる。
 
 ##### 4.2.4.14 Production Monitoringを本番開始前に設定する
 
+Production Monitoringは、Realtime Experimentへ登録したScorerを本番Traceの一部に非同期適用し、品質Feedbackを継続追加するMLflow機能である。物理的にはRegistered Scorer、Sampling設定、Serverless Monitoring Job、生成されたAssessmentから構成され、2026年8月時点ではBetaである。定期評価を開始する前に、Preview有効化、Experiment権限、UC Trace、SQL Warehouse、Budget Policy、Judge Model権限をPreflightで確認する。
+
 Production MonitoringはBeta機能である。本番導入／Pilot時に、PoCとRelease Gateで検証したJudgeを本番Experimentへ登録し、Stagingの本番相当TraceでDry Runしてから開始する。全件集計するLatency、Token、検索件数、拒否率などは決定論的集計へ残し、意味評価だけをSamplingしたJudgeへ任せる。Code-based Scorerはオフライン`mlflow.genai.evaluate()`で使い、Production Monitoringへそのまま自動登録できる前提にしない。
+
+| Prerequisite | 実体／確認方法 | 不足時の動作 |
+| --- | --- | --- |
+| Feature Status | Workspace AdminがPreviewsでProduction Monitoring Betaを許可 | `register()`を実行しない |
+| 対象Experiment | Bootstrap済み`MLFLOW_REALTIME_EXPERIMENT_ID` | 名前Fallbackせず停止 |
+| Trace Schema | `AGENT`、`RETRIEVER`、`LLM` SpanとVersion Tagを固定Staging Traceで検証 | Pilot Gate不合格 |
+| Monitoring SQL Warehouse | `set_databricks_monitoring_sql_warehouse_id()`でExperiment Tagへ永続設定 | UC Trace上のMonitoring開始不可 |
+| Warehouse／Experiment権限 | 最初の登録IdentityにWarehouse`CAN USE`、Experiment`CAN EDIT` | 登録Job停止 |
+| Serverless Budget Policy | Default利用可、または`mlflow.workload_creation_policy_id` Tag | Fail Closed |
+| Scorer／Judge Version | HoldoutとJudge Validationで承認済み。Experiment当たり最大20 Registered Scorer | 不要VersionをStop／Archiveしてから登録 |
+| Sampling／Cost | Scorer別Sample Rate、月額上限、停止閾値をDecision Logへ固定 | Pilot拡大不可 |
+| Judge Model権限 | Monitoring IdentityにJudge Model Service`EXECUTE` | Judge登録／開始不可 |
+| 実行Identity | 最初にScorer登録した管理対象Quality SP | 個人Userでの初回登録禁止 |
+
+Registered ScorerはExperimentに関連付くVersion付きMLflow Resourceであり、実行結果は対象TraceのFeedback Assessmentとして保存される。`register()`は定義を登録するだけ、`start()`はSampling設定でバックグラウンド評価を開始する。停止時はRegistered ScorerをStopし、既存Feedbackは監査Evidenceとして残す。再開は承認済みVersionとSample Rateを確認してStartし直す。Rollbackは新JudgeをStopして直前のRegistered Judge Versionを再開し、Release ManifestとDecision Logへ切替理由を記録する。
+
+Production Monitoringへ登録する独自`@scorer`関数はDatabricks Notebookで定義・登録し、関数内Importだけを使うSelf-contained実装にする必要がある。Standalone Python FileのCustom Code ScorerをSerializationできる前提にしない。本Sourceの`make_judge`はVersion管理するJudge定義であり、決定論的なACL／Citation検査は引き続きオフラインGateとOperational SQLで全件評価する。
 
 `bundles/quality/src/register_monitoring.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入／Pilot時に設定・Dry Runし、Pilotまたは本番開始と同時に有効化する。 |
-| 初めて必要になる段階 | 本番導入／Pilot時 |
-| 後続段階で追加される機能 | 本番導入後にSampling、Alert閾値、Cost上限、Review Queue連携を実績から調整する。 |
-| 関連Table／Dataset | 入力: 本番相当Trace、検証済みJudge／出力: Registered Judge、Monitoring設定 |
-| 関連Job／Pipeline | Quality SPが実行するMonitoring設定Job。 |
-| 関連する検証 | 固定TraceでJudge Version、対人間一致率、False Positive／Negative、Sampling Costを確認する。 |
-| ファイルパス | `bundles/quality/src/register_monitoring.py` |
-| 実行主体 | Quality SP |
-| 入力 | Judge定義、Experiment、Sampling Rate、Git Commit、Judge Validation結果 |
-| 出力 | 未開始または開始済みのRegistered Judge Version |
-| 必要な理由 | 本番開始後に評価不能な期間を作らず、開発時と同じ品質定義を継続利用するため |
-| 正常終了時 | Dry Runでは登録まで、Pilot開始時は承認済みVersionだけを開始する |
-| 失敗時 | Monitoringを開始せず、Release GateをFail Closedにする |
-| 再実行時 | 登録済みVersionと開始状態を照合し、重複登録・重複開始を防ぐ |
+| 目的 | 検証済みScorerを登録し、承認時だけProduction Monitoringを開始する。 |
+| 入力 | Realtime Experiment、Judge Model、Warehouse、Budget、承認値。Pilot前に読む。 |
+| 処理 | Prerequisiteを検査してVersion付きScorerをregister／startする。権限、Budget、Judge承認が不足すれば開始しない。 |
+| 出力 | Registered ScorerとMonitoring設定を作り、Operational ViewとAlertが参照する。 |
+| 失敗・再実行 | 既存Monitoringを無断変更しない。Scorer名とVersionで重複登録を避ける。 |
 
 ```python
 """検証済みJudgeを登録し、承認時だけProduction Monitoringを開始する。"""
@@ -12116,6 +12396,12 @@ from mlflow.genai.scorers import ScorerSamplingConfig
 
 def build_internal_rag_quality_judge():
     """Retriever根拠とStable Citationに対する意味的品質Judgeを定義する。"""
+    model_service = os.environ["RAG_JUDGE_MODEL_SERVICE"]
+    judge_model_uri = (
+        model_service
+        if model_service.startswith("databricks:/")
+        else f"databricks:/{model_service}"
+    )
     return make_judge(
         name="internal_rag_quality",
         instructions="""
@@ -12124,26 +12410,50 @@ def build_internal_rag_quality_judge():
 すべて満たせばyes、根拠不足または誤引用が1つでもあればnoを返してください。
 """.strip(),
         feedback_value_type=Literal["yes", "no"],
-        model=os.environ["PRODUCTION_JUDGE_MODEL"],
+        model=judge_model_uri,
     )
 
 
 def main() -> None:
     """Judge候補をVersion登録し、明示承認された場合だけSampling評価を開始する。"""
-    experiment = mlflow.set_experiment("/Shared/llmops/internal-rag-realtime")
+    experiment_id = os.environ["MLFLOW_REALTIME_EXPERIMENT_ID"]
+    experiment = mlflow.set_experiment(experiment_id=experiment_id)
+    tags = experiment.tags or {}
+    if not tags.get("mlflow.monitoring.sqlWarehouseId"):
+        raise ValueError("Monitoring SQL Warehouse ID is not set on experiment")
+    if (
+        os.getenv("DEFAULT_MONITORING_BUDGET_POLICY_ALLOWED", "false").lower()
+        != "true"
+        and not tags.get("mlflow.workload_creation_policy_id")
+    ):
+        raise ValueError("Serverless budget policy is not set on experiment")
+    if os.getenv("MONITORING_PREVIEW_ENABLED", "false").lower() != "true":
+        raise ValueError("Production Monitoring Beta is not enabled")
+    if os.getenv("JUDGE_VALIDATION_APPROVED", "false").lower() != "true":
+        raise ValueError("Judge validation has not been approved")
+    registered_name = (
+        "internal_rag_quality_"
+        + os.environ["JUDGE_RELEASE_VERSION"].replace("/", "_")
+    )
     registered = build_internal_rag_quality_judge().register(
-        experiment_id=experiment.experiment_id
+        name=registered_name,
+        experiment_id=experiment_id,
     )
     print(f"registered_judge={registered.name}, version={registered.version}")
 
     # Staging Dry Runではfalseのまま登録Versionを固定Traceへ明示評価する。
     # Judge Validation承認とPilot Go判定の両方が揃ったDeployだけが開始できる。
     if os.getenv("ENABLE_PRODUCTION_MONITORING", "false").lower() == "true":
-        registered.start(
+        registered = registered.start(
             sampling_config=ScorerSamplingConfig(
-                sample_rate=float(os.getenv("MONITORING_SAMPLE_RATE", "0.10"))
+                sample_rate=float(os.environ["MONITORING_SAMPLE_RATE"]),
+                filter_string=(
+                    "attributes.status = 'OK' AND "
+                    "tag.bootstrap.smoke_test != 'true'"
+                ),
             )
         )
+        print("monitoring_state=started")
 
 
 if __name__ == "__main__":
@@ -12176,16 +12486,15 @@ flowchart TD
 
 `bundles/quality/src/create_operational_monitoring_assets.sql`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| Trigger | 初回本番Deploy、Schema Migration承認時 |
-| Data Source | 既存Review Table、各Detectorが作る標準Signal |
-| 出力 | Signal Inbox、Threshold正本、Case監視View |
-| 実行主体 | Quality SP |
-| 通知 | Migration失敗時はJob Failure Notification |
-| 記録先 | Unity Catalog Delta TableとView |
-| 権限 | DetectorはSignal Tableへ`APPEND`相当の最小権限、Quality SPはCaseへ`MODIFY`、閲覧者はViewへ`SELECT` |
-| Retention | Signalは監査Policyの最低保持後に承認済みPurge Jobで削除し、Case・Decisionは業務記録の保持規程に従う |
+| 目的 | Review Case、Signal、Run／Decision LogのSchemaをMigrationする。 |
+| 入力 | 既存Review CaseとSystem／MLflow参照列。BootstrapとSchema更新時に読む。 |
+| 処理 | Version付きALTER／CREATEでReview状態とOperational Case状態を分ける。Trace本文は複製せず参照IDで関連付ける。 |
+| 出力 | 運用Tableと監視Viewを作り、TriageとAssignmentが使用する。 |
+| 失敗・再実行 | Migration失敗時は旧Schemaを維持する。適用済みVersionを確認して再実行する。 |
 
 ```sql
 -- 一度だけ実行するVersion付きMigration。
@@ -12290,6 +12599,14 @@ WHERE coalesce(case_status, 'detected') NOT IN
 
 `bundles/quality/src/triage_operational_signals.sql`
 
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Trigger | 10分ごとに未処理Monitoring SignalをQuality Caseへ冪等変換する |
+| 読取／更新 | `internal_rag_monitoring_signals`を読み、`internal_rag_review_cases`をMERGEし、取込済みSignalを`processed`へ更新する |
+| SQL順序 | `dedup_key`内の最古Signal選択→未作成CaseだけInsert→原因別Owner／Severity別SLA設定→Case存在Signalを処理済みにする |
+| 重要判定 | 同一EventからCaseを1件だけ作り、質問本文をWorkflow Tableへ複製しない |
+| Transaction／Retry | 各MERGEは冪等。1本目成功・2本目失敗でも再実行時に既存Caseへ一致して状態だけ収束する |
+
 ```sql
 -- 未取込Signalをdedup_keyで既存Caseと照合し、1 Eventから1 Caseだけを作成する。
 -- 質問内容はTraceへ残し、Workflow TableにはMask済み参照情報だけを記録する。
@@ -12374,6 +12691,14 @@ THEN UPDATE SET target.ingestion_status = 'processed';
 | `job:7341:run:98211`の再送 | 同じ`dedup_key` | 既存Caseに一致し追加しない |
 
 `bundles/quality/resources/operational_monitoring.yml`
+
+| ロジック概要 | 内容 |
+| --- | --- |
+| 責務／Trigger | Triage Job、SQL Alert、通知、Warehouse、実行SPの接続をDABで宣言する |
+| 変数解決 | `quality/databricks.yml`のWarehouse、System Destination、Group Mail、SP Application IDを環境別に展開する |
+| Deploy／Run | DeployはJob／Alert定義を作成し、Run時はSQL MERGE、5分Alert、10分Triageを実行する |
+| 重要判定 | Emailだけに依存せずSystem Destinationも使い、Run時間超過とJob失敗をQuality Signalとは別経路で通知する |
+| 正常／失敗／Retry | 同Targetへ再Deployして設定を収束。Triage SQLは`dedup_key`で重複Caseを防ぐ |
 
 ```yaml
 # このFileが参照するEmail、Group、System Destination、Warehouseは
@@ -12770,22 +13095,15 @@ Deltaテーブルには次の列を持たせる。
 
 `bundles/quality/src/assign_review_cases.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入後に本番TraceとAssessmentを使って追加する。 |
-| 初めて必要になる段階 | 本番導入後 |
-| 後続段階で追加される機能 | 改善CycleごとにDataset、Rubric、閾値、Release比較を更新する。 |
-| 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
-| 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/assign_review_cases.py` |
-| 実行主体 | Quality SP |
-| 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
-| 出力 | 評価、Dataset、Prompt／Judge候補 |
-| 必要な理由 | 品質改善を本番実行から分離するため |
-| 正常終了時 | Version付き成果物を保存する |
-| 失敗時 | Releaseへ昇格しない |
-| 再実行時 | 安定Case IDで冪等再評価する |
+| 目的 | 承認済みCaseへ改善対象と安定Dataset Splitを割り当てる。 |
+| 入力 | Review Case、root_cause、case_group_id、Split Policy。approved後に読む。 |
+| 処理 | 原因対応表とGroup Hashで改善先とSplitを固定する。結果を見た後のSplit変更と類似Case分断を禁止する。 |
+| 出力 | Caseを`assigned`にしてDataset Syncへ渡す。 |
+| 失敗・再実行 | 承認前Caseは変更しない。Policy Versionとgroup_idを再読して既存割当を上書きしない。 |
 
 ```python
 """承認済み本番レビューCaseへ改善先と固定Dataset Splitを割り当てるModule。評価結果を見た後の恣意的Split変更を許さない。
@@ -12819,14 +13137,8 @@ def add_improvement_target(review_cases: DataFrame) -> DataFrame:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return review_cases.withColumn(
         "improvement_target",
@@ -12851,14 +13163,8 @@ def add_dataset_split(review_cases: DataFrame) -> DataFrame:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     with_bucket = review_cases.withColumn(
         "split_bucket",
@@ -12890,14 +13196,8 @@ def assert_split_distribution(projected_cases: DataFrame) -> None:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     for dimension in (
         "category",
@@ -12926,14 +13226,8 @@ def assign_approved_cases() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     source = (
         spark.table(REVIEW_TABLE)
@@ -12986,22 +13280,15 @@ Quality Jobは `assigned` CaseをTraining／HoldoutへCase単位で配送する�
 
 `bundles/quality/src/sync_evaluation_dataset.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入後に本番TraceとAssessmentを使って追加する。 |
-| 初めて必要になる段階 | 本番導入後 |
-| 後続段階で追加される機能 | 改善CycleごとにDataset、Rubric、閾値、Release比較を更新する。 |
-| 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
-| 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/sync_evaluation_dataset.py` |
-| 実行主体 | Quality SP |
-| 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
-| 出力 | 評価、Dataset、Prompt／Judge候補 |
-| 必要な理由 | 品質改善を本番実行から分離するため |
-| 正常終了時 | Version付き成果物を保存する |
-| 失敗時 | Releaseへ昇格しない |
-| 再実行時 | 安定Case IDで冪等再評価する |
+| 目的 | assigned Caseを用途別EvaluationDatasetへ冪等配送する。 |
+| 入力 | Review Case、Dataset Mapping、Experiment ID。Assignment後に読む。 |
+| 処理 | Splitと改善先を検証しMask済みRecordをmergeする。競合する最終検証用途へ二重配送しない。 |
+| 出力 | Dataset Recordを作りCaseを`synced`へ更新する。 |
+| 失敗・再実行 | Dataset失敗時は`assigned`のまま残す。`review_case_id`で重複を防ぐ。 |
 
 ```python
 """承認済みReview Caseを用途別MLflow EvaluationDatasetへ冪等同期するModule。同じCaseを競合する最終検証用途へ重複配送しない。
@@ -13012,6 +13299,7 @@ Quality Jobは `assigned` CaseをTraining／HoldoutへCase単位で配送する�
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 
 import mlflow
 from delta.tables import DeltaTable
@@ -13022,7 +13310,9 @@ from pyspark.sql import functions as F
 
 REVIEW_TABLE = "main.llmops.internal_rag_review_cases"
 BATCH_SIZE = 200
-experiment = mlflow.set_experiment("/Shared/llmops/internal-rag-evaluation")
+experiment = mlflow.set_experiment(
+    experiment_id=os.environ["MLFLOW_EVALUATION_EXPERIMENT_ID"]
+)
 
 
 def get_or_create_dataset(name: str):
@@ -13034,14 +13324,8 @@ def get_or_create_dataset(name: str):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     try:
         return get_dataset(name=name)
@@ -13060,14 +13344,8 @@ def to_record(row) -> dict:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return {
         "inputs": {
@@ -13110,14 +13388,8 @@ def next_batch(dataset_split: str):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return (
         spark.table(REVIEW_TABLE)
@@ -13147,14 +13419,8 @@ def verify_destination_records(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     records = spark.table(dataset_name)
     return {
@@ -13190,14 +13456,8 @@ def mark_sync_result(
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     updates = spark.createDataFrame(
         [
@@ -13255,14 +13515,8 @@ def sync_split(dataset_name: str, dataset_split: str) -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     dataset = get_or_create_dataset(dataset_name)
     while rows := next_batch(dataset_split):
@@ -13283,14 +13537,8 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     sync_split("main.llmops.internal_rag_train", "train")
     sync_split("main.llmops.internal_rag_holdout", "holdout")
@@ -13319,6 +13567,8 @@ Trainingには正常回答、検索失敗、拒否正解、略語、複数文書
 検索設定を選択したTraining Datasetと、最終判定用Holdout Datasetを分離する。検索結果を見ながら期待文書を後から変更すると、検索設定に都合のよい評価になるため、期待文書はドメイン担当者が事前承認する。
 
 ##### 5.1.2.4 固定EvidenceでAnswer Promptだけを最適化する
+
+Prompt Optimizationは、固定したTraining Datasetに対してPrompt候補を生成・比較する改善処理であり、基盤LLMのWeightを更新する学習ではない。このシステムでは`optimize_answer_prompt.py`がReflection用Model Serviceを呼び、候補をMLflow RunとPrompt Registryの新Versionとして保存する。Holdoutを候補探索へ使わず、最終採否は次節のRelease Gateで判断する。
 
 Answer Prompt Optimization用Training Recordは、承認済み `fixed_evidence`、Citation ID、文書Version、Corpus Snapshotを `inputs` に保持する。Evidenceは選定時点でMasking・ACL確認し、Optimizer実行中にAI Search、Sufficiency、Query Rewriteを呼ばない。これにより差分はAnswer Promptだけとなる。Retrieval改善はAnswer PromptとModelを固定し、Sufficiency Prompt改善も固定Evidenceで別Jobとして行う。
 
@@ -13361,22 +13611,15 @@ record_inputs = {
 
 `bundles/quality/src/optimize_answer_prompt.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入後に本番TraceとAssessmentを使って追加する。 |
-| 初めて必要になる段階 | 本番導入後 |
-| 後続段階で追加される機能 | 改善CycleごとにDataset、Rubric、閾値、Release比較を更新する。 |
-| 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
-| 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/optimize_answer_prompt.py` |
-| 実行主体 | Quality SP |
-| 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
-| 出力 | 評価、Dataset、Prompt／Judge候補 |
-| 必要な理由 | 品質改善を本番実行から分離するため |
-| 正常終了時 | Version付き成果物を保存する |
-| 失敗時 | Releaseへ昇格しない |
-| 再実行時 | 安定Case IDで冪等再評価する |
+| 目的 | Training DatasetでAnswer Prompt候補を最適化する。 |
+| 入力 | Training Dataset、現行Prompt、Answer／Judge／Reflection Model。PROMPT原因Case蓄積後に読む。 |
+| 処理 | Reflectionで候補を生成し固定Judgeで評価してRegistryへ登録する。LLM Weightを変えずHoldoutを探索に使わない。 |
+| 出力 | 候補Prompt VersionとOptimization Runを作り、Holdout評価へ渡す。 |
+| 失敗・再実行 | 現行Releaseを維持する。DigestとPrompt Versionで同じ候補の重複を抑止する。 |
 
 ```python
 """固定EvidenceとTraining Datasetを使ってAnswer Prompt候補を最適化するModule。基盤LLMのWeightは更新せず、Holdoutを最適化入力に使わない。
@@ -13386,22 +13629,27 @@ record_inputs = {
 
 from __future__ import annotations
 
+import os
 import re
 
 import mlflow
-from databricks_langchain import ChatDatabricks
-from langchain_core.messages import HumanMessage
+from databricks_openai import DatabricksOpenAI
 from mlflow.entities import Feedback, SpanType
 from mlflow.genai.datasets import get_dataset
 from mlflow.genai.optimize import GepaPromptOptimizer
 from mlflow.genai.scorers import Correctness, RetrievalGroundedness, scorer
 
 
-TARGET_PROMPT_URI = "prompts:/main.llmops.internal_rag_answer/17"
-FIXED_MODEL_ENDPOINT = "internal-rag-model-baseline"
+TARGET_PROMPT_URI = os.environ["TARGET_PROMPT_URI"]
+FIXED_MODEL_SERVICE = os.environ["FIXED_MODEL_SERVICE"]
+JUDGE_MODEL_SERVICE = os.environ["RAG_JUDGE_MODEL_SERVICE"]
+JUDGE_MODEL_URI = (
+    JUDGE_MODEL_SERVICE
+    if JUDGE_MODEL_SERVICE.startswith("databricks:/")
+    else f"databricks:/{JUDGE_MODEL_SERVICE}"
+)
 CITATION_PATTERN = re.compile(r"\[(SRC-[A-F0-9]{12})\]")
-llm = ChatDatabricks(endpoint=FIXED_MODEL_ENDPOINT, temperature=0.0)
-mlflow.langchain.autolog()
+model_client = DatabricksOpenAI()
 
 
 @mlflow.trace(name="fixed_answer_evidence", span_type=SpanType.RETRIEVER)
@@ -13414,14 +13662,8 @@ def load_fixed_evidence(fixed_evidence: list[dict]) -> list[dict]:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return [
         {
@@ -13446,14 +13688,8 @@ def render_context(evidence: list[dict]) -> str:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     return "\n\n".join(
         (
@@ -13479,14 +13715,8 @@ def fixed_citations_valid(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     expected = {
         item["citation_id"] for item in inputs["fixed_evidence"]
@@ -13496,6 +13726,20 @@ def fixed_citations_valid(
         value=bool(actual) and actual.issubset(expected),
         rationale=f"unknown={actual - expected}",
     )
+
+
+@mlflow.trace(name="fixed_model_service_call", span_type=SpanType.LLM)
+def invoke_fixed_model(instruction: str) -> str:
+    """全Candidateで同じModel Serviceと温度を使い、Prompt差だけを測定する。"""
+    response = model_client.chat.completions.create(
+        model=FIXED_MODEL_SERVICE,
+        messages=[{"role": "user", "content": instruction}],
+        temperature=0.0,
+    )
+    answer = response.choices[0].message.content
+    if not answer:
+        raise ValueError("Fixed Model Service returned empty content")
+    return answer
 
 
 def predict_with_candidate(
@@ -13513,14 +13757,8 @@ def predict_with_candidate(
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     evidence = load_fixed_evidence(fixed_evidence)
     prompt = mlflow.genai.load_prompt(TARGET_PROMPT_URI)
@@ -13528,24 +13766,26 @@ def predict_with_candidate(
         question=question,
         context=render_context(evidence),
     )
-    response = llm.invoke([HumanMessage(content=instruction)])
-    return {"answer": str(response.content)}
+    return {"answer": invoke_fixed_model(instruction)}
 
 
+mlflow.set_experiment(
+    experiment_id=os.environ["MLFLOW_EVALUATION_EXPERIMENT_ID"]
+)
 train_dataset = get_dataset(name="main.llmops.internal_rag_train")
 result = mlflow.genai.optimize_prompts(
     predict_fn=predict_with_candidate,
     train_data=train_dataset,
     prompt_uris=[TARGET_PROMPT_URI],
     optimizer=GepaPromptOptimizer(
-        reflection_model="databricks:/system.ai.claude-sonnet-4-5",
+        reflection_model=os.environ["PROMPT_OPTIMIZATION_REFLECTION_MODEL"],
         max_metric_calls=100,
         display_progress_bar=False,
     ),
     scorers=[
         fixed_citations_valid,
-        RetrievalGroundedness(),
-        Correctness(),
+        RetrievalGroundedness(model=JUDGE_MODEL_URI),
+        Correctness(model=JUDGE_MODEL_URI),
     ],
 )
 
@@ -13556,6 +13796,8 @@ for optimized_prompt in result.optimized_prompts:
 上のJobはPrompt単体Trainingであり、本番Graphの品質を保証しない。候補Promptを不変Versionとして登録した後、別のEnd-to-End JobがRAG Release候補、Training smoke set、未使用Holdoutを使って検索、経路、回答、ACL、Latencyを評価する。Prompt Optimizerの実行Caseと最終Release判定Caseを分離する。
 
 ##### 5.1.2.5 Holdout評価とリリースゲート
+
+Release GateはDatabricksの独立Serviceではなく、固定Holdout、Security Test、Latency、Costの結果から候補Releaseの可否を判定するQuality JobとPythonロジックである。出力はpass／failだけでなく、Evaluation Run ID、閾値Version、判断理由、承認者を持つDecision Log Recordになる。不合格時はRelease ManifestのCurrent Pointerを変更しない。
 
 この実装では、候補と本番を同じHoldout Datasetで比較し、回答スコアだけでなく検索、拒否、ACL、経路、性能を判定する。IndexとPromptを同時に変更せず、Retrieval変更ではPromptを固定し、Prompt変更ではIndexを固定する。
 
@@ -13580,7 +13822,7 @@ Prompt Aliasは開発候補の探索用であり、本番切替単位ではな�
 | Prompt | 新しい不変Prompt Version URI | 新Manifestへ含める | 直前Manifest IDへ戻す |
 | Index／Chunk | 新しいIndex Release IDとIndex名 | 新Manifestへ含める | 旧Indexを参照するManifestへ戻す |
 | Agent Code／Wheel | Clean Git Buildを新規Deploy | 新Commit／WheelのManifestへ切替 | 直前BuildのManifestへ戻す |
-| Model Route | Serving endpointの固定RouteまたはSticky方針を検証 | Expected RouteをManifestへ含める | 旧RouteのManifestへ戻す |
+| Model Route | Model Serviceの固定DestinationまたはSession Affinity方針を検証 | Expected RouteをManifestへ含める | 旧RouteのManifestへ戻す |
 | Judge | 未使用Judge Validation Setで合格 | Judge VersionをManifestへ含める | 旧Judge VersionのManifestへ戻す |
 
 PromptだけのExperimentでもその他列を現行Manifestと同一にし、差分を1要素へ限定する。Model Serving Traffic Splitを使う場合は1 Request内でVariantを固定できるRoute Keyを使うか、すべてのLLM Spanへ実Routeを記録し、Variant混在Requestを評価から分離する。文書更新だけでも新しいCorpus Snapshot／Index ReleaseとしてGolden Queryと削除・ACL回帰に合格してからManifestを切り替える。
@@ -13610,6 +13852,39 @@ MLflow Review AppとLabeling SessionはTraceへFeedback／Expectationを付与�
 | コメント | Rationale | 原因分析とAlignment |
 
 `bundles/quality/src/create_review_queue.py`
+
+**ロジック概要**
+
+| 項目 | 内容 |
+| --- | --- |
+| このFileの責務 | 本番Traceから人手Assessment対象を抽出・MaskしLabeling Sessionへ投入する。 |
+| 呼出元 | Quality Review Queue Job。 |
+| 実行Trigger | 低Score、利用者Feedback、Sampling Schedule時。 |
+| 読取対象 | Realtime Experiment Trace、Monitoring Assessment、Review Policy。 |
+| 更新対象 | Labeling Session Assignmentと独自Review Case候補。 |
+| 主な処理順序 | 対象TraceをFilterし、重複を除き、表示可能FieldをMaskしてSessionへ追加する。 |
+| 重要な判定 | ACL越境疑いは通常Queueと分離し、Reviewerに不要な原文／Secretを見せない。 |
+| Traceとの関係 | 元Traceを複製せずSession側からsource_trace_idで参照する。 |
+| 正常終了時 | Reviewerへ割当済みのReview対象が作成される。 |
+| 失敗時 | Session追加を中断し元Trace／Case状態を変更しない。 |
+| Retry時 | trace_id＋review_policy_versionで二重投入を防ぐ。 |
+| 後続処理 | Assessment収集、assign_review_cases.py、align_judge.py。 |
+
+Review AppはTraceへFeedback／Expectationを入力するMLflow UI、Labeling Sessionは対象Trace、Label Schema、担当者をまとめるレビュー単位である。Label Schemaは独立したDelta TableではなくMLflow管理Resourceであり、AssessmentはSession側へ複製されたTraceへ保存される。本資料独自の`internal_rag_review_cases`はSLA、原因、承認、Split、改善配送を管理するDelta Tableであり、Review Appの代替ではない。
+
+| 項目 | 本システムでの設定 |
+| --- | --- |
+| Session作成主体 | Quality SP。個人ReviewerはSession作成権限を持たない |
+| Source Experiment | `MLFLOW_REALTIME_EXPERIMENT_ID`。候補抽出元の本番Trace |
+| Session保存先 | `MLFLOW_LABELING_EXPERIMENT_ID`。元Traceと混ぜずReview用に保持 |
+| Reviewer | `REVIEW_ASSIGNED_USERS`へ認証済みUserをCI／Job Parameterから注入し、Reviewer GroupのMembershipを事前確認 |
+| 権限 | Source Experimentは`CAN_READ`、Labeling ExperimentはReviewer／Quality SPに`CAN_EDIT` |
+| 表示情報 | Mask済み質問、回答、許可されたCitation metadata、必要なSpan。Raw ACL式、Token、署名付きURLは除外 |
+| Session終了 | 全必須Schema入力、重複／除外判定、品質責任者の締切承認が完了した時点 |
+| 保持 | SessionとAssessmentは監査保持Policy、元UC Traceは別のTrace保持Policyに従う |
+| 後続同期 | Session Run IDからAssessmentを読み、Review Case Tableへ正規化して状態遷移する |
+
+PoCは少数Traceへ直接Assessmentを付ければよく、Labeling Sessionを必須にしない。本番ではSessionへ追加する前にMasking Jobが対象Fieldを許可List方式で整形し、Session終了後も元TraceをWorkflow DBとして更新しない。
 
 | 実装情報 | 内容 |
 | --- | --- |
@@ -13651,14 +13926,8 @@ def create_schemas():
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     quality = create_label_schema(
         name="internal_rag_quality",
@@ -13760,7 +14029,7 @@ def create_schemas():
 
 
 def get_source_experiment_id() -> str:
-    """本番RAG Experimentを取得し、未作成ならReview Session作成を失敗させる。
+    """Bootstrapで固定した本番RAG Experiment IDを取得する。
 
     Returns:
         処理結果。
@@ -13768,20 +14037,13 @@ def get_source_experiment_id() -> str:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
-    experiment = mlflow.get_experiment_by_name(
-        "/Shared/llmops/internal-rag-realtime"
-    )
+    experiment_id = os.environ["MLFLOW_REALTIME_EXPERIMENT_ID"]
+    experiment = mlflow.get_experiment(experiment_id)
     if experiment is None:
-        raise ValueError("Realtime MLflow experiment was not found")
+        raise ValueError(f"Realtime MLflow experiment was not found: {experiment_id}")
     return experiment.experiment_id
 
 
@@ -13791,15 +14053,13 @@ def main() -> None:
     Returns:
         なし。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
+    # Session側TraceとAssessmentを本番Realtime Traceとは別Experimentへ保存する。
+    mlflow.set_experiment(
+        experiment_id=os.environ["MLFLOW_LABELING_EXPERIMENT_ID"]
+    )
     schemas = create_schemas()
     # 通知先をSourceに書かず、認証済みReviewerのEmailをSecret参照でJob環境へ注入する。
     assigned_users = [
@@ -13836,28 +14096,23 @@ Review Assessment同期Jobは、Expectationが揃ったら`labeled`、`root_caus
 
 ##### 5.1.2.9 AssessmentでLLM JudgeをAlignmentする
 
+Judge Alignmentは、人間FeedbackとJudge Feedbackの不一致を使ってJudgeのInstructionsや例示を人間基準へ近づける処理であり、Judge基盤LLMのWeightを更新するFine-tuningではない。物理的な成果物はAlignment Run、候補Judge定義、評価Metricであり、現行Registered Scorerを直接上書きしない。Alignmentに利用したTraceを最終Judge検証へ再利用せず、独立Caseで採用可否を判断する。
+
 Judge Alignmentの時期はPoC／本番という環境名ではなく、**同じ評価基準の人間Feedbackが十分にあるか**、**JudgeをRelease GateやProduction Monitoringの判断へ使うか**で決める。JudgeをGateへ使わないPoCでは不要である。一方、専門家ラベルが集まりPilotのGateへ使うならPoC後半またはPilot中に実施する。本番後は基準変更や誤差Driftが確認されたときに再Alignmentする。
 
 この実装では、まず初期Judgeで`internal_rag_quality` Assessmentを作成し、同じTraceへ**完全に同じ名前**の人間Feedbackを収集する。公式上は最低10 TraceでAlignmentできるが、金融機関向けではカテゴリ、拒否、ACL境界を含む50～100 Traceを目安にする。`judge_dataset_split=alignment`と`judge_dataset_split=validation`をCase Family単位で固定し、同じTraceを両方へ入れない。Aligned Judgeを人間へ合わせた後も、未使用Validationで一致率、False Positive、False Negativeを確認し、自動でProduction Monitoringへ反映しない。
 
 `bundles/quality/src/align_judge.py`
 
-| 実装情報 | 内容 |
+**実装概要**
+
+| 項目 | 内容 |
 | --- | --- |
-| 導入段階 | JudgeをRelease Gateへ使う場合はPoC後半／Pilotでも実施でき、通常は本番後の継続改善で実施する。 |
-| 初めて必要になる段階 | 人間Feedbackが最低10 Trace、望ましくは50～100 Trace集まり、Judgeを重要判断へ使う段階 |
-| 後続段階で追加される機能 | 基準変更、Judge Drift、Model変更時に再Alignmentし、毎回未使用Validationで検証する。 |
-| 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
-| 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/align_judge.py` |
-| 実行主体 | Quality SP |
-| 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
-| 出力 | 評価、Dataset、Prompt／Judge候補 |
-| 必要な理由 | 品質改善を本番実行から分離するため |
-| 正常終了時 | Version付き成果物を保存する |
-| 失敗時 | Releaseへ昇格しない |
-| 再実行時 | 安定Case IDで冪等再評価する |
+| 目的 | 人間AssessmentからJudge候補をAlignmentする。 |
+| 入力 | Labeling Trace／Assessment、現行Judge、Reflection Model。二重レビュー済みCase蓄積後に読む。 |
+| 処理 | 合意Assessmentから候補を作り一致度を評価する。Model Weightを変えずAlignment Caseを最終検証へ再利用しない。 |
+| 出力 | 候補Judge、Alignment Run、Metricを独立Holdoutへ渡す。 |
+| 失敗・再実行 | 現行Scorerを維持する。DigestとJudge Versionで重複処理を識別する。 |
 
 ```python
 """人間Assessmentを使ってLLM JudgeのInstructionsと例示をAlignmentするModule。基盤ModelのWeightは更新せず、Alignment Traceを最終検証へ再利用しない。
@@ -13887,14 +14142,8 @@ def has_alignment_pair(trace) -> bool:
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     assessments = trace.search_assessments(name=JUDGE_NAME)
     source_types = {
@@ -13917,14 +14166,8 @@ def load_alignment_traces(run_id: str):
     Returns:
         処理結果。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     traces = mlflow.search_traces(run_id=run_id, return_type="list")
     return [
@@ -13988,15 +14231,13 @@ def main() -> None:
     Raises:
         ValueError: 入力、権限、状態、外部Resourceの検証に失敗した場合。
 
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
 
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
 
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
+    # Alignment計算のRunはRelease評価用Experimentへ保存する。
+    mlflow.set_experiment(
+        experiment_id=os.environ["MLFLOW_EVALUATION_EXPERIMENT_ID"]
+    )
     run_id = os.environ["LABELING_SESSION_RUN_ID"]
     alignment_traces = load_alignment_traces(run_id)
     validation_traces = load_validation_traces(run_id)
@@ -14010,7 +14251,7 @@ def main() -> None:
             f"{len(alignment_traces)}"
         )
     optimizer = MemAlignOptimizer(
-        reflection_lm="databricks:/system.ai.claude-sonnet-4-5"
+        reflection_lm=os.environ["JUDGE_ALIGNMENT_REFLECTION_MODEL"]
     )
     aligned_judge = build_internal_rag_quality_judge().align(
         traces=alignment_traces,
@@ -14027,8 +14268,9 @@ def main() -> None:
         os.getenv("MAX_JUDGE_FALSE_POSITIVE", "0.05")
     ):
         raise ValueError(f"Judge false-positive gate failed: {metrics}")
-    experiment = mlflow.set_experiment("/Shared/llmops/internal-rag-realtime")
-    candidate = aligned_judge.register(experiment_id=experiment.experiment_id)
+    experiment_id = os.environ["MLFLOW_REALTIME_EXPERIMENT_ID"]
+    mlflow.set_experiment(experiment_id=experiment_id)
+    candidate = aligned_judge.register(experiment_id=experiment_id)
     print(candidate)
     print(metrics)
 
@@ -14078,6 +14320,28 @@ Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、Judgeの
 | Release Drift | Git、Prompt、Index、Model、Judge、Wheel | Deployごと、日次 | Release Manager | 実行中の組合せがRelease Manifestと一致するか確認する |
 
 Dashboardで平均値だけを眺めず、文書形式、業務Role、質問Purpose、回答可否、Prompt Version、Model Route、Index Release、再検索有無でSliceする。閾値変更は監視を静かにする目的で行わず、変更理由、比較期間、承認者をDecision Logへ残す。
+
+#### 5.2.1 Workspace／MLflow Resourceの継続運用
+
+Application品質だけでなく、Bootstrapで作成したResource自体もLifecycle管理する。次の項目は月次、権限変更時、Model／MLflow Runtime更新時に再点検する。
+
+| 対象 | Trigger／頻度 | Systemによる検知・記録 | 担当者の判断・対応 |
+| --- | --- | --- | --- |
+| Model Service／Route | Route変更、月次 | `system.ai_gateway.usage`から実Route、Fallback、429、Tokenを集計しRelease Manifestとの差をSignal化 | Platform OwnerがWeight、Capacity、Fallbackを承認。未検証Routeは除外 |
+| AI Gateway Rate Limit | 429増加、利用範囲変更 | QPM／TPM、Group別上限、Retry回数をDashboard化 | Service Ownerが品質を落とさず上限またはClient Backoffを変更 |
+| Experiment／UC Trace容量 | 日次、保持期限到来 | 4 UC Tableの件数・Byte・取込Rate、欠落Span、削除対象を集計 | LLMOpsとData Ownerが保持／Legal Holdを判断し承認済みDELETE Jobを実行 |
+| Monitoring Budget Policy | 月次、Scorer追加 | `system.billing.usage`とScorer Sample数をBudgetと比較 | Quality OwnerがSample Rate、Scorer構成、停止条件を見直す |
+| Registered Scorer | Judge更新、週次 | Started／Stopped、Version、失敗率、Experiment当たり登録数をRun Logへ同期 | 未使用VersionをStopし、20件上限へ近づく前に整理 |
+| Reviewer権限 | 異動、四半期 | Group Membership、Experiment ACL、Session割当差分をAccess Review Case化 | Quality Ownerが不要Userを削除し、未完Sessionを再割当 |
+| Prompt Registry権限 | Alias変更、四半期 | `MANAGE`、`CREATE FUNCTION`、`EXECUTE` Grant差分とAlias変更Auditを検知 | Prompt ManagerとSecurityが職務分離を再承認 |
+| EvaluationDataset | Case追加、月次 | Record数、重複Family、Split Drift、Expectation欠落、上限接近を検知 | Quality OwnerがArchive／新Dataset Version作成を判断 |
+| Inference Logging | 有効化中は日次 | Payload保存率、Masking違反、保持期限、閲覧Auditを検知 | Securityが即時停止、削除、Incident化を判断。不要なら無効化 |
+| App SP／Quality SP | Grant変更、四半期 | UC Grant、Workspace ACL、Model Service`EXECUTE`の差分を台帳化 | Platform／Securityが最小権限へ是正 |
+| Manifest／Quality Case | 状態変更、日次 | 不正遷移、SLA超過、孤立Evidence、未同期CaseをSignal化 | Ownerが修正、Risk受容、CloseをDecision Logへ記録 |
+
+保持期限はResourceごとに分ける。Raw Prompt／Responseを持たないGateway Usage、Mask済みUC Trace、Assessment、Quality Case、Decision／Audit Event、EvaluationDatasetでは監査目的と機密性が異なる。1つの一律Retentionを適用せず、Legal Hold中のRecordを自動削除しない。削除Jobは対象件数、Policy Version、承認Decision ID、実行Identity、Before／After件数をRun Logへ残す。
+
+現行EvaluationDatasetは1 Dataset当たり最大2,000 Record、1 Record当たり最大20 Expectationという制約を前提にする。上限へ近づいたら古いCaseを恣意的に削るのではなく、業務領域、期待値Version、期間で新Datasetへ分割し、Release Gateが参照したDataset名とDigestをManifestへ残す。
 
 ### 5.3 Alert・障害・品質問題への対応
 
@@ -14141,7 +14405,7 @@ Judge Alignmentとオンライン比較は、PoCの必須機能ではなく、�
 | --- | --- | --- | --- |
 | Judge Alignment | 同名の人間FeedbackとJudge Feedbackが十分あり、Label品質を確認済み | Alignment用Traceで`align()`し、別のJudge Validation Setで検証する | Alignment Caseを最終Validationへ再利用しない。False Positive／Negativeを確認する |
 | Judge Version更新 | 独立Validation合格、品質責任者承認 | Registered Judge VersionをRelease Manifestへ固定する | 新Judgeを自動開始せず、旧Judgeへ戻せるようにする |
-| Model Canary | Model Route別のオフライン評価、Capacity、Cost確認済み | Model Serving EndpointのTraffic設定またはAgent側の決定的Routeで比率制御する | User／Case Familyを跨いだ混入を防ぎ、ACLと品質Guardrailを共通化する |
+| Model Canary | Model Route別のオフライン評価、Capacity、Cost確認済み | Model ServiceのTraffic SplitまたはAgent側の決定的Routeで比率制御する | Session Affinityを使い、User／Case Familyを跨いだ混入を防ぎ、ACLと品質Guardrailを共通化する |
 | Prompt A/B | Prompt候補がHoldout合格し、割当単位と期間を事前定義済み | Agent側で`candidate_id`から不変Prompt URIを選び、Traceへ記録する | Prompt Registry自体のTraffic Splitに依存せず、途中で比率・KPIを恣意的変更しない |
 | Index Canary | 新旧Indexを並行保持し、同一Corpus Snapshotで比較可能 | Release ManifestまたはAgent RouteでIndexを固定する | 文書Snapshot差を検索設定差と混同しない |
 | 自動Rollback | 十分な障害訓練、低誤検知Alert、承認済み停止条件 | Release Manager Jobが不変旧Manifestへ切り戻す | ACL越境など限定条件から開始し、品質Judge単独では自動化しない |
@@ -14171,7 +14435,7 @@ Canary／A-Bでは、評価期間、対象母集団、Primary KPI、Guardrail、
 
 #### 5.7.3 アクセス制御
 
-- App Service PrincipalへAI SearchとModel Endpointの最小権限だけを付与する。
+- App Service PrincipalへAI Searchの参照権限とModel Serviceの`EXECUTE`だけを付与する。
 - 文書単位ACLは検索後ではなくQuery Filterへ適用する。
 - Clientが送った`access_scope`をそのまま信用しない。
 - 認証済みUser／GroupからServer側で許可Filterを生成する。
@@ -14265,6 +14529,15 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 ### 6.1 Identity／Bootstrap
 
+- Workspace AdminがProduction Monitoring Beta、System Tables、SQL Warehouse、Serverless Budget Policyの利用可否を確認している
+- Answer／Judge Model ServiceをPlatform管理者が作成し、用途別FQN、Destination、Rate Limit、Fallback、Ownerを台帳化している
+- Realtime／Evaluation／Labeling ExperimentをMLflow SDK Bootstrapが別IDで作成し、DAB `experiments`と重複作成していない
+- Realtime Experimentが作成時からUC Trace Locationへ関連付けられ、Monitoring Warehouse IDがExperiment Tagへ永続化されている
+- Default Budget Policyを使えない環境では`mlflow.workload_creation_policy_id`がRealtime Experimentへ設定されている
+- CI/CDが3 Experiment IDを保護Variable Storeから各Bundleへ注入し、Source内の名前検索や個人ExperimentへのFallbackがない
+- UC Trace 4表へ`SELECT`／`MODIFY`を明示付与し、`ALL PRIVILEGES`だけで完了扱いにしていない
+- Prompt Registry Schemaの登録者、Runtime、Prompt ManagerとEvaluationDataset SchemaのBootstrap／Reader権限を分離している
+- PoC／本番Smoke TestがModel、Experiment、Trace、Prompt、Dataset、Assessment、Search、Warehouse、Gatewayを検証している
 - Account／IdP管理者が`dev`、`stg`、`prod`で別のService Principalを作成し、表示名とApplication IDを台帳化している
 - Terraformの`databricks_service_principal`出力でApplication IDとAccount SCIM IDを混同していない
 - すべてのRuntime Service Principalが対象Workspaceへ割り当てられ、不要なCompute作成Entitlementを持たない
@@ -14350,6 +14623,11 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 ### 6.7 Production Monitoring
 
+- 最初のScorer登録者が管理対象Quality SPであり、Monitoring Jobの実行権限と退役手順を管理している
+- Experiment当たり最大20 Registered Scorerを考慮し、不要VersionのStop／整理手順がある
+- Custom Code Scorerを登録する場合はDatabricks NotebookでSelf-containedに定義し、Standalone PythonのSerializationを前提にしていない
+- Registered Scorerの`register`、`start`、`stop`、再開、旧VersionへのRollback手順と承認者を定義している
+- Judge Model Serviceの`EXECUTE`、Sampling Rate、月額Cost上限、停止条件をDecision Logへ固定している
 - Production Monitoringを本番開始前に設定し、StagingでDry Runしている
 - Production Trace Schema、Masking、Assessment権限、Scorer／Judgeの誤検知を固定Staging Traceで検証している
 - Alert通知経路、Runbook、Index切替、Retry／Replay、Agent／Model／Search障害、ACL越境、Rollbackを本番開始前に試験している
@@ -14378,6 +14656,18 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - 基盤Model Service、期待Route、実Route、Embedding Modelを記録している
 - Apps Runtimeは`.git`や`git rev-parse`へ依存していない
 - CleanなGit CommitからDeployしている
+
+### 6.10 設計書・Source整合性
+
+- 主要Databricks／MLflow Serviceについて一般機能、本システム内の役割、作成Resource、入出力、確認UI、導入段階、Statusが記載されている
+- 公式Service、MLflow Resource、UC Table、DAB Resource、設定、独自Application／Workflow、論理概念を区別している
+- Manifest、Registry、Gate、Case、Snapshot、Route、Pointerの物理実体、実名、主要列、更新主体、Lifecycleを特定できる
+- 各実装用Source Fileの責務、呼出元、Trigger、読取／更新対象、処理順序、重要判定、正常／失敗／Retry、後続処理をコード直前で確認できる
+- PythonのCall Flow、SQLの入力／出力とJOIN／Window／重複排除、YAMLのResource関係と変数解決、TerraformのBootstrap境界を説明している
+- Environment Variable、Task Parameter、DAB Variable、Terraform Outputの注入元が追跡でき、未設定時にDefaultへFallbackしない
+- PoC、本番導入、本番導入後でResource、Identity、Trace Storage、Review、Monitoring、自動化範囲の差を比較できる
+- Project構成に記載したPath、コードブロックのPath、Bundle Include、Job Parameter、本文内参照が一致している
+- Workspace BootstrapとPreflightの合格Evidenceがあり、初見の担当者が「何を作り、何が保存され、どのSourceが動かすか」を追跡できる
 
 ## 7. 参考資料
 
@@ -14414,6 +14704,18 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - [MLflow Agent Server](https://mlflow.org/docs/latest/genai/serving/agent-server/)
 - [MLflow 3 for GenAI: Evaluation and Monitoring](https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor)
 - [Databricks MLflow 3 for GenAI](https://docs.databricks.com/aws/en/mlflow3/genai/)
+- [MLflow TracingをUnity Catalog Tableへ保存](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/trace-unity-catalog)
+- [Databricks上のProduction Tracing](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/prod-tracing)
+- [MLflow Production Monitoring](https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor/production-monitoring)
+- [MLflow ExperimentのServerless Budget Policy](https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor/serverless-budget-policy)
+- [MLflow Prompt Registry](https://docs.databricks.com/aws/en/mlflow3/genai/prompt-version-mgmt/prompt-registry/track-prompts-app-versions)
+- [Unity AI Gateway](https://docs.databricks.com/aws/en/ai-gateway/)
+- [Unity AI Gateway Model Services](https://docs.databricks.com/aws/en/ai-gateway/model-services)
+- [Model Serviceの作成](https://docs.databricks.com/aws/en/ai-gateway/create-model-services)
+- [Model ServiceのQuery](https://docs.databricks.com/aws/en/ai-gateway/query-model-services)
+- [AI Gateway Usage Tracking](https://docs.databricks.com/aws/en/ai-gateway/usage-tracking)
+- [AI Gateway Rate Limits](https://docs.databricks.com/aws/en/ai-gateway/rate-limits)
+- [AI Gateway Traffic Split／Fallback](https://docs.databricks.com/aws/en/ai-gateway/configure-traffic-splitting)
 - [Databricks Human Feedback](https://docs.databricks.com/aws/mlflow3/genai/human-feedback/)
 - [Databricks Label during development](https://docs.databricks.com/aws/en/mlflow3/genai/human-feedback/dev-annotations)
 - [Databricks Building MLflow evaluation datasets](https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor/build-eval-dataset)
@@ -14436,3 +14738,62 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - [Databricks Apps resources](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/resources)
 - [Declarative Automation Bundles resources](https://docs.databricks.com/aws/en/dev-tools/bundles/resources)
 - [MLflow Git-based application version tracking](https://mlflow.org/docs/latest/genai/version-tracking/track-application-versions-with-mlflow/)
+
+## 8. 用語・物理実体索引
+
+この付録は本文を読む前の前提知識ではなく、正式名称、物理的な実体、初出箇所を後から検索するための索引である。本文の初出説明を正とし、Status、権限、処理順序は記載された章で確認する。
+
+- Unity Catalog、Lakeflow、AI Search、Databricks Apps、AI/BI DashboardなどはDatabricksが提供するServiceである。
+- Experiment、Trace、Assessment、Prompt、EvaluationDataset、Registered ScorerはMLflowが管理するResourceである。
+- `document_source_manifest`、`document_version_registry`、`internal_rag_review_cases`は本システムがUnity Catalogへ作成するDelta Tableであり、Databricksの固有Service名ではない。
+- Job、Pipeline、App、Dashboard、AlertのYAMLはDAB Resource定義であり、YAML File自体が実行結果や業務状態を保持するわけではない。
+- Release Gate、Quality Case Lifecycle、Reconciliationは、Job、Python、SQL、Delta Tableで構成する本システム独自Workflowである。
+
+| 用語 | 短い定義 | 物理的な実体 | 初出章 |
+| --- | --- | --- | --- |
+| DAB | SourceとWorkspace Resourceを環境別にDeployするDatabricks機能 | `databricks.yml`、`resources/*.yml` | 3.2.2 |
+| Lakeflow Spark Declarative Pipelines | Dataset依存と増分処理を実行するDatabricks Service | Pipeline、Streaming Table、Materialized View | 3.2.2 |
+| Lakeflow Jobs | Task依存、Retry、Schedule、通知を管理するService | Job、Task、Run | 3.2.6.5 |
+| Streaming Table | Checkpoint付きで増分更新するLakeflow Dataset | UC Delta Streaming Table | 3.2.3 |
+| Materialized View | 上流から導出した現在値をRefreshするDataset | UC Materialized View | 3.2.5 |
+| AI Search Endpoint | AI Search Indexを実行するCompute | Vector Search Endpoint Resource | 3.2.6 |
+| Delta Sync Index | Delta Tableから増分同期する検索Index | AI Search Index Resource | 3.2.6 |
+| Model Service | Model Destination、Route、Rate Limitを統制するUC Securable | `catalog.schema.service` | 3.2.6.1 |
+| MLflow Experiment | Run、Trace、Assessment、Datasetを関連付ける管理単位 | Workspace Experiment ID | 3.2.6.1 |
+| Prompt Registry | Promptを名前、Version、Aliasで管理するMLflow Resource | UC-backed Prompt | 3.2.6.3 |
+| EvaluationDataset | 入力とExpectationをVersion管理する評価ケース正本 | Unity Catalog Table | 3.2.6.4 |
+| MLflow Trace | 1 Requestの入出力と処理経路を保存するEvidence | Experiment ArtifactまたはUC Trace Table | 3.2.6.6 |
+| Span | Trace内の検索・LLMなどの処理区間 | Traceの子Record | 3.2.6.6 |
+| Scorer | TraceとExpectationから品質結果を作る評価器 | Python ScorerまたはRegistered Scorer | 3.2.6.6 |
+| LLM Judge | RubricとLLMで意味的品質を判定するScorer | Judge定義、Model Service、Feedback | 3.2.6.6 |
+| Assessment | Trace／Spanへ付与する評価Recordの総称 | MLflow Assessment Record | 3.2.6.6 |
+| Feedback | 実際の結果がよかったかを表すAssessment | AssessmentのFeedback Record | 3.2.6.6 |
+| Expectation | 同じ入力で期待する正解を表すAssessment | Assessment／Dataset内Expectation | 3.2.6.6 |
+| Quality Case | 検知から修正・再評価・Closeまでを管理する独自Workflow | `poc_quality_cases`または`internal_rag_review_cases`の1行 | 3.2.7 |
+| Decision Log | 採否、Risk受容、Release、Closeの判断証跡 | Delta Tableの追記Record | 3.2.7 |
+| Service Principal | JobやAppが使う非人間Identity | Account PrincipalとWorkspace Assignment | 4.2.4.3.1.1 |
+| `run_as` | 作成済みIdentityをJob／Pipeline実行主体にする設定 | DAB Resource Field | 4.2.4.3.1.1 |
+| Document Manifest | 文書の管理属性と公開Pointerを持つ正本 | `main.llmops.document_source_manifest` | 4.2.4.3.1 |
+| Version Registry | 文書Versionの処理・審査履歴を持つ正本 | `main.llmops.document_version_registry` | 4.2.4.3.1 |
+| Public Pointer | 現在公開する文書Versionを指す値 | `approved_document_version_id`列 | 1.6 |
+| Quarantine | 失敗・未登録データを公開経路から隔離する領域 | Error／Quarantine Delta Table | 4.2.4.3 |
+| Corpus Snapshot | 評価・Index時点の公開文書Version集合 | Snapshot RegistryとMember Table | 4.2.4.5 |
+| Index Release | Index、Corpus、Embedding、Schemaを固定した版 | Index Registry RecordとAI Search Index | 4.2.4.5 |
+| Release Manifest | RAG構成を一体で再現・Rollbackする正本 | `main.llmops.rag_release_manifest`の1行 | 4.2.4.6 |
+| RAG Release ID | 固定したRAG構成の不変ID | Release Manifest KeyとTrace Tag | 4.2.4.6 |
+| Stable Citation | 回答と不変Chunk Versionを結ぶ引用 | `Citation` ObjectとResponse／Trace属性 | 4.2.4.7 |
+| Identity Fixture | ACL評価用の承認済み架空Identity | Git FixtureとDataset参照ID | 4.2.4.9 |
+| Production Monitoring | 本番Traceを登録済みScorerでSampling評価するMLflow機能 | Registered Scorer、Monitoring Job、Assessment | 4.2.4.14 |
+| Monitoring Signal | DetectorがCase化前に出す標準Event | `internal_rag_monitoring_signals`の1行 | 4.2.4.15 |
+| Review App | TraceやRecordへ人間Labelを入力するMLflow UI | Review UIとLabel Schema | 5.1.2.1 |
+| Labeling Session | Reviewerと対象TraceをまとめるReview単位 | MLflow Labeling Session | 5.1.2.1 |
+| Training Dataset | 改善候補の探索に使う評価Dataset | `main.llmops.internal_rag_train` | 5.1.2.2 |
+| Holdout Dataset | 最終Release判定だけに使う固定Dataset | `main.llmops.internal_rag_holdout` | 5.1.2.2 |
+| Prompt Optimization | Training DataでPrompt候補を比較する改善処理 | Optimization RunとPrompt Version候補 | 5.1.2.4 |
+| Release Gate | Holdout、Security、SLO、Costから採否を決める独自Workflow | Quality Job、Python判定、Decision Log | 5.1.2.5 |
+| Judge Alignment | Judge定義を人間Feedbackへ適合させる処理 | Alignment Runと候補Judge | 5.1.2.9 |
+| Root Cause | 最初に破綻した工程の分類 | Quality Caseの`root_cause`列 | 5.1.2.1 |
+| Improvement Target | 実際に修正する資産の分類 | Quality Case列とGit管理Mapping | 5.1.2.1 |
+| Reconciliation | Volume、Manifest、Gold、Indexの差分検出 | Job、Python、候補Delta Table | 4.2.4.4 |
+| Model Route | 用途別Model ServiceとFallbackの固定構成 | Release Manifest列とAI Gateway設定 | 4.2.3.2 |
+| Git Model Versioning | Application CodeをGit Commitで追跡する方式 | Git CommitとTrace／Release Tag | 5.1.2.10 |
