@@ -84,6 +84,12 @@ flowchart TD
 | Reconciliation | Volume、Manifest、Gold、Indexの差分を検出する定期照合。 |
 | Service Principal | JobやService用の非人間Identity。 |
 | `run_as` | 作成済みService PrincipalをJob／Pipeline実行主体に指定するDAB設定。 |
+| Assessment | TraceまたはSpanへ付与する評価データの総称。実績を評価するFeedbackと、正解値を表すExpectationを含む。PoCから利用する。 |
+| Feedback | 実際の回答、検索結果、Agent経路がどの程度よかったかを表すAssessment。Code、LLM Judge、人間のいずれも作成できる。 |
+| Expectation | 期待回答、期待文書、期待Chunk、期待拒否など「何が起きるべきか」を表す人間定義の正解値。 |
+| Scorer | Trace、入力、出力、ExpectationからFeedbackを生成する評価器。決定論的Code ScorerとLLM Judgeを用途別に使い分ける。 |
+| Judge Alignment | 同じ名前のJudge Feedbackと人間Feedbackを使い、JudgeのInstructionsや例示を人間基準へ適応させる処理。基盤LLMのWeight更新ではない。 |
+| Production Monitoring | 本番TraceをSamplingし、登録済みScorer／Judgeで継続評価するMLflow機能。本番導入前に設定・Dry Runする。 |
 
 ## 2. 三段階の導入ロードマップ
 
@@ -91,15 +97,21 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    POC["1. PoC時<br/>Lakeflow Medallion・AI Search・RAG・最小評価"] --> PROD["2. 本番導入時<br/>Manifest・Service Principal・監査・Release Gate"]
-    PROD --> OPS["3. 本番導入後<br/>Assessment・Dataset育成・最適化・Canary"]
+    POC_BUILD["1. PoC開始前<br/>Medallion・RAG・Trace・評価契約を構築"] --> POC_RUN["PoC実施中<br/>限定運用・Trace確認・Assessment"]
+    POC_RUN --> POC_DECIDE["PoC分析・判断<br/>原因分類・本番化Gap・Go / No-Go"]
+    POC_DECIDE --> PROD_BUILD["2. 本番開始前<br/>統制・Holdout・Monitoring・Runbookを構築"]
+    PROD_BUILD --> PROD_TEST["Dry Run・Pilot<br/>障害・ACL・Rollback試験と限定運用"]
+    PROD_TEST --> PROD_DECIDE["本番判断<br/>Release・Rollback・利用範囲拡大"]
+    PROD_DECIDE --> OPS_RUN["3. 本番導入後<br/>定常監視・Alert・品質Review"]
+    OPS_RUN --> OPS_IMPROVE["Evidence起点の改善<br/>Dataset育成・Alignment・Canary"]
+    OPS_IMPROVE --> OPS_RUN
 ```
 
-| 段階 | 目的 | 利用者・データ | この段階で完成させるもの | 次へ進む条件 |
+| 段階 | 開始前に構築する機能 | 実施中の監視・運用 | 結果の分析・改善 | 完了・移行判断 |
 | --- | --- | --- | --- | --- |
-| PoC時 | 取込、検索、Citation付き回答、拒否、評価の成立性を確認 | 開発者・限定Tester、Sample／匿名化／低機密文書 | Lakeflow Medallion、Attempt物理保持、AI Search、RAG、Trace、最小UI／評価 | 合意した検索・回答KPIを満たし、本番化Gapが一覧化される |
-| 本番導入時 | 実データを安全に業務利用できる状態へ置換 | 承認済み業務利用者、承認済み実データ | Manifest、Version審査、SP職務分離、Scanner、Gold公開統制、監査、Rollback、Monitoring | Pilotで品質・Security・運用Gateを満たし責任者がGo判定する |
-| 本番導入後 | 本番実績から品質、Cost、運用を改善 | 一般利用者、専門家Reviewer、本番Trace／Assessment | Review Workflow、Dataset育成、Judge Alignment、Prompt／Retrieval改善、Canary／A/B | 改善版が独立Holdoutと本番Guardrailを継続通過する |
+| PoC時 | Lakeflow Medallion、AI Search、RAG、Trace、EvaluationDataset、Scorer、Assessment最小契約 | Pipeline Run、Error、件数、Index同期、Trace、限定Testerの実質問をRunごとに確認 | Component別・Slice別に失敗を分類し、固定Datasetで1要素ずつ比較 | KPI、Risk、Cost、Latency、本番化GapをEvidenceとしてGo／No-Goを決める |
+| 本番導入／Pilot時 | Manifest、SP職務分離、Training／Holdout、Release Gate、正式Assessment、Monitoring、Alert、Runbook、Rollback | Dry Run後、Pilotで文書公開、Pipeline、Agent、Model、ACL、品質、Costを監視 | 障害試験とPilot結果から閾値、手順、利用Scopeを見直す | Release継続、Rollback、No-Go、利用範囲拡大を責任者が承認する |
+| 本番導入後 | Review Workflow、Dataset同期、改善Job、Judge Alignment、Canary／A-BをEvidenceに応じて高度化 | 定常監視、Alert対応、専門家Review、Assessment、Release Drift確認 | 原因別Backlogへ配送し、Training探索、Holdout判定、段階Releaseを循環する | 品質Guardrail、Security、SLO、Cost、運用負荷に基づき採用・却下・追加調査を決める |
 
 ### 2.1 Architectureと手運用範囲の比較
 
@@ -107,29 +119,27 @@ flowchart TD
 flowchart LR
     subgraph POC["PoC時"]
         direction TB
-        P1["開発者がSampleをVolumeへ配置"] --> P2["Lakeflow SDP<br/>Bronze・Attempt・Silver・PoC Gold"]
-        P2 --> P3["開発用AI Search"]
-        P3 --> P4["Prompt Registry・Model Serving・最小RAG"]
-        P4 --> P5["MLflow Trace・固定Case評価"]
-        PH["人: Upload、起動、Index更新、Trace確認、Go判断"]
+        P1["開始前に構築<br/>Lakeflow SDP・AI Search・RAG・評価契約"] --> P2["実施中<br/>手動起動・件数／Error／Trace確認"]
+        P2 --> P3["分析<br/>Assessment・Slice・原因分類"]
+        P3 --> P4["判断<br/>PoC合否・本番化Gap"]
+        PH["人の範囲<br/>Upload・起動・期待値入力・原因確認・Go判断"]
     end
 
     subgraph PROD["本番導入時"]
         direction TB
-        B1["Staging・Scanner・登録Command"] --> B2["Manifest・Version Registry"]
-        B2 --> B3["SP分離Lakeflow・Gold Current"]
-        B3 --> B4["Search Sync・Release Index"]
-        B4 --> B5["Release Manifest・Agent Server・Monitoring"]
-        BH["人: 文書審査、Release承認、Alert判断、Rollback承認"]
+        B1["開始前に構築<br/>Manifest・SP分離・Release・Monitoring"] --> B2["事前検証<br/>Dry Run・障害／ACL／Rollback試験"]
+        B2 --> B3["Pilot運用<br/>全Component監視・Assessment"]
+        B3 --> B4["判断<br/>Release・Rollback・範囲拡大"]
+        BH["人の範囲<br/>文書審査・例外対応・Holdout・Release承認"]
     end
 
     subgraph OPS["本番導入後"]
         direction TB
-        O1["本番Trace・User Feedback"] --> O2["Review App・Assessment"]
-        O2 --> O3["EvaluationDataset育成"]
-        O3 --> O4["Retrieval・Prompt・Judge改善"]
-        O4 --> O5["Canary／A-B・再Release"]
-        OH["人: Expectation、原因診断、改善採否、段階昇格"]
+        O1["定常運用<br/>Monitoring・Alert・Review"] --> O2["分析<br/>Expectation・原因分類・優先度"]
+        O2 --> O3["改善<br/>Dataset・Retrieval・Prompt・Judge"]
+        O3 --> O4["判断<br/>Holdout・Canary・再Release"]
+        O4 --> O1
+        OH["人の範囲<br/>Expectation・原因診断・採否・段階昇格"]
     end
 
     POC --> PROD --> OPS
@@ -141,8 +151,9 @@ flowchart LR
 | 公開判断 | 開発者がPoC Run Logで確認 | 登録者と承認者を分離しPointer切替 | Failure分析から審査基準を改善 |
 | Pipeline | 開発者が手動起動可能 | Ingestion SPで自動実行・監視 | Cost・処理時間・Error傾向を最適化 |
 | Prompt／Model | Prompt RegistryとModel Servingを使用 | Release ManifestでVersion／Route固定 | Optimization、Canary、A/Bで比較 |
-| 品質確認 | Trace確認と固定Case評価 | Holdout、ACL、負荷、Release Gate | 本番AssessmentでDatasetとJudgeを更新 |
+| 品質確認 | `mlflow.genai.evaluate()`、Code Scorer、RAG Judge、手動Assessment | Training／Holdout、ACL等Golden Test、Judge対人間誤差、Release Gate、Monitoring Dry Run | 本番AssessmentでDatasetを育成し、必要時だけJudgeを再Alignment |
 | 人が残す判断 | PoC合否と本番化Gap | 文書承認、Release、障害対応 | Expectation、root cause、改善Release承認 |
+| MLflow運用 | Trace UIへ少数担当者がFeedback／Expectationを直接入力 | Assessment SchemaとReviewerを正式化し、MonitoringをPilot開始時に有効化 | Review Queueを定期配送し、滞留・Cost・品質を継続監視 |
 
 ### 2.2 PoC版から本番版への置換
 
@@ -154,50 +165,46 @@ flowchart LR
 | 開発者が起動・承認 | Registration／Approval／Ingestion／Publish SPへ分離 | 自己承認と過剰権限を防ぐため |
 | PoC Error TableとRun Log | Quarantine、Command状態、Audit Event、Reconciliation | Retryと変更履歴を監査可能にするため |
 | 1つのdev Index | SnapshotとRelease単位Index | Rollbackと評価再現性を確保するため |
-| 手動品質確認 | Holdout、ACL Golden Test、Release Gate | 本番Release判定を再現可能にするため |
+| 小規模EvaluationDatasetと手動Assessment | UC管理のTraining／Holdout、正式Assessment Schema、Release Gate | PoCの評価契約を捨てず、Lineage、職務分離、再現性を加えるため |
+| PoC ScorerとRAG Judge | Version固定した本番Scorer／Judge、Production Monitoring | 開発と本番で同じ品質定義を再利用し、評価差を減らすため |
 
 PoCの手運用は検査の省略を意味しない。実行者、対象Version、確認項目、結果、時刻をPoC Run Logへ記録する。実データを使う場合はPoCでもACL、Secret、Trace Maskingを省略しない。
 
-## 3. PoC時に実装するもの
+## 3. PoC時に実施するもの
 
-### 3.1 目的・範囲・完了条件
+### 3.1 PoCの目的・範囲・完了条件
 
 | 項目 | 内容 |
 | --- | --- |
 | 目的 | 少数文書で取込から根拠付き回答まで成立するか確認する。 |
 | 手運用 | Volume配置、Pipeline起動、Index作成、期待値登録、Release判定。 |
-| 自動化 | Bronze、重複排除、Parse／Prep Attempt、Error、Silver、PoC Gold、Trace。 |
-| 実装しない | Manifest、Version Registry、Service Principal職務分離、外部Scanner、Reconciliation、Canary。 |
+| 自動化 | Bronze、重複排除、Parse／Prep Attempt、Error、Silver、PoC Gold、Retriever／LLM／Agent Trace、Evaluation。 |
+| 実装しない | Manifest、Version Registry、Service Principal職務分離、外部Scanner、Reconciliation、Review Queue自動配送、Production Monitoring定期実行、Canary。 |
 | Security制約 | dev限定、一般公開禁止、限定Tester、低機密を原則とする。 |
 | 完了条件 | Parse／Prep／Chunk、期待Chunk取得、Citation、回答拒否、Trace、最小評価が合格する。 |
 
 PoCでもLakeflow Spark Declarative PipelinesでBronze／Silver／Goldを実装する。AI Functionを成功表とError表で別々に呼ばず、物理Attempt Datasetから分岐する。これにより、本番化時にメダリオン処理を作り直すのではなく、入力契約とGold公開条件だけを強化できる。
 
-### 3.2 開発時の実装
+### 3.2 PoC開始前に構築する最小機能
 
 PoC開発でも、PromptをSourceコードへ埋め込むだけでは比較できないため、Prompt Registryへ判定・回答Promptを登録し、解決したPrompt VersionをTraceへ残す。生成ModelはDatabricks Model Serving Endpoint経由で呼び、Model名、Endpoint、Request IDをTraceへ記録する。Lakeflow SDP、AI Search、RAG、Streamlitはdev DABで再現可能にする。
 
 Canary／A/BのTraffic Splitやオンライン最適化はPoC必須ではない。PoCでは候補PromptやModel Routeを**評価Runごとに固定してオフライン比較**すればよい。ただし、本番でCanaryを予定する場合は、Requestへ`candidate_id`、Prompt Version、Model Routeを記録できる契約だけ先に用意する。
 
-### 3.3 運用時の実装
+以下の実装はすべてPoC開始前に完成させる。PoC期間中は未完成機能を追加しながら評価するのではなく、固定した入力、Prompt、Model Route、Retrieval設定でEvidenceを収集し、変更時は新しいEvaluation Runとして比較する。
 
-PoCにも運用がある。開発者またはPoC Ownerが日次または評価RunごとにPipeline Event Log、Parse／Prep Error、AI Search結果、MLflow Trace、Token、Latencyを確認する。失敗Caseは`poc_cases.json`へ追加し、Prompt Registryの候補VersionとModel Serving Routeを固定して再評価する。
-
-| PoC運用 | 実施者 | 記録先 | 本番での置換 |
-| --- | --- | --- | --- |
-| Sample UploadとPipeline起動 | 開発者 | PoC Run Log、Job Run ID | Registration Job／Ingestion Pipeline |
-| Parse／Prep Error確認 | 開発者 | Error Table、Issue | Alert、Runbook、再処理Workflow |
-| Traceと回答の確認 | 開発者、限定Tester | MLflow Trace、Evaluation Run | Monitoring、Review App、Assessment |
-| Prompt／Model候補比較 | LLMOps担当者 | Prompt Version、Model Route、Metric | Holdout Gate、Canary／A-B |
-| PoC合否 | PoC Owner | Decision Log | Release承認Workflow |
-
-### 3.4 PoC Project構成
+#### 3.2.1 PoC Project構成
 
 ```text
 internal-docs-rag-poc/
 ├── databricks.yml
 ├── resources/
-│   └── poc_pipeline.yml
+│   ├── poc_pipeline.yml
+│   ├── poc_monitoring_job.yml
+│   ├── poc_dashboard.yml
+│   └── poc_alerts.yml
+├── dashboards/
+│   └── poc_operations.lvdash.json
 ├── src/
 │   ├── 01_bronze.sql
 │   ├── 01b_unique_versions.py
@@ -208,12 +215,21 @@ internal-docs-rag-poc/
 │   ├── create_search_index.py
 │   ├── register_poc_prompt.py
 │   ├── rag_app.py
-│   └── evaluate_poc.py
+│   ├── poc_scorers.py
+│   ├── evaluate_poc.py
+│   ├── record_poc_assessments.py
+│   ├── create_poc_operational_tables.sql
+│   ├── create_poc_monitoring_views.sql
+│   ├── triage_poc_quality_cases.py
+│   └── close_poc_quality_case.py
+├── ops/
+│   ├── poc_monitoring_thresholds.yml
+│   └── poc_runbook.md
 └── tests/
     └── poc_cases.json
 ```
 
-### 3.5 PoC BundleとPipeline
+#### 3.2.2 PoC BundleとPipeline
 
 `poc/databricks.yml`
 
@@ -229,6 +245,30 @@ include:
 
 # 環境ごとに差し替えるBundle変数を宣言する。
 variables:
+  # PoC監視Table、View、Pipeline出力を配置するUnity Catalog Catalogを設定する。
+  catalog:
+    # PoCでは専用dev Catalogまたは限定Schemaを利用する。
+    default: main
+  # PoC監視Table、View、Pipeline出力を配置するSchemaを設定する。
+  schema:
+    # 本番資産と混在させないPoC専用Schemaを指定する。
+    default: llmops_poc
+  # DashboardとSQL AlertのQuery実行に利用するSQL Warehouse IDを設定する。
+  sql_warehouse_id:
+    # Workspaceごとに異なるため、Deploy時に明示指定する。
+    default: ""
+  # Error／Critical通知を送る管理者作成済みSystem Destination IDを設定する。
+  ops_system_destination_id:
+    # Slack／Teams／PagerDuty／WebhookのURL自体はSourceへ保存しない。
+    default: ""
+  # PoC実施時間内の通知先Group Mailを設定する。
+  poc_ops_email:
+    # 個人Emailではなく管理されたDistribution ListをDeploy変数で注入する。
+    default: ""
+  # PoC Dashboardを閲覧・実行できる管理対象Group名を設定する。
+  poc_reviewer_group:
+    # 個人名や固定GroupをSourceへ書かず、環境ごとにDeploy変数で注入する。
+    default: ""
   # source_pathに関する設定値を定義する。
   source_path:
     # 変数未指定時に使う既定値を設定する。
@@ -264,9 +304,17 @@ resources:
       # Databricks上で表示・参照するResource名を設定する。
       name: internal-docs-rag-poc
       # Pipelineの出力先Unity Catalog Catalogを設定する。
-      catalog: main
+      catalog: ${var.catalog}
       # Pipelineの出力先Schemaを設定する。
-      schema: llmops_poc
+      schema: ${var.schema}
+      # Event LogをUnity Catalog Tableとして公開し、共有可能な監視Viewの正本にする。
+      event_log:
+        # Event Logの配置先Catalogを設定する。
+        catalog: ${var.catalog}
+        # Event Logの配置先Schemaを設定する。
+        schema: ${var.schema}
+        # DashboardとSQL Alertが参照する公開Event Log Table名を設定する。
+        name: poc_pipeline_event_log
       # Serverless Computeを使用するか設定する。
       serverless: true
       # 開発ModeでPipelineを実行するか設定する。
@@ -313,7 +361,9 @@ resources:
 
 PoCでは開発者Identityで実行してよいが、専用dev SchemaとVolumeだけへ権限を限定する。本番章では`run_as`をIngestion SPへ変更する。
 
-### 3.6 Bronzeと文書Version重複排除
+#### 3.2.3 Bronzeと文書Version重複排除
+
+以下の想定出力は処理のつながりを理解するための説明用データである。Hash、Timestamp、Binary、VARIANTは読みやすいよう省略・短縮しており、実環境の値や完全なSchema Dumpではない。
 
 `poc/src/01_bronze.sql`
 
@@ -347,6 +397,15 @@ FROM STREAM read_files(
 );
 ```
 
+**想定出力サンプル（`poc_documents_bronze`）**
+
+| `document_id` | `document_version_id` | `source_uri` | `source_title` | `length` | `preflight_error` | `ingested_at` |
+| --- | --- | --- | --- | ---: | --- | --- |
+| `POC-7f1c9a2b3d4e5f60718293ab` | `ver-a81f...` | `/Volumes/poc/docs/rag-guide.pdf` | `rag-guide.pdf` | 248120 | `NULL` | `2026-08-15T09:00:03Z` |
+| `POC-2a3b4c5d6e7f8091a2b3c4d5` | `ver-991c...` | `/Volumes/poc/docs/archive.zip` | `archive.zip` | 98120 | `UNSUPPORTED_EXTENSION` | `2026-08-15T09:00:04Z` |
+
+`content`はBinaryのため省略している。1行目はParse対象、2行目は履歴には残るがAI Functionへ渡らない。
+
 `poc/src/01b_unique_versions.py`
 
 ```python
@@ -379,7 +438,17 @@ def poc_unique_versions() -> DataFrame:
     )
 ```
 
-### 3.7 Parse／Prep AttemptとError分岐
+**想定出力サンプル（`poc_unique_versions`）**
+
+| 入力Event | `document_version_id` | 出力されるか | 理由 |
+| --- | --- | --- | --- |
+| 初回配置 | `ver-a81f...` | はい | 未処理の内容Versionであるため |
+| 同一Fileの再配置 | `ver-a81f...` | いいえ | 同じ`document_version_id`として重複排除されるため |
+| 内容を改訂したFile | `ver-b72e...` | はい | 新しい内容Versionであるため |
+
+下流へ渡る代表行は、Bronzeの1行目と同じ文書属性を持ち、AI Functionの実行回数だけがVersion単位で1回に抑えられる。
+
+#### 3.2.4 Parse／Prep AttemptとError分岐
 
 `poc/src/02_parse.sql`
 
@@ -417,6 +486,8 @@ SELECT
   document_id,
   document_version_id,
   source_uri,
+  lower(regexp_extract(source_uri, '\\.([^.?#/]+)(?:[?#].*)?$', 1)) AS source_extension,
+  '${poc.parse_version}' AS processor_version,
   coalesce(to_json(parsed_document:error_status), 'PARSE_NULL_RESULT') AS error_message,
   current_timestamp() AS occurred_at
 FROM STREAM(poc_parse_attempts)
@@ -425,6 +496,16 @@ WHERE parsed_document IS NULL
    OR coalesce(size(from_json(to_json(parsed_document:error_status),
       'ARRAY<STRUCT<error_message:STRING,page_id:INT>>')), 0) > 0;
 ```
+
+**想定出力サンプル（Parse分岐）**
+
+| 出力Dataset | `document_version_id` | `parsed_document`／`error_message` | 結果 |
+| --- | --- | --- | --- |
+| `poc_parse_attempts` | `ver-a81f...` | `{"document":{"pages":[...]},"error_status":[]}` | AI Functionの生結果を1回だけ保持 |
+| `poc_parsed` | `ver-a81f...` | `document.pages=12` | 成功したためPrepへ進む |
+| `poc_parse_errors` | `ver-c33d...` | `[{"page_id":3,"error_message":"PAGE_PARSE_FAILED"}]` | 失敗したためQuarantineへ分岐 |
+
+同じ`document_version_id`が`poc_parsed`と`poc_parse_errors`の両方へ入ることはない。
 
 `poc/src/03_prep.sql`
 
@@ -458,6 +539,8 @@ SELECT
   document_id,
   document_version_id,
   source_uri,
+  lower(regexp_extract(source_uri, '\\.([^.?#/]+)(?:[?#].*)?$', 1)) AS source_extension,
+  '${poc.prep_version}' AS processor_version,
   coalesce(to_json(prepared_document:error_status), 'PREP_NULL_RESULT') AS error_message,
   current_timestamp() AS occurred_at
 FROM STREAM(poc_prep_attempts)
@@ -466,7 +549,17 @@ WHERE prepared_document IS NULL
    OR coalesce(to_json(prepared_document:error_status), 'null') NOT IN ('null', '{}', '[]');
 ```
 
-### 3.8 Silver ChunkとPoC Gold
+**想定出力サンプル（Prep分岐）**
+
+| 出力Dataset | `document_version_id` | `prepared_document`／`error_message` | 結果 |
+| --- | --- | --- | --- |
+| `poc_prep_attempts` | `ver-a81f...` | `document.contents`に4 Chunk | AI Functionの生結果を1回だけ保持 |
+| `poc_prepared` | `ver-a81f...` | `error_status=[]` | Chunk展開へ進む |
+| `poc_prep_errors` | `ver-d44e...` | `{"error_code":"PREP_FAILED"}` | Quarantineへ分岐 |
+
+成功表とError表はAttemptの`error_status`だけから相互排他的に生成される。
+
+#### 3.2.5 Silver ChunkとPoC Gold
 
 `poc/src/04_chunks_silver.sql`
 
@@ -501,6 +594,15 @@ SELECT
 FROM exploded;
 ```
 
+**想定出力サンプル（`poc_chunks_silver`）**
+
+| `chunk_version_id` | `document_id` | `document_version_id` | `chunk_position` | `chunk_to_embed` | `chunk_to_retrieve` | `page_number` | `chunk_schema_version` |
+| --- | --- | --- | ---: | --- | --- | ---: | --- |
+| `chunk-01a9...` | `POC-7f1c...` | `ver-a81f...` | 0 | `RAG基盤 Databricks AI Search...` | `当社RAG基盤ではDatabricks AI Searchを利用する。` | 2 | `poc-v1` |
+| `chunk-02b8...` | `POC-7f1c...` | `ver-a81f...` | 1 | `検索方式 HYBRID ANN...` | `検索方式はHYBRIDを既定とする。` | 3 | `poc-v1` |
+
+`chunk_to_embed`は検索照合用、`chunk_to_retrieve`は回答Context用であり、同じ用途として扱わない。
+
 `poc/src/05_gold_poc.sql`
 
 ```sql
@@ -532,7 +634,16 @@ INNER JOIN latest
 WHERE latest.version_rank = 1;
 ```
 
-### 3.9 PoC AI Search、RAG、評価
+**想定出力サンプル（`poc_chunks_gold`）**
+
+| `document_id` | SilverにあるVersion | Goldへ出るVersion | `chunk_version_id` | 理由 |
+| --- | --- | --- | --- | --- |
+| `POC-7f1c...` | `ver-a81f...`、`ver-b72e...` | `ver-b72e...` | `chunk-11c7...` | PoCでは最新のParse／Prep成功Versionを採用するため |
+| `POC-9d8e...` | `ver-c33d...`のみ | なし | なし | Parse ErrorでSilver Chunkへ到達していないため |
+
+このPoC Goldは承認を表さない。本番では「最新」ではなくManifestの承認Pointerと一致するVersionだけを公開する。
+
+#### 3.2.6 PoC AI Search、RAG、評価
 
 PoCでは`poc_chunks_gold`から開発用Indexを1つ作る。Index作成は手動Jobでもよいが、設定はGitへ保存する。RAGはACLやRelease Manifestをまだ持たず、取得Chunkだけから回答し、Citationが不足する場合は拒否する。
 
@@ -580,7 +691,20 @@ if __name__ == "__main__":
     main()
 ```
 
+**想定出力サンプル（Prompt Registry）**
+
+| 項目 | 値 |
+| --- | --- |
+| Prompt名 | `main.llmops_poc.internal_rag_answer` |
+| 登録Version | `3` |
+| Alias | `development -> 3` |
+| Console出力 | `prompts:/main.llmops_poc.internal_rag_answer/3` |
+
+再実行するとVersion `3`を上書きせず、新しいVersion `4`を作成して`development` Aliasだけを更新する。
+
 `poc/src/rag_app.py`
+
+この実装では、RAG全体を`AGENT`、検索を`RETRIEVER`、生成Model呼び出しを`LLM` Spanとして記録する。`RETRIEVER` Spanの出力は`Document`へ正規化し、`page_content`、`metadata.doc_uri`、`metadata.chunk_id`をMLflowのRAG Judgeが解釈できる形で残す。Prompt、Model Endpoint、Index、Corpus／Chunk Version、Git CommitはTrace Tagへ付与し、どの構成で回答したかをEvaluation Runから追跡できるようにする。
 
 ```python
 """PoC AI Search結果だけを根拠に回答する最小RAG Application。
@@ -590,32 +714,128 @@ if __name__ == "__main__":
 """
 
 from dataclasses import dataclass
+import os
 
 import mlflow
 from databricks.ai_search.client import AISearchClient
 from databricks.sdk import WorkspaceClient
+from mlflow.entities import Document, SpanType
 
 
-PROMPT_URI = "prompts:/main.llmops_poc.internal_rag_answer@development"
+PROMPT_URI = os.getenv(
+    "POC_PROMPT_URI",
+    "prompts:/main.llmops_poc.internal_rag_answer@development",
+)
+
+
+@dataclass(frozen=True)
+class RetrievedChunk:
+    """AI Search行を回答生成と評価で再利用できる形へ正規化する。"""
+
+    document_id: str
+    document_version_id: str
+    chunk_version_id: str
+    content: str
+    source_uri: str
+    source_title: str
+    page_number: int | None
 
 
 @dataclass(frozen=True)
 class PocResult:
-    """PoC回答とCitationを保持する。"""
+    """PoC回答と決定論的Scorerが必要とする観測値を保持する。"""
 
     answer: str
     citations: list[str]
     refused: bool
+    refusal_reason: str | None
+    retrieved_document_ids: list[str]
+    retrieved_chunk_version_ids: list[str]
 
 
-@mlflow.trace(name="poc_rag")
-def answer_question(question: str, index_name: str, endpoint_name: str) -> PocResult:
+@mlflow.trace(name="poc_retrieve", span_type=SpanType.RETRIEVER)
+def retrieve_chunks(question: str, index_name: str) -> list[RetrievedChunk]:
+    """AI Searchを実行し、Retriever Spanへ標準Document出力を記録する。"""
+    index = AISearchClient().get_index(index_name=index_name)
+    response = index.similarity_search(
+        query_text=question,
+        columns=[
+            "document_id",
+            "document_version_id",
+            "chunk_version_id",
+            "chunk_to_retrieve",
+            "source_uri",
+            "source_title",
+            "page_number",
+        ],
+        num_results=5,
+        query_type="HYBRID",
+    )
+    rows = response.get("result", {}).get("data_array", [])
+    chunks = [
+        RetrievedChunk(
+            document_id=row[0],
+            document_version_id=row[1],
+            chunk_version_id=row[2],
+            content=row[3],
+            source_uri=row[4],
+            source_title=row[5],
+            page_number=row[6],
+        )
+        for row in rows
+    ]
+
+    # RAG JudgeはRETRIEVER Spanの出力から検索根拠を読むため、
+    # Application内部形式ではなくMLflow Document形式を明示的に保存する。
+    documents = [
+        Document(
+            id=chunk.chunk_version_id,
+            page_content=chunk.content,
+            metadata={
+                "doc_uri": chunk.source_uri,
+                "chunk_id": chunk.chunk_version_id,
+                "document_id": chunk.document_id,
+                "document_version_id": chunk.document_version_id,
+                "source_title": chunk.source_title,
+                "page_number": chunk.page_number,
+            },
+        )
+        for chunk in chunks
+    ]
+    mlflow.get_current_active_span().set_outputs(documents)
+    return chunks
+
+
+@mlflow.trace(name="poc_generate_answer", span_type=SpanType.LLM)
+def generate_answer(prompt: str, endpoint_name: str) -> str:
+    """Databricks Model Serving Endpointを呼び、回答本文を生成する。"""
+    client = WorkspaceClient().serving_endpoints.get_open_ai_client()
+    completion = client.chat.completions.create(
+        model=endpoint_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    return completion.choices[0].message.content
+
+
+@mlflow.trace(name="poc_rag", span_type=SpanType.AGENT)
+def answer_question(
+    question: str,
+    index_name: str,
+    endpoint_name: str,
+    corpus_version: str,
+    chunk_schema_version: str,
+    git_commit: str,
+) -> PocResult:
     """関連Chunkを検索し、根拠がある場合だけ回答する。
 
     Args:
         question: 限定Testerが入力した質問。
         index_name: PoC AI Search Index名。
         endpoint_name: PoC生成Model Serving Endpoint名。
+        corpus_version: PoC GoldのCorpus Version。
+        chunk_schema_version: Chunk生成契約のVersion。
+        git_commit: Evaluation対象ApplicationのGit Commit。
 
     Returns:
         回答、Citation ID、拒否状態。
@@ -623,81 +843,1741 @@ def answer_question(question: str, index_name: str, endpoint_name: str) -> PocRe
     Security:
         PoC Indexには低機密Sampleだけを格納し、一般利用者へ公開しない。
     """
-    index = AISearchClient().get_index(index_name=index_name)
-    response = index.similarity_search(
-        query_text=question,
-        columns=["chunk_version_id", "chunk_to_retrieve", "source_title", "page_number"],
-        num_results=5,
-        query_type="HYBRID",
-    )
-    rows = response.get("result", {}).get("data_array", [])
-    if not rows:
-        return PocResult("根拠となる文書を確認できませんでした。", [], True)
-
-    citations = [f"[C{i + 1}]" for i in range(len(rows))]
-    context = "\n\n".join(
-        f"{citations[i]} {row[1]}" for i, row in enumerate(rows)
-    )
     registered_prompt = mlflow.genai.load_prompt(PROMPT_URI)
     mlflow.update_current_trace(
         tags={
+            "poc.prompt.name": registered_prompt.name,
             "poc.prompt.version": str(registered_prompt.version),
             "poc.model.endpoint": endpoint_name,
+            "poc.index.name": index_name,
+            "poc.corpus.version": corpus_version,
+            "poc.chunk.schema_version": chunk_schema_version,
+            "poc.git.commit": git_commit,
         }
     )
-    prompt = registered_prompt.format(question=question, context=context)
-    client = WorkspaceClient().serving_endpoints.get_open_ai_client()
-    completion = client.chat.completions.create(
-        model=endpoint_name,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
+
+    chunks = retrieve_chunks(question=question, index_name=index_name)
+    if not chunks:
+        return PocResult(
+            answer="根拠となる文書を確認できませんでした。",
+            citations=[],
+            refused=True,
+            refusal_reason="NO_RETRIEVAL_RESULT",
+            retrieved_document_ids=[],
+            retrieved_chunk_version_ids=[],
+        )
+
+    citations = [f"[C{i + 1}]" for i in range(len(chunks))]
+    context = "\n\n".join(
+        f"{citations[i]} {chunk.content}" for i, chunk in enumerate(chunks)
     )
-    answer = completion.choices[0].message.content
+    prompt = registered_prompt.format(question=question, context=context)
+    answer = generate_answer(prompt=prompt, endpoint_name=endpoint_name)
     if not any(citation in answer for citation in citations):
-        return PocResult("根拠を検証できないため回答できません。", [], True)
-    return PocResult(answer, citations, False)
+        return PocResult(
+            answer="根拠を検証できないため回答できません。",
+            citations=[],
+            refused=True,
+            refusal_reason="CITATION_VALIDATION_FAILED",
+            retrieved_document_ids=sorted({chunk.document_id for chunk in chunks}),
+            retrieved_chunk_version_ids=[chunk.chunk_version_id for chunk in chunks],
+        )
+    return PocResult(
+        answer=answer,
+        citations=citations,
+        refused=False,
+        refusal_reason=None,
+        retrieved_document_ids=sorted({chunk.document_id for chunk in chunks}),
+        retrieved_chunk_version_ids=[chunk.chunk_version_id for chunk in chunks],
+    )
 ```
+
+**想定出力サンプル（`PocResult`とTrace）**
+
+```json
+{
+  "answer": "検索にはDatabricks AI Searchを利用します。[C1]",
+  "citations": ["[C1]"],
+  "refused": false,
+  "refusal_reason": null,
+  "retrieved_document_ids": ["POC-7f1c9a2b3d4e5f60718293ab"],
+  "retrieved_chunk_version_ids": ["chunk-01a9..."]
+}
+```
+
+| Trace階層 | `span_type` | 主な入力 | 主な出力 |
+| --- | --- | --- | --- |
+| `poc_rag` | `AGENT` | 質問、Index、Endpoint、各Version | 上記`PocResult` |
+| `poc_retrieve` | `RETRIEVER` | 質問、Index | `Document(page_content=..., metadata.chunk_id=...)`の配列 |
+| `poc_generate_answer` | `LLM` | Prompt、Endpoint | Citation付き回答文字列 |
+
+検索0件なら`refused=true`、`refusal_reason="NO_RETRIEVAL_RESULT"`となり、LLM Spanは生成されない。
+
+`poc/src/poc_scorers.py`
+
+文書／Chunk Recall、Citation、拒否はIDやBooleanを比較すれば再現できるため、LLMへ判定させない。Groundedness、検索関連性、検索十分性、期待回答との意味的CorrectnessだけをBuilt-in Judgeへ任せる。これにより、同じEvaluationDatasetとScorerを候補Prompt、Model Endpoint、Index設定の比較へ再利用できる。
+
+```python
+"""PoCと本番Quality Bundleで再利用する決定論的RAG Scorer。"""
+
+from mlflow.entities import Feedback
+from mlflow.genai.scorers import scorer
+
+
+@scorer(pass_if=lambda value: value == 1.0)
+def expected_document_recall(outputs: dict, expectations: dict) -> Feedback:
+    """期待文書IDが検索結果へ含まれた割合を計算する。"""
+    expected = set(expectations.get("expected_document_ids", []))
+    actual = set(outputs.get("retrieved_document_ids", []))
+    value = 1.0 if not expected else len(expected & actual) / len(expected)
+    return Feedback(value=value, rationale=f"expected={expected}, actual={actual}")
+
+
+@scorer(pass_if=lambda value: value == 1.0)
+def expected_chunk_recall(outputs: dict, expectations: dict) -> Feedback:
+    """期待Chunk Versionが検索結果へ含まれた割合を計算する。"""
+    expected = set(expectations.get("expected_chunk_version_ids", []))
+    actual = set(outputs.get("retrieved_chunk_version_ids", []))
+    value = 1.0 if not expected else len(expected & actual) / len(expected)
+    return Feedback(value=value, rationale=f"expected={expected}, actual={actual}")
+
+
+@scorer
+def citation_valid(outputs: dict) -> Feedback:
+    """非拒否回答にCitationがあり、そのIDが回答本文へ出現することを検査する。"""
+    citations = outputs.get("citations", [])
+    if outputs.get("refused"):
+        return Feedback(value=True, rationale="Refused response does not require citations")
+    missing = [citation for citation in citations if citation not in outputs.get("answer", "")]
+    valid = bool(citations) and not missing
+    return Feedback(value=valid, rationale=f"citations={citations}, missing={missing}")
+
+
+@scorer
+def expected_refusal(outputs: dict, expectations: dict) -> Feedback:
+    """拒否要否と、拒否時は内部理由Codeが期待値と一致するか検査する。"""
+    expected = bool(expectations.get("expected_refused", False))
+    actual = bool(outputs.get("refused", False))
+    expected_reason = expectations.get("expected_refusal_reason")
+    actual_reason = outputs.get("refusal_reason")
+    valid = expected == actual and (
+        not expected or expected_reason is None or expected_reason == actual_reason
+    )
+    return Feedback(
+        value=valid,
+        rationale=(
+            f"expected_refused={expected}, actual_refused={actual}, "
+            f"expected_reason={expected_reason}, actual_reason={actual_reason}"
+        ),
+    )
+```
+
+**想定出力サンプル（ケース別Feedback）**
+
+| Scorer | `value` | `rationale`の例 |
+| --- | ---: | --- |
+| `expected_document_recall` | `1.0` | `expected={'DOC-RAG-001'}, actual={'DOC-RAG-001'}` |
+| `expected_chunk_recall` | `0.5` | 期待2 Chunkのうち1 Chunkだけ取得 |
+| `citation_valid` | `true` | `citations=['[C1]'], missing=[]` |
+| `expected_refusal` | `true` | 期待・実績ともに非拒否 |
+
+文書／Chunk IDやCitationの一致は同じ入力なら常に同じ値になる。意味的な正しさは、この後のBuilt-in Judgeで別に評価する。
 
 `poc/src/evaluate_poc.py`
 
 ```python
-"""PoC質問を実行し、検索、Citation、拒否の成立性をMLflowで評価する。"""
+"""PoC RAGをMLflow GenAI Evaluationでケース別・集計評価する。"""
 
+from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 
 import mlflow
+from mlflow import MlflowClient
+from mlflow.genai.scorers import (
+    Correctness,
+    RetrievalGroundedness,
+    RetrievalRelevance,
+    RetrievalSufficiency,
+)
 
-from rag_app import answer_question
+from poc_scorers import (
+    citation_valid,
+    expected_chunk_recall,
+    expected_document_recall,
+    expected_refusal,
+)
+from rag_app import PROMPT_URI, answer_question
 
 
-def load_cases(path: str) -> list[dict]:
-    """JSONからPoC評価Caseを読み込む。"""
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+EXPERIMENT_NAME = os.getenv(
+    "POC_MLFLOW_EXPERIMENT",
+    "/Shared/llmops/internal-rag-poc-evaluation",
+)
+INDEX_NAME = os.environ["POC_INDEX_NAME"]
+MODEL_ENDPOINT = os.environ["POC_MODEL_ENDPOINT"]
+JUDGE_MODEL = os.getenv("POC_JUDGE_MODEL", "databricks")
+CORPUS_VERSION = os.environ["POC_CORPUS_VERSION"]
+CHUNK_SCHEMA_VERSION = os.environ["POC_CHUNK_SCHEMA_VERSION"]
+GIT_COMMIT = os.environ["GIT_COMMIT"]
+
+
+def load_evaluation_data(path: str) -> list[dict]:
+    """JSON Caseを`inputs`、`expectations`、`tags`形式へ正規化する。"""
+    cases = json.loads(Path(path).read_text(encoding="utf-8"))
+    return [
+        {
+            "inputs": {"question": case["question"]},
+            "expectations": {
+                "expected_response": case["expected_response"],
+                "expected_document_ids": case.get("expected_document_ids", []),
+                "expected_chunk_version_ids": case.get(
+                    "expected_chunk_version_ids", []
+                ),
+                "expected_refused": case["expected_refused"],
+                "expected_refusal_reason": case.get("expected_refusal_reason"),
+            },
+            "tags": {
+                "case_id": case["case_id"],
+                "category": case.get("category", "general"),
+            },
+        }
+        for case in cases
+    ]
+
+
+def predict_fn(question: str) -> dict:
+    """1 Caseにつき1つのAGENT Traceを生成し、評価可能な構造化出力を返す。"""
+    result = answer_question(
+        question=question,
+        index_name=INDEX_NAME,
+        endpoint_name=MODEL_ENDPOINT,
+        corpus_version=CORPUS_VERSION,
+        chunk_schema_version=CHUNK_SCHEMA_VERSION,
+        git_commit=GIT_COMMIT,
+    )
+    return asdict(result)
+
+
+def log_evaluation_configuration(run_id: str) -> None:
+    """Evaluation Runへ比較軸となる不変Versionを記録する。"""
+    prompt = mlflow.genai.load_prompt(PROMPT_URI)
+    client = MlflowClient()
+    parameters = {
+        "prompt_name": prompt.name,
+        "prompt_version": str(prompt.version),
+        "model_endpoint": MODEL_ENDPOINT,
+        "judge_model": JUDGE_MODEL,
+        "index_name": INDEX_NAME,
+        "corpus_version": CORPUS_VERSION,
+        "chunk_schema_version": CHUNK_SCHEMA_VERSION,
+        "git_commit": GIT_COMMIT,
+    }
+    for key, value in parameters.items():
+        client.log_param(run_id, key, value)
 
 
 def main() -> None:
-    """固定Caseを実行し、結果をMLflow Runへ記録する。"""
-    cases = load_cases("tests/poc_cases.json")
-    with mlflow.start_run(run_name="internal-rag-poc-evaluation"):
-        passed = 0
-        for case in cases:
-            result = answer_question(
-                case["question"],
-                case["index_name"],
-                case["endpoint_name"],
-            )
-            citation_ok = result.refused or bool(result.citations)
-            refusal_ok = result.refused == case["expected_refused"]
-            passed += int(citation_ok and refusal_ok)
-        mlflow.log_metric("poc_pass_rate", passed / len(cases))
+    """固定Datasetに同じScorer群を適用し、Evaluation Runを作成する。"""
+    mlflow.set_experiment(EXPERIMENT_NAME)
+    evaluation = mlflow.genai.evaluate(
+        data=load_evaluation_data("tests/poc_cases.json"),
+        predict_fn=predict_fn,
+        scorers=[
+            expected_document_recall,
+            expected_chunk_recall,
+            citation_valid,
+            expected_refusal,
+            RetrievalRelevance(model=JUDGE_MODEL),
+            RetrievalGroundedness(model=JUDGE_MODEL),
+            RetrievalSufficiency(model=JUDGE_MODEL),
+            Correctness(model=JUDGE_MODEL),
+        ],
+    )
+    log_evaluation_configuration(evaluation.run_id)
+    print(f"evaluation_run_id={evaluation.run_id}")
 
 
 if __name__ == "__main__":
     main()
 ```
 
-### 3.10 PoCから本番へ持ち越すもの・置き換えるもの
+**想定出力サンプル（Evaluation Run）**
+
+| Case | 文書Recall | Chunk Recall | Citation | 拒否 | Retrieval Relevance | Groundedness | Correctness |
+| --- | ---: | ---: | --- | --- | --- | --- | --- |
+| `poc-001` | 1.0 | 1.0 | `true` | `true` | `yes` | `yes` | `yes` |
+| `poc-002` | 0.0 | 0.0 | `true` | `false` | `no` | `yes` | `no` |
+
+Evaluation Runには集計値として、例えば`expected_document_recall/mean=0.50`、`citation_valid/mean=1.00`が残る。Consoleには`evaluation_run_id=...`が出力され、Run ParameterからPrompt Version、Model Endpoint、Index、Corpus／Chunk Version、Git Commitを比較できる。
+
+`tests/poc_cases.json`は少数の代表Caseを`inputs`へ渡す質問と、Scorerが読む`expectations`へ変換できる形で保持する。単一の`poc_pass_rate`へ潰さず、各Scorerのケース別Feedback、Rationale、集計MetricをEvaluation Runへ残す。
+
+```json
+[
+  {
+    "case_id": "poc-001",
+    "category": "architecture",
+    "question": "RAG基盤で利用している検索サービスは何ですか？",
+    "expected_response": "Databricks AI Searchを利用している。",
+    "expected_document_ids": ["DOC-ARCH-RAG"],
+    "expected_chunk_version_ids": ["CHUNK-VERSION-ARCH-RAG-001"],
+    "expected_refused": false,
+    "expected_refusal_reason": null
+  }
+]
+```
+
+`poc/src/record_poc_assessments.py`
+
+PoCではReview Queueを構築せず、開発者または少人数の業務担当者がTrace UIから直接入力してよい。APIで再現する場合は、実際の回答品質を`Feedback`、期待値を`Expectation`として分けて付与する。`expected_response`、期待文書／Chunk、拒否要否／理由はExpectationであり、回答が良かったかという判定とは別資産である。`mlflow.log_feedback()`と`mlflow.log_expectation()`はMLflow 3.2.0以降を前提にし、DABでMLflow Versionを固定する。
+
+```python
+"""PoC Traceへ人間Feedbackと正解Expectationを手動登録する。"""
+
+import json
+import os
+
+import mlflow
+from mlflow.entities import AssessmentSource, AssessmentSourceType
+
+
+def human_source() -> AssessmentSource:
+    """監査可能なReviewer IDを持つ人間Assessment Sourceを返す。"""
+    return AssessmentSource(
+        source_type=AssessmentSourceType.HUMAN,
+        source_id=os.environ["POC_REVIEWER_ID"],
+    )
+
+
+def log_expectations(trace_id: str, values: dict) -> None:
+    """期待回答、期待Evidence、期待拒否を独立Expectationとして保存する。"""
+    source = human_source()
+    for name in (
+        "expected_response",
+        "expected_document_ids",
+        "expected_chunk_version_ids",
+        "expected_refused",
+        "expected_refusal_reason",
+    ):
+        mlflow.log_expectation(
+            trace_id=trace_id,
+            name=name,
+            value=values.get(name),
+            source=source,
+        )
+
+
+def main() -> None:
+    """対象Traceへ回答品質Feedback、Rationale、Expectationを登録する。"""
+    trace_id = os.environ["POC_TRACE_ID"]
+    assessment = json.loads(os.environ["POC_ASSESSMENT_JSON"])
+    mlflow.log_feedback(
+        trace_id=trace_id,
+        name="internal_rag_quality",
+        value=assessment["answer_quality"],
+        rationale=assessment["rationale"],
+        source=human_source(),
+        metadata={"criteria_version": "poc-v1"},
+    )
+    log_expectations(trace_id=trace_id, values=assessment)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**想定出力サンプル（Traceへ追加されるAssessment）**
+
+| `name` | 種類 | `value` | `source_type` | `rationale` |
+| --- | --- | --- | --- | --- |
+| `internal_rag_quality` | Feedback | `yes` | `HUMAN` | `期待文書を根拠に簡潔に回答している` |
+| `expected_response` | Expectation | `Databricks AI Searchを利用する。` | `HUMAN` | なし |
+| `expected_document_ids` | Expectation | `["DOC-RAG-001"]` | `HUMAN` | なし |
+| `expected_chunk_version_ids` | Expectation | `["chunk-01a9..."]` | `HUMAN` | なし |
+| `expected_refused` | Expectation | `false` | `HUMAN` | なし |
+| `expected_refusal_reason` | Expectation | `null` | `HUMAN` | なし |
+
+Feedbackは「今回の実績がよかったか」、Expectationは「同じ入力で何を正解とするか」であり、同じAssessmentとして一列に潰さない。
+
+PoCで収集する最小Assessmentは、`internal_rag_quality` Feedback、`expected_response`、`expected_document_ids`、`expected_chunk_version_ids`、`expected_refused`、`expected_refusal_reason`、Rationaleである。PoCではJudge Alignment、Review Queue自動配送、定期Labeling Sessionを必須にしない。ただし、同名のJudge Feedbackと人間Feedbackが十分に集まり、そのJudgeをPilotのRelease Gateに使うなら、PoC後半またはPilot中にAlignmentと独立Validationを実施する。
+
+#### 3.2.7 PoC監視・記録基盤
+
+3.3の運用は、人が思い出したときにUIを確認するだけでは成立しない。PoC開始前に、Triggerを受けて異常を検知し、担当者へ通知し、Quality Caseを重複なく登録し、再評価Evidenceを伴ってCloseする最小基盤を構築する。
+
+```mermaid
+flowchart TD
+    A["Trigger<br/>Run・Threshold・Change・Feedback・Security"] --> B["検知<br/>Notification・Event Log・SQL Alert・Scorer"]
+    B --> C["可視化<br/>Jobs / Pipeline / MLflow UI・AI/BI Dashboard"]
+    B --> D{"即時対応が必要か"}
+    D -->|Critical / Error| E["Email / System Destinationへ通知"]
+    D -->|Warning / Info| F["Dashboard・日次Subscription"]
+    E --> G["poc_quality_casesへ冪等登録"]
+    F --> G
+    G --> H["Primary Ownerを割当・Acknowledge"]
+    H --> I["Trace・Assessment・Runを使って原因診断"]
+    I --> J["Issueを修正・固定Caseで再評価"]
+    J --> K{"採用判断"}
+    K -->|採用| L["validated_run_idとDecisionを保存"]
+    K -->|却下・Risk受容| M["理由と承認者をDecision Logへ保存"]
+    L --> N["Close承認"]
+    M --> N
+```
+
+Trigger種別は次の共通Enumで固定する。`RUN_EVENT`は実行Event、`SCHEDULE`は時刻による定期起動であり、「Pipeline実行ごと」を曖昧な頻度として記載しない。
+
+| Trigger種別 | 発火例 | 主な検知手段 |
+| --- | --- | --- |
+| `RUN_EVENT` | Job／Task／Pipeline／Evaluationの開始、成功、失敗、Timeout | Lakeflow Jobs Notification、Pipeline Event Log、MLflow Evaluation Run |
+| `THRESHOLD` | Error率、Latency、Cost、0件率、低品質率、Case滞留の上限超過 | Databricks SQL Alert v2、Monitoring Query |
+| `SCHEDULE` | 日次Review、週次品質会議、月次Cost確認 | Lakeflow Job Schedule、Dashboard Schedule／Subscription |
+| `CHANGE` | Git、Prompt、Model、Index、Chunk、Judge Version変更 | Release Manifest、Deploy Job、MLflow Trace Tag |
+| `USER_FEEDBACK` | 👎、Comment、業務担当者Feedback | MLflow Assessment、User Feedback API |
+| `JUDGE_FEEDBACK` | Scorer／Judge Fail、低Score、人間不一致 | MLflow Evaluation／Production Monitoring |
+| `SECURITY_EVENT` | ACL越境、Secret／個人情報露出、Masking違反 | 決定論的Security Scorer、Audit／Security Query、手動Trace Review |
+| `MANUAL_REVIEW` | Testerが誤回答、誤拒否、Citation不一致を発見 | MLflow Trace UI、Review App |
+| `LIFECYCLE_EVENT` | 文書追加、改訂、失効、削除、公開Pointer切替 | Manifest Audit Event、Pipeline／Search Sync Run |
+
+Dashboard、Alert、Subscriptionは用途を分離する。
+
+| 仕組み | Push／Pull | 用途 | PoCでの方針 |
+| --- | --- | --- | --- |
+| AI/BI Dashboard | Pull | 成功率、処理時間、Error分布、Layer件数、評価比較、品質Slice、Latency／Token／Cost、Case滞留を分析する | PoC実施中と終了時に担当者が確認する。正常系と傾向を可視化する |
+| Databricks SQL Alert v2 | Push | 閾値超過、未知Error、重大品質違反、Case SLA超過など、対応が必要なQuery結果を通知する | Critical／Errorを中心に限定し、Warningを無条件通知しない |
+| Lakeflow Jobs Notification | Push | Start、Success、Failure、Duration Warning、Streaming Backlog Eventを通知する | FailureとDuration Warningを必須とし、Start／SuccessはRun Log中心にする |
+| Dashboard Schedule／Subscription | 定期Push | 日次・週次SnapshotをEmail、Slack、Teamsへ共有する | 即時障害通知の代用にせず、日次Review Reminderとして使う |
+
+2026年8月時点の公式仕様との対応は次のとおりである。Preview機能は利用可能性をWorkspaceで確認し、使えない場合はGA機能または明示的な手運用へFallbackする。
+
+| 公式機能 | 採用箇所 | Status／注意 |
+| --- | --- | --- |
+| Lakeflow Jobs Notification | Job／Task失敗、Duration Warning、必要時のStreaming Backlog | Start／Success／Failure／Duration Warningは公式機能。Streaming Backlog通知はPublic Preview |
+| Pipeline Event Log／Expectations | Pipeline状態、Expectation違反、処理時間、Error | Event LogをUCへ公開し、直接Tableを共有せずViewを公開する |
+| `system.lakeflow.job_run_timeline`／`job_task_run_timeline` | Run／Taskの履歴、所要時間、失敗傾向 | 365日保持のSystem Table。利用にはSystem Schemaの`SELECT`が必要 |
+| `system.lakeflow.pipeline_update_timeline` | Pipeline Update履歴 | Public Preview、365日保持。PoCでは公開Event LogをPrimaryにする |
+| Databricks SQL Alert v2 | Error率、Open Critical Case、SLA超過 | DAB `resources.alerts`はCLI 0.279.0以降。Alert HistoryとCase IDを関連付ける |
+| AI/BI Dashboard | 運用・品質・Case Backlogの可視化 | DAB `resources.dashboards`で管理可能。生成済み`.lvdash.json`をGit管理する |
+| Dashboard Schedule／Subscription | 日次・週次Snapshot | Schedule／SubscriberはWorkspace UIまたは公式APIでBootstrapし、DABに架空Fieldを作らない。Teams宛SubscriptionはPublic Preview |
+| MLflow Tracing／Evaluation／Assessment／Review App | RAG Evidence、評価、Feedback／Expectation | TraceをWorkflow DBにせず、Case Tableから参照する |
+| MLflow Production Monitoring | 本番TraceのSampling Scorer | Beta。PoCではオフラインEvaluationをPrimaryとし、本番導入時にDry Runする |
+| `system.ai_gateway.usage` | Request、Token、Latency、Routeの集計 | 既定でAccount AdminとMetastore Adminだけが参照できる。監視用Viewへ最小列だけ公開する |
+| `system.billing.usage` | Databricks利用量とCost集計 | 365日保持。Correctionの`RETRACTION`／`RESTATEMENT`を合算して扱う |
+
+PoCのSeverityと通知方針は次のとおりである。
+
+| Severity | 例 | 通知方針 | Acknowledge目標 |
+| --- | --- | --- | --- |
+| `Critical` | ACL越境、Secret露出、未承認文書公開 | PoC利用停止、PoC OwnerとSecurity担当へ即時通知 | PoC実施時間内に15分 |
+| `Error` | Pipeline失敗、Evaluation Gate失敗、Index同期失敗 | PoC実施時間内にEmailまたはSystem Destinationへ通知 | 30分 |
+| `Warning` | Error率上昇、Latency／Cost超過、Judge不一致 | Dashboard＋日次Review。継続または影響大の場合だけ通知 | 当日Reviewまで |
+| `Info` | 正常Run、件数、通常品質推移 | Dashboard／Run Logのみ | Acknowledge不要 |
+
+##### 3.2.7.1 PoC運用Tableを作成する
+
+Sample台帳、件数照合表、Quarantine台帳、Dataset候補一覧、変更記録、試用記録を別々に作らず、実行Evidenceは`poc_run_log`、問題Lifecycleは`poc_quality_cases`、判断は`poc_decision_log`へ統合する。質問全文、Chunk全文、Token、Email、署名付きURLは保存せず、Trace ID、Document Version ID、Mask済み参照だけを保持する。
+
+`poc/src/create_poc_operational_tables.sql`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | PoC Monitoring Jobの実行Identity |
+| Trigger | 初回DeployおよびSchema Migration |
+| 入力 | Catalog／Schema、承認済みSchema Version |
+| 出力 | `poc_run_log`、`poc_quality_cases`、`poc_decision_log` |
+| Data Source | Lakeflow Run、MLflow Run／Trace／Assessmentへの参照 |
+| 通知先 | DDL失敗時のみPoC運用Group |
+| 記録先 | Unity Catalog Delta Table |
+| 正常終了時 | 3 Tableと制約が存在する |
+| 失敗時 | PoC開始を保留し、Migration Runを失敗させる |
+| 再実行時 | `CREATE TABLE IF NOT EXISTS`とVersion管理されたMigrationで冪等にする |
+| Security | 原文・Chunk・PII・Credentialを複製しない |
+| 権限 | Monitoring Jobに`MODIFY`、Reviewerに必要Viewの`SELECT`だけ付与する |
+| Retention | PoC終了後に監査要件で定めた期間保持し、削除は承認制にする |
+| ファイルパス | `poc/src/create_poc_operational_tables.sql` |
+
+```sql
+-- PoCのPipeline／Evaluation実行を1行ずつ記録する実行台帳を作成する。
+CREATE TABLE IF NOT EXISTS main.llmops_poc.poc_run_log (
+  run_log_id STRING NOT NULL,
+  trigger_type STRING NOT NULL,
+  trigger_id STRING NOT NULL,
+  run_kind STRING NOT NULL,
+  job_id STRING,
+  job_run_id STRING,
+  task_run_id STRING,
+  pipeline_id STRING,
+  pipeline_update_id STRING,
+  evaluation_run_id STRING,
+  status STRING NOT NULL,
+  source_sample_set_id STRING,
+  rag_release_id STRING,
+  git_commit STRING,
+  prompt_version STRING,
+  model_route STRING,
+  index_release_id STRING,
+  bronze_count BIGINT,
+  silver_count BIGINT,
+  gold_count BIGINT,
+  parse_error_count BIGINT,
+  prep_error_count BIGINT,
+  quarantine_count BIGINT,
+  metric_values MAP<STRING, DOUBLE>,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP,
+  recorded_by STRING NOT NULL,
+  recorded_at TIMESTAMP NOT NULL
+) USING DELTA
+COMMENT 'PoCのPipeline、Job、Evaluation Runと件数照合結果を管理する正本。原文書や質問本文は保存しない。';
+
+-- 検知から再評価・Closeまでを管理するPoC Quality Caseの正本を作成する。
+CREATE TABLE IF NOT EXISTS main.llmops_poc.poc_quality_cases (
+  quality_case_id STRING NOT NULL,
+  dedup_key STRING NOT NULL,
+  detected_at TIMESTAMP NOT NULL,
+  detected_by STRING NOT NULL,
+  trigger_type STRING NOT NULL,
+  trigger_id STRING NOT NULL,
+  alert_id STRING,
+  alert_history_url STRING,
+  severity STRING NOT NULL,
+  pipeline_run_id STRING,
+  evaluation_run_id STRING,
+  trace_id STRING,
+  case_family_id STRING,
+  rag_release_id STRING,
+  git_commit STRING,
+  prompt_version STRING,
+  model_route STRING,
+  index_release_id STRING,
+  document_version_ids ARRAY<STRING>,
+  proposed_root_cause STRING,
+  confirmed_root_cause STRING,
+  secondary_causes ARRAY<STRING>,
+  root_cause_rationale STRING,
+  improvement_target STRING,
+  owner STRING,
+  secondary_owner STRING,
+  status STRING NOT NULL,
+  acknowledged_at TIMESTAMP,
+  investigation_started_at TIMESTAMP,
+  linked_issue_id STRING,
+  evaluation_dataset_record_id STRING,
+  resolution STRING,
+  validated_run_id STRING,
+  decision_id STRING,
+  close_approved_by STRING,
+  created_by STRING NOT NULL,
+  diagnosed_by STRING,
+  closed_by STRING,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL,
+  closed_at TIMESTAMP,
+  CONSTRAINT poc_quality_case_trigger_type
+    CHECK (trigger_type IN ('RUN_EVENT', 'THRESHOLD', 'SCHEDULE', 'CHANGE', 'USER_FEEDBACK', 'JUDGE_FEEDBACK', 'SECURITY_EVENT', 'MANUAL_REVIEW', 'LIFECYCLE_EVENT')),
+  CONSTRAINT poc_quality_case_severity
+    CHECK (severity IN ('Critical', 'Error', 'Warning', 'Info')),
+  CONSTRAINT poc_quality_case_status
+    CHECK (status IN ('detected', 'triaged', 'diagnosed', 'assigned', 'fixing', 'ready_for_validation', 'validated', 'closed', 'duplicate', 'rejected', 'accepted_risk', 'blocked'))
+) USING DELTA
+COMMENT 'PoC品質問題の検知、担当、原因、修正、再評価、Closeを管理するWorkflow正本。Evidence本体はTrace等を参照する。';
+
+-- 採用、却下、Risk受容、Go／No-Go、閾値変更を記録する判断台帳を作成する。
+CREATE TABLE IF NOT EXISTS main.llmops_poc.poc_decision_log (
+  decision_id STRING NOT NULL,
+  decision_type STRING NOT NULL,
+  subject_type STRING NOT NULL,
+  subject_id STRING NOT NULL,
+  decision STRING NOT NULL,
+  rationale STRING NOT NULL,
+  evidence_refs ARRAY<STRING> NOT NULL,
+  threshold_policy_version STRING,
+  previous_value STRING,
+  new_value STRING,
+  effective_from TIMESTAMP,
+  decided_by STRING NOT NULL,
+  approved_by STRING,
+  decided_at TIMESTAMP NOT NULL
+) USING DELTA
+COMMENT 'PoCの採否、例外、Risk、Go／No-Go、監視閾値変更の監査証跡。';
+
+-- Metric閾値をSource Codeへ分散させず、Versionと有効期間で管理する。
+CREATE TABLE IF NOT EXISTS main.llmops_poc.poc_monitoring_thresholds (
+  policy_version STRING NOT NULL,
+  metric_name STRING NOT NULL,
+  warning_threshold DOUBLE,
+  error_threshold DOUBLE,
+  critical_threshold DOUBLE,
+  comparison_operator STRING NOT NULL,
+  effective_from TIMESTAMP NOT NULL,
+  effective_to TIMESTAMP,
+  changed_by STRING NOT NULL,
+  decision_id STRING NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+) USING DELTA
+COMMENT 'PoC監視閾値のVersion付き正本。変更理由と承認はpoc_decision_logを参照する。';
+```
+
+**想定出力サンプル**
+
+| `quality_case_id` | `trigger_type` | `severity` | `proposed_root_cause` | `confirmed_root_cause` | `owner` | `status` | `validated_run_id` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `qc-7c2f...` | `THRESHOLD` | `Error` | `PARSE` | `PARSE` | `poc-data-eng` | `diagnosed` | `NULL` |
+| `qc-a031...` | `USER_FEEDBACK` | `Warning` | `ANSWER_PROMPT` | `NULL` | `poc-llmops` | `triaged` | `NULL` |
+| `qc-f99d...` | `SECURITY_EVENT` | `Critical` | `ACL` | `ACL` | `poc-security` | `validated` | `eval-sec-1042` |
+
+##### 3.2.7.2 PoC監視Viewを作成する
+
+DashboardとAlertは、生のEvent Log、System Table、各Layer Tableを個別に解釈せず、監視用Viewだけを参照する。Event LogはPipeline設定で`main.llmops_poc.poc_pipeline_event_log`へ公開済みとし、監視利用者へはViewだけを共有する。
+
+`poc/src/create_poc_monitoring_views.sql`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | PoC Monitoring Job |
+| Trigger | 初回Deploy、監視Query変更時 |
+| 入力 | 公開Pipeline Event Log、PoC Layer／Error Table、Quality Case、System Tables |
+| 出力 | Dashboard／Alert用View |
+| Data Source | Event Log、`system.lakeflow.*`、PoC Delta Table |
+| 通知先 | View作成失敗時のみPoC運用Group |
+| 記録先 | Unity Catalog View、Job Run |
+| 正常終了時 | 監視IdentityがViewをQueryできる |
+| 失敗時 | Dashboard／Alertを有効化せず権限とSchemaを修正する |
+| 再実行時 | `CREATE OR REPLACE VIEW`で定義を置換する |
+| Security | Event LogのError本文をDashboardへ直接公開せず、分類・件数中心にする |
+| 権限 | System Table参照は専用監視Identityに限定し、Viewへ必要列だけ公開する |
+| Retention | 元System Tableは公式保持期間、PoC Tableは組織Policyに従う |
+| ファイルパス | `poc/src/create_poc_monitoring_views.sql` |
+
+```sql
+-- Pipeline UIと同じEventをSQLで確認するため、公開Event Logの必要列だけをView化する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_pipeline_event_log_v AS
+SELECT
+  timestamp AS event_time,
+  event_type,
+  level,
+  origin.pipeline_id AS pipeline_id,
+  origin.update_id AS pipeline_update_id,
+  origin.flow_name AS flow_name,
+  message,
+  error,
+  details
+FROM main.llmops_poc.poc_pipeline_event_log;
+
+-- Expectationごとの成功・失敗件数をDashboardとAlertが集計できる粒度へ展開する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_expectation_metrics_v AS
+WITH expectation_events AS (
+  SELECT
+    event_time,
+    pipeline_id,
+    pipeline_update_id,
+    EXPLODE(
+      FROM_JSON(
+        GET_JSON_OBJECT(details, '$.flow_progress.data_quality.expectations'),
+        'array<struct<name:string,dataset:string,passed_records:bigint,failed_records:bigint>>'
+      )
+    ) AS expectation
+  FROM main.llmops_poc.poc_pipeline_event_log_v
+  WHERE event_type = 'flow_progress'
+    AND GET_JSON_OBJECT(details, '$.flow_progress.data_quality.expectations') IS NOT NULL
+)
+SELECT
+  event_time,
+  pipeline_id,
+  pipeline_update_id,
+  expectation.dataset AS dataset_name,
+  expectation.name AS expectation_name,
+  expectation.passed_records,
+  expectation.failed_records,
+  expectation.failed_records / NULLIF(expectation.passed_records + expectation.failed_records, 0) AS failure_rate
+FROM expectation_events;
+
+-- Bronze／Silver／GoldとError Tableの現在件数を同じSchemaで可視化する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_layer_counts_v AS
+SELECT CURRENT_TIMESTAMP() AS observed_at, 'bronze' AS layer, COUNT(*) AS row_count FROM main.llmops_poc.poc_documents_bronze
+UNION ALL
+SELECT CURRENT_TIMESTAMP(), 'silver_chunks', COUNT(*) FROM main.llmops_poc.poc_chunks_silver
+UNION ALL
+SELECT CURRENT_TIMESTAMP(), 'gold_chunks', COUNT(*) FROM main.llmops_poc.poc_chunks_gold
+UNION ALL
+SELECT CURRENT_TIMESTAMP(), 'parse_errors', COUNT(*) FROM main.llmops_poc.poc_parse_errors
+UNION ALL
+SELECT CURRENT_TIMESTAMP(), 'prep_errors', COUNT(*) FROM main.llmops_poc.poc_prep_errors;
+
+-- Parse／Prep Errorを文書形式・Error分類・処理Versionで比較できる形へ統合する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_error_metrics_v AS
+SELECT
+  'PARSE' AS stage,
+  document_version_id,
+  source_extension,
+  error_message,
+  processor_version,
+  occurred_at AS detected_at
+FROM main.llmops_poc.poc_parse_errors
+UNION ALL
+SELECT
+  'PREP' AS stage,
+  document_version_id,
+  source_extension,
+  error_message,
+  processor_version,
+  occurred_at AS detected_at
+FROM main.llmops_poc.poc_prep_errors;
+
+-- Open CaseのSeverity、Owner、滞留時間をDashboardとSLA Alertへ公開する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_open_quality_cases_v AS
+SELECT
+  quality_case_id,
+  trigger_type,
+  severity,
+  proposed_root_cause,
+  confirmed_root_cause,
+  improvement_target,
+  owner,
+  status,
+  detected_at,
+  TIMESTAMPDIFF(HOUR, detected_at, CURRENT_TIMESTAMP()) AS age_hours,
+  alert_id,
+  pipeline_run_id,
+  evaluation_run_id,
+  trace_id
+FROM main.llmops_poc.poc_quality_cases
+WHERE status NOT IN ('closed', 'duplicate', 'rejected', 'accepted_risk');
+
+-- SQL Alertは個別Metricの閾値を持たず、Version付きThresholdに違反したSignalだけを参照する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_monitoring_signals_v AS
+WITH active_thresholds AS (
+  SELECT *
+  FROM main.llmops_poc.poc_monitoring_thresholds
+  WHERE effective_from <= CURRENT_TIMESTAMP()
+    AND (effective_to IS NULL OR effective_to > CURRENT_TIMESTAMP())
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY metric_name ORDER BY effective_from DESC) = 1
+), metrics AS (
+  SELECT
+    'open_critical_cases' AS metric_name,
+    CAST(COUNT_IF(severity = 'Critical') AS DOUBLE) AS metric_value,
+    CURRENT_TIMESTAMP() AS observed_at
+  FROM main.llmops_poc.poc_open_quality_cases_v
+  UNION ALL
+  SELECT
+    'open_error_cases',
+    CAST(COUNT_IF(severity = 'Error') AS DOUBLE),
+    CURRENT_TIMESTAMP()
+  FROM main.llmops_poc.poc_open_quality_cases_v
+  UNION ALL
+  SELECT
+    'expectation_failure_rate',
+    COALESCE(MAX(failure_rate), 0D),
+    CURRENT_TIMESTAMP()
+  FROM main.llmops_poc.poc_expectation_metrics_v
+  WHERE event_time >= CURRENT_TIMESTAMP() - INTERVAL 1 DAY
+  UNION ALL
+  SELECT
+    'quality_case_sla_hours',
+    COALESCE(MAX(age_hours), 0D),
+    CURRENT_TIMESTAMP()
+  FROM main.llmops_poc.poc_open_quality_cases_v
+)
+SELECT
+  m.metric_name,
+  m.metric_value,
+  m.observed_at,
+  t.policy_version,
+  CASE
+    WHEN t.critical_threshold IS NOT NULL AND m.metric_value > t.critical_threshold THEN 'Critical'
+    WHEN t.error_threshold IS NOT NULL AND m.metric_value > t.error_threshold THEN 'Error'
+    WHEN t.warning_threshold IS NOT NULL AND m.metric_value > t.warning_threshold THEN 'Warning'
+    ELSE 'Info'
+  END AS severity
+FROM metrics AS m
+JOIN active_thresholds AS t USING (metric_name);
+
+-- Job／TaskのRun Eventを365日保持のSystem Tableから監視する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_job_run_timeline_v AS
+SELECT
+  workspace_id,
+  job_id,
+  run_id,
+  run_type,
+  result_state,
+  MIN(period_start_time) AS started_at,
+  MAX(period_end_time) AS ended_at,
+  CAST(SUM(period_end_time - period_start_time) AS LONG) AS duration_seconds
+FROM system.lakeflow.job_run_timeline
+WHERE period_start_time >= CURRENT_TIMESTAMP() - INTERVAL 30 DAYS
+GROUP BY workspace_id, job_id, run_id, run_type, result_state;
+
+-- Pipeline Update System TableはPublic Previewのため、公開Event Logとの照合用に限定する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_pipeline_update_timeline_v AS
+SELECT
+  workspace_id,
+  pipeline_id,
+  update_id,
+  trigger_type,
+  result_state,
+  MIN(period_start_time) AS started_at,
+  MAX(period_end_time) AS ended_at,
+  CAST(SUM(period_end_time - period_start_time) AS LONG) AS duration_seconds
+FROM system.lakeflow.pipeline_update_timeline
+WHERE period_start_time >= CURRENT_TIMESTAMP() - INTERVAL 30 DAYS
+GROUP BY workspace_id, pipeline_id, update_id, trigger_type, result_state;
+
+-- 本番Model ServiceのRequest、Token、Latency、Routeを必要列だけへ制限して公開する。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_ai_gateway_usage_v AS
+SELECT
+  event_time,
+  request_id,
+  endpoint_name,
+  destination_name,
+  status_code,
+  latency_ms,
+  input_tokens,
+  output_tokens
+FROM system.ai_gateway.usage
+WHERE event_time >= CURRENT_TIMESTAMP() - INTERVAL 30 DAYS;
+
+-- Job／AI Functions／Apps等の利用量を日次集計し、Cost傾向のDashboard入力にする。
+CREATE OR REPLACE VIEW main.llmops_poc.poc_daily_billable_usage_v AS
+SELECT
+  usage_date,
+  billing_origin_product,
+  sku_name,
+  SUM(usage_quantity) AS usage_quantity,
+  usage_unit
+FROM system.billing.usage
+WHERE usage_date >= CURRENT_DATE() - INTERVAL 30 DAYS
+GROUP BY usage_date, billing_origin_product, sku_name, usage_unit
+HAVING SUM(usage_quantity) <> 0;
+```
+
+`system.ai_gateway.usage`は既定でAccount AdminとMetastore Adminだけが参照でき、それ以外のPrincipalにはSystem Schemaへの明示Grantが必要である。PoC担当者へSystem Tableを直接開放せず、Platform管理者が最小列Viewを作成して`SELECT`だけを付与する。利用できないWorkspaceでは、MLflow TraceのUsageとModel Serving UIを代替Data Sourceとして明記する。
+
+##### 3.2.7.3 Monitoring ThresholdをVersion管理する
+
+`poc/ops/poc_monitoring_thresholds.yml`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | PoC Monitoring Job |
+| Trigger | 初回Deploy、承認済み閾値変更 |
+| 入力 | Git管理YAML、Decision ID |
+| 出力 | `poc_monitoring_thresholds`の有効Version |
+| Data Source | 品質基準、PoC SLO、Cost上限 |
+| 通知先 | 不正Schemaまたは未承認Decision時はPoC Owner |
+| 記録先 | Threshold Table、Decision Log、Git |
+| 正常終了時 | 同一Metricに有効Versionが1件だけ存在する |
+| 失敗時 | 旧Versionを維持し、新閾値を適用しない |
+| 再実行時 | `policy_version + metric_name`で冪等MERGEする |
+| Security | 通知先URLやCredentialを含めない |
+| 権限 | Quality担当者が変更申請し、PoC OwnerがDecisionを承認する |
+| Retention | 全VersionをPoC監査期間保持する |
+| ファイルパス | `poc/ops/poc_monitoring_thresholds.yml` |
+
+```yaml
+# 監視Policy全体の不変Versionを定義する。
+policy_version: poc-monitoring-v1
+# このVersionを適用開始する時刻をUTCで定義する。
+effective_from: "2026-08-15T00:00:00Z"
+# 閾値変更を承認したDecision LogのIDを指定する。
+decision_id: decision-poc-monitoring-v1
+# 各MetricのWarning／Error／Critical閾値を定義する。
+metrics:
+  # Open Critical Caseは1件でも即時停止対象にする。
+  open_critical_cases:
+    # 比較方法は現在値が閾値を超えたかで判定する。
+    comparison_operator: GREATER_THAN
+    # Critical Caseが0件を超えた時点でCriticalにする。
+    critical_threshold: 0
+  # Open Error CaseはPoC実施時間内の対応対象にする。
+  open_error_cases:
+    # 比較方法は現在値が閾値を超えたかで判定する。
+    comparison_operator: GREATER_THAN
+    # Error Caseが0件を超えた時点でErrorにする。
+    error_threshold: 0
+  # Pipeline Expectation失敗率を品質劣化のSignalにする。
+  expectation_failure_rate:
+    # 比較方法は失敗率が閾値を超えたかで判定する。
+    comparison_operator: GREATER_THAN
+    # 1%超はDashboardで確認するWarningにする。
+    warning_threshold: 0.01
+    # 5%超はPoC実施時間内に通知するErrorにする。
+    error_threshold: 0.05
+  # Open Quality Caseの最長滞留時間をSLAとして監視する。
+  quality_case_sla_hours:
+    # 比較方法は滞留時間が閾値を超えたかで判定する。
+    comparison_operator: GREATER_THAN
+    # 8時間超は日次Reviewで確認するWarningにする。
+    warning_threshold: 8
+    # 24時間超はPoC Ownerへ通知するErrorにする。
+    error_threshold: 24
+```
+
+閾値を変える場合は、YAML変更だけでなく`poc_decision_log`へ変更理由、旧値、新値、適用開始時刻、承認者を保存する。Alertを静かにする目的だけの引上げは認めない。
+
+##### 3.2.7.4 Pipeline／監視Job Notificationを構築する
+
+Pipelineを直接手動更新するだけではJob Notificationを設定できないため、Pipeline Taskを持つLakeflow JobをPoCの標準起動経路にする。Job／Task FailureとDuration WarningはPush通知し、Start／Successは`poc_run_log`とJobs UIで確認する。System DestinationはWorkspace Adminが事前作成し、IDだけをBundle変数で注入する。
+
+`poc/resources/poc_monitoring_job.yml`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | PoC実行Identity |
+| Trigger | 手動／APIのPipeline Run、日次18時の監視トリアージ |
+| 入力 | Pipeline Resource、監視SQL／Python、Threshold YAML |
+| 出力 | Pipeline Run、監視View更新、Quality Case候補 |
+| Data Source | Jobs Event、Pipeline Event Log、MLflow／PoC Table |
+| 通知先 | `${var.poc_ops_email}`、`${var.ops_system_destination_id}` |
+| 記録先 | Jobs Run、`poc_run_log`、`poc_quality_cases` |
+| 正常終了時 | Run IDと結果を記録し、正常通知は抑制する |
+| 失敗時 | Failure／Duration WarningをPushし、Case候補を作る |
+| 再実行時 | 新Run IDで実行し、Trigger IDによるCase重複を防ぐ |
+| Security | Email／Webhook URLをSourceへ埋め込まない |
+| 権限 | Jobの`CAN_MANAGE_RUN`とSystem Destination管理権限を分離する |
+| Retention | Jobs System Table 365日、PoC台帳は組織Policyに従う |
+| ファイルパス | `poc/resources/poc_monitoring_job.yml` |
+
+```yaml
+# PoC Pipelineの標準起動経路と通知を定義する。
+resources:
+  # Pipeline実行と監視トリアージをLakeflow Jobsとして定義する。
+  jobs:
+    # Pipeline更新を起動し、Run Eventを通知可能にするJobを定義する。
+    poc_pipeline_job:
+      # Jobs UIに表示する名前を設定する。
+      name: internal-docs-rag-poc-pipeline
+      # 長時間化を検知するJob Health Ruleを定義する。
+      health:
+        # 評価するHealth Ruleを列挙する。
+        rules:
+          # Run時間が30分を超えた場合にDuration Warningを発火する。
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 1800
+      # Email通知は管理されたGroup MailをBundle変数から注入する。
+      email_notifications:
+        # Job失敗時だけEmail通知する。
+        on_failure:
+          - ${var.poc_ops_email}
+        # Health RuleのDuration Warning発火時にEmail通知する。
+        on_duration_warning_threshold_exceeded:
+          - ${var.poc_ops_email}
+      # Slack／Teams／PagerDuty／Webhookは管理者作成済みSystem Destinationを使う。
+      webhook_notifications:
+        # Job失敗EventをSystem Destinationへ送る。
+        on_failure:
+          - id: ${var.ops_system_destination_id}
+        # Duration Warning EventをSystem Destinationへ送る。
+        on_duration_warning_threshold_exceeded:
+          - id: ${var.ops_system_destination_id}
+      # Cancel／SkipをFailure通知へ含めるか明示する。
+      notification_settings:
+        # PoC Ownerが明示CancelしたRunはFailure通知しない。
+        no_alert_for_canceled_runs: true
+        # Resource競合等でSkipされたRunは見落とさない。
+        no_alert_for_skipped_runs: false
+      # Pipeline更新を実行するTaskを定義する。
+      tasks:
+        # Pipeline Taskの安定Keyを設定する。
+        - task_key: run_poc_pipeline
+          # DABで作成したPipeline IDを参照する。
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.poc_document_pipeline.id}
+
+    # Open Case、Threshold、未入力Assessmentを日次集計するJobを定義する。
+    poc_monitoring_job:
+      # Jobs UIに表示する名前を設定する。
+      name: internal-docs-rag-poc-monitoring
+      # PoC実施時間帯に10分間隔でトリアージするScheduleを設定する。
+      schedule:
+        # 平日9時から18時台まで10分間隔で起動するQuartz Cronを設定する。
+        quartz_cron_expression: "0 0/10 9-18 ? * MON-FRI *"
+        # 日本時間でScheduleを解釈する。
+        timezone_id: Asia/Tokyo
+        # PoC期間外はDeploy変数またはUIでPauseする。
+        pause_status: UNPAUSED
+      # Monitoring Job自体の失敗だけを通知する。
+      email_notifications:
+        # 失敗時のGroup Mailを設定する。
+        on_failure:
+          - ${var.poc_ops_email}
+      # Monitoring Jobで実行するTaskを定義する。
+      tasks:
+        # Threshold同期とQuality Case作成を実行する。
+        - task_key: triage_poc_quality_cases
+          # Git管理Python FileをServerless Python Taskとして実行する。
+          spark_python_task:
+            # Quality Case候補を冪等登録するSource Fileを指定する。
+            python_file: ../src/triage_poc_quality_cases.py
+            # Threshold YAMLのWorkspace配置Pathを引数で渡す。
+            parameters:
+              - --threshold-config
+              - ${workspace.file_path}/ops/poc_monitoring_thresholds.yml
+          # Serverless Python Environmentを参照する。
+          environment_key: default
+      # Serverless Python TaskのDependencyを固定する。
+      environments:
+        # Taskから参照するEnvironment Keyを定義する。
+        - environment_key: default
+          # Python実行環境の仕様を定義する。
+          spec:
+            # Serverless Environment Versionを固定する。
+            environment_version: "4"
+            # 外部DependencyをVersion固定する。
+            dependencies:
+              - pyyaml==6.0.2
+```
+
+Streaming Backlog通知はPublic Previewであり、本PoCのTriggered Pipelineでは必須にしない。Continuous Streamを採用する場合だけ、`STREAMING_BACKLOG_*` Health Ruleと`on_streaming_backlog_exceeded`を追加し、10分平均と30分再通知の公式挙動をRunbookへ記載する。
+
+##### 3.2.7.5 PoC SQL Alertを構築する
+
+SQL Alertは全Metricを通知せず、`Critical`／`Error`のOpen CaseまたはSecurity Signalだけを対象にする。WarningはDashboardと日次Reviewへ残す。Alert HistoryとQuality Caseを相互参照できるよう、Query結果へ代表Case IDを含める。
+
+`poc/resources/poc_alerts.yml`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | SQL Alert v2の`run_as` Identity |
+| Trigger | 10分ScheduleによるQuery評価 |
+| 入力 | `poc_open_quality_cases_v`、`poc_monitoring_signals_v` |
+| 出力 | Alert State、Alert History、Notification |
+| Data Source | Unity Catalog監視View |
+| 通知先 | `${var.ops_system_destination_id}` |
+| 記録先 | Databricks SQL Alert History、Quality Caseの`alert_id`／`alert_history_url` |
+| 正常終了時 | 0件なら通知せず、既存Alertが回復した場合だけOK通知する |
+| 失敗時 | Alert Query失敗を運用GroupへEscalateし、Dashboardで代替確認する |
+| 再実行時 | `retrigger_seconds`で30分抑止し、同じCaseの通知洪水を防ぐ |
+| Security | 通知本文へ質問・Chunk・機密Error本文を含めない |
+| 権限 | Alert管理者と閲覧者を分離し、Query用Viewだけ`SELECT`許可する |
+| Retention | Alert HistoryはWorkspace設定、Case参照はPoC監査期間保持する |
+| ファイルパス | `poc/resources/poc_alerts.yml` |
+
+```yaml
+# Databricks CLI 0.279.0以降のSQL Alert v2 Resourceを定義する。
+resources:
+  # Bundleで管理するAlertを定義する。
+  alerts:
+    # Critical／ErrorのOpen Quality Caseを通知するAlertを定義する。
+    poc_actionable_quality_cases:
+      # SQL Alert UIに表示する名前を設定する。
+      display_name: internal-docs-rag-poc-actionable-quality-cases
+      # 通知で表示する概要を設定する。機密本文は含めない。
+      custom_summary: "PoC Quality Caseに対応が必要です"
+      # Alert HistoryからCaseへ遷移するための説明を設定する。
+      custom_description: "AI/BI Dashboardでrepresentative_case_idを確認し、担当を割り当ててください。"
+      # Alert評価Queryを定義する。
+      query_text: |
+        SELECT
+          COUNT(*) AS actionable_count,
+          MAX(quality_case_id) AS representative_case_id,
+          MAX(severity) AS highest_severity,
+          MIN(detected_at) AS oldest_detected_at
+        FROM main.llmops_poc.poc_open_quality_cases_v
+        WHERE severity IN ('Critical', 'Error')
+      # Query実行に利用するSQL WarehouseをBundle変数で指定する。
+      warehouse_id: ${var.sql_warehouse_id}
+      # Alert Queryを評価するScheduleを設定する。
+      schedule:
+        # PoC実施中は10分間隔で評価する。
+        quartz_cron_schedule: "0 0/10 * * * ?"
+        # 日本時間でScheduleを評価する。
+        timezone_id: Asia/Tokyo
+        # PoC期間中だけ有効にし、終了後はPauseする。
+        pause_status: UNPAUSED
+      # Query結果に対する発火条件と通知抑止を定義する。
+      evaluation:
+        # 対応対象Caseが0件を超えた場合に発火する。
+        comparison_operator: GREATER_THAN
+        # Query結果の評価列を指定する。
+        source:
+          # 複数行でも最大値で評価する。
+          aggregation: MAX
+          # Alert UIに表示する列名を設定する。
+          display: actionable_count
+          # Query結果の実列名を設定する。
+          name: actionable_count
+        # 発火閾値を0件に設定する。
+        threshold:
+          # 固定値との比較を定義する。
+          value:
+            # 1件以上で発火させるため0を設定する。
+            double_value: 0
+        # 通知先と再通知条件を定義する。
+        notification:
+          # 全Case解消時に回復通知を送る。
+          notify_on_ok: true
+          # 同じAlertの再通知を30分抑止する。
+          retrigger_seconds: 1800
+          # Workspace Admin作成済み通知先を指定する。
+          subscriptions:
+            # URLではなくSystem Destination IDを参照する。
+            - destination_id: ${var.ops_system_destination_id}
+```
+
+##### 3.2.7.6 PoC AI/BI Dashboardを構築する
+
+Dashboardは通知画面ではなく、担当者が傾向、Slice、Backlogを調査するPull型の入口である。DABでは`.lvdash.json`とDashboard Resourceを管理する。Schedule／SubscriptionはDeploy後にDashboard UIまたは公式APIで作成し、Schedule ID、Subscriber Group、適用時刻を`poc_decision_log`へ記録する。
+
+`poc/resources/poc_dashboard.yml`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | DashboardのQuery実行Identity |
+| Trigger | 利用者の閲覧、Dashboard Schedule、Subscription |
+| 入力 | Event Log／Layer／Error／Run／Quality Case／Usage View |
+| 出力 | AI/BI Dashboard、日次Snapshot |
+| Data Source | `main.llmops_poc`の監視View |
+| 通知先 | 日次SubscriptionのPoC Reviewer Group |
+| 記録先 | Dashboard Resource、Schedule ID、Subscription実行履歴 |
+| 正常終了時 | 最新Refresh時刻と全Widgetが表示される |
+| 失敗時 | Subscriptionを障害通知の代用にせず、SQL Alert／Job Notificationで通知する |
+| 再実行時 | DAB DeployでJSON差分を反映し、Scheduleは同じIDを更新する |
+| Security | `embed_credentials: false`を原則とし、閲覧者権限でQueryする |
+| 権限 | PoC Reviewerへ`CAN_RUN`、編集者を限定する |
+| Retention | Dashboard Snapshot添付の保管先・転送禁止をPoC Policyで定める |
+| ファイルパス | `poc/resources/poc_dashboard.yml`、`poc/dashboards/poc_operations.lvdash.json` |
+
+```yaml
+# Git管理するAI/BI Dashboard AssetをDAB Resourceとして定義する。
+resources:
+  # Bundleで管理するDashboardを定義する。
+  dashboards:
+    # PoC運用・品質Dashboardを定義する。
+    poc_operations:
+      # Dashboard一覧に表示する名前を設定する。
+      display_name: internal-docs-rag-poc-operations
+      # UIからExportしたDashboard JSONのLocal Pathを設定する。
+      file_path: ../dashboards/poc_operations.lvdash.json
+      # Dashboard Datasetの既定Catalogを設定する。
+      dataset_catalog: ${var.catalog}
+      # Dashboard Datasetの既定Schemaを設定する。
+      dataset_schema: ${var.schema}
+      # Viewer本人の権限でQueryし、過剰なCredential埋込を避ける。
+      embed_credentials: false
+      # Dashboardの閲覧・実行権限を設定する。
+      permissions:
+        # PoC Reviewer GroupへDashboard実行権限を付与する。
+        - level: CAN_RUN
+          group_name: ${var.poc_reviewer_group}
+```
+
+`.lvdash.json`はDashboard UIで次のDataset／Widgetを作成し、`databricks bundle generate dashboard --existing-id <dashboard-id>`でExportしてGit管理する。手書きの架空JSON Schemaは資料へ作らない。
+
+| Dashboard Page | Dataset／Widget | 用途 |
+| --- | --- | --- |
+| Pipeline | `poc_job_run_timeline_v`、`poc_pipeline_update_timeline_v` | 成功率、失敗、Duration、Run比較 |
+| Data Quality | `poc_expectation_metrics_v`、`poc_error_metrics_v` | Expectation失敗率、形式別Parse／Prep Error |
+| Medallion | `poc_layer_counts_v` | Bronze／Silver／Gold／Quarantine件数 |
+| Evaluation | MLflow Evaluation Runから同期したRun Log | Baseline、Prompt／Model／Index Version比較 |
+| Quality Cases | `poc_open_quality_cases_v` | Severity、状態、Owner、原因分類、滞留時間 |
+| Usage | `poc_ai_gateway_usage_v`、`poc_daily_billable_usage_v` | Latency、Token、Route、利用量、Cost傾向 |
+
+Dashboard ScheduleはPoC実施日の18時に更新し、必要ならEmail／Slack／TeamsへSnapshotを配信する。これは日次Review用であり、Failure、ACL越境、Masking違反の即時通知には使用しない。Teams SubscriptionはPublic Previewであるため、利用不可の場合はEmail SubscriptionへFallbackする。
+
+##### 3.2.7.7 SignalをPoC Quality Caseへ登録する
+
+自動処理はTrigger、Severity、`proposed_root_cause`、Primary Owner候補までを設定する。`confirmed_root_cause`はTrace、Expectation、最初に破綻したSpanを担当者が確認した後だけ入力する。同じRun／Document Version／Metric Windowから同じCaseを重複作成しない。
+
+`poc/src/triage_poc_quality_cases.py`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | PoC Monitoring Job |
+| Trigger | 10分Schedule、必要時の手動Run |
+| 入力 | Threshold YAML、Signal View、Job Run View、Error View |
+| 出力 | Threshold Version、重複排除済みQuality Case |
+| Data Source | Unity Catalog監視View |
+| 通知先 | Case登録後にSQL AlertがPoC運用Groupへ通知する |
+| 記録先 | `poc_monitoring_thresholds`、`poc_quality_cases` |
+| 正常終了時 | 新規Caseだけが`triaged`で登録される |
+| 失敗時 | 既存Caseを変更せずJobを失敗させる |
+| 再実行時 | `dedup_key`のMERGEで同一Caseを再作成しない |
+| Security | Trigger IDと参照IDだけを保存し、質問・Chunk本文を複製しない |
+| 権限 | Monitoring Jobに対象Tableの`SELECT`／`MODIFY`だけを付与する |
+| Retention | Case TableのRetention Policyに従う |
+| ファイルパス | `poc/src/triage_poc_quality_cases.py` |
+
+```python
+"""PoC監視Signalを重複排除し、担当Group付きQuality Caseへ登録する。"""
+
+import argparse
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    DoubleType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
+
+
+ROOT_CAUSE_OWNER = {
+    "DOCUMENT": "poc-document-owners",
+    "PARSE": "poc-data-engineering",
+    "PREP": "poc-data-engineering",
+    "CHUNK": "poc-data-engineering",
+    "RETRIEVAL": "poc-search",
+    "QUERY_REWRITE": "poc-search",
+    "SUFFICIENCY": "poc-llmops",
+    "ANSWER_PROMPT": "poc-llmops",
+    "MODEL": "poc-llmops",
+    "ROUTING": "poc-agent",
+    "CITATION": "poc-agent",
+    "ACL": "poc-security",
+    "JUDGE": "poc-quality",
+    "PLATFORM": "poc-platform",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    """Threshold設定PathをJob引数から取得する。"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--threshold-config", required=True)
+    return parser.parse_args()
+
+
+def load_threshold_policy(path: str) -> dict:
+    """Git管理YAMLを読み、最低限の監視Policy項目を検証する。"""
+    policy = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    required = {"policy_version", "effective_from", "decision_id", "metrics"}
+    missing = required - set(policy)
+    if missing:
+        raise ValueError(f"threshold policy is missing fields: {sorted(missing)}")
+    return policy
+
+
+def current_user(spark: SparkSession) -> str:
+    """Threshold変更者とCase作成者へ実行Identityを記録する。"""
+    return spark.sql("SELECT current_user() AS principal").first()["principal"]
+
+
+def stable_id(prefix: str, *values: str) -> str:
+    """同じTriggerから同じIDを作り、再実行時の重複を防ぐ。"""
+    payload = "|".join(str(value) for value in values)
+    return f"{prefix}-{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def sync_thresholds(spark: SparkSession, policy: dict, actor: str) -> None:
+    """Policy VersionとMetricをKeyにThreshold Tableへ冪等反映する。"""
+    effective_from = datetime.fromisoformat(
+        policy["effective_from"].replace("Z", "+00:00")
+    )
+    now = datetime.now(timezone.utc)
+    rows = []
+    for metric_name, settings in policy["metrics"].items():
+        rows.append(
+            {
+                "policy_version": policy["policy_version"],
+                "metric_name": metric_name,
+                "warning_threshold": settings.get("warning_threshold"),
+                "error_threshold": settings.get("error_threshold"),
+                "critical_threshold": settings.get("critical_threshold"),
+                "comparison_operator": settings["comparison_operator"],
+                "effective_from": effective_from,
+                "effective_to": None,
+                "changed_by": actor,
+                "decision_id": policy["decision_id"],
+                "updated_at": now,
+            }
+        )
+
+    # effective_toが全行NULLでも型推論に失敗しないよう、Table契約と同じSchemaを明示する。
+    threshold_schema = StructType(
+        [
+            StructField("policy_version", StringType(), False),
+            StructField("metric_name", StringType(), False),
+            StructField("warning_threshold", DoubleType(), True),
+            StructField("error_threshold", DoubleType(), True),
+            StructField("critical_threshold", DoubleType(), True),
+            StructField("comparison_operator", StringType(), False),
+            StructField("effective_from", TimestampType(), False),
+            StructField("effective_to", TimestampType(), True),
+            StructField("changed_by", StringType(), False),
+            StructField("decision_id", StringType(), False),
+            StructField("updated_at", TimestampType(), False),
+        ]
+    )
+    spark.createDataFrame(rows, threshold_schema).createOrReplaceTempView(
+        "incoming_thresholds"
+    )
+    spark.sql(
+        """
+        MERGE INTO main.llmops_poc.poc_monitoring_thresholds AS target
+        USING incoming_thresholds AS source
+          ON target.policy_version = source.policy_version
+         AND target.metric_name = source.metric_name
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+        """
+    )
+
+
+def collect_candidates(spark: SparkSession, actor: str) -> list[dict]:
+    """Threshold、Run Failure、Parse／Prep Errorを共通Case候補へ変換する。"""
+    now = datetime.now(timezone.utc)
+    candidates: list[dict] = []
+
+    # Threshold SignalはMetric、Policy、日付を重複排除単位にする。
+    for row in spark.sql(
+        """
+        SELECT metric_name, metric_value, observed_at, policy_version, severity
+        FROM main.llmops_poc.poc_monitoring_signals_v
+        WHERE metric_name = 'expectation_failure_rate'
+          AND severity IN ('Critical', 'Error', 'Warning')
+        """
+    ).collect():
+        trigger_id = f"{row.metric_name}:{row.policy_version}:{row.observed_at.date()}"
+        proposed = "PLATFORM" if row.metric_name.endswith("sla_hours") else "PARSE"
+        candidates.append(
+            build_candidate(
+                actor=actor,
+                trigger_type="THRESHOLD",
+                trigger_id=trigger_id,
+                severity=row.severity,
+                proposed_root_cause=proposed,
+                detected_at=row.observed_at,
+            )
+        )
+
+    # 失敗したJob RunはRun IDをTrigger IDとしてPLATFORM候補にする。
+    for row in spark.sql(
+        """
+        SELECT run_id, result_state, ended_at
+        FROM main.llmops_poc.poc_job_run_timeline_v
+        WHERE result_state IN ('FAILED', 'TIMED_OUT', 'INTERNAL_ERROR')
+          AND ended_at >= CURRENT_TIMESTAMP() - INTERVAL 1 DAY
+        """
+    ).collect():
+        candidate = build_candidate(
+            actor=actor,
+            trigger_type="RUN_EVENT",
+            trigger_id=row.run_id,
+            severity="Error",
+            proposed_root_cause="PLATFORM",
+            detected_at=row.ended_at or now,
+        )
+        candidate["pipeline_run_id"] = row.run_id
+        candidates.append(candidate)
+
+    # Parse／Prep ErrorはDocument VersionとStageを重複排除単位にする。
+    for row in spark.sql(
+        """
+        SELECT stage, document_version_id, detected_at
+        FROM main.llmops_poc.poc_error_metrics_v
+        WHERE detected_at >= CURRENT_TIMESTAMP() - INTERVAL 1 DAY
+        """
+    ).collect():
+        candidate = build_candidate(
+            actor=actor,
+            trigger_type="RUN_EVENT",
+            trigger_id=f"{row.stage}:{row.document_version_id}",
+            severity="Error",
+            proposed_root_cause=row.stage,
+            detected_at=row.detected_at,
+        )
+        candidate["document_version_ids"] = [row.document_version_id]
+        candidates.append(candidate)
+
+    return candidates
+
+
+def build_candidate(
+    *,
+    actor: str,
+    trigger_type: str,
+    trigger_id: str,
+    severity: str,
+    proposed_root_cause: str,
+    detected_at: datetime,
+) -> dict:
+    """検知情報を、本文を含まないQuality Case最小行へ正規化する。"""
+    dedup_key = stable_id("dedup", trigger_type, trigger_id, proposed_root_cause)
+    return {
+        "quality_case_id": stable_id("qc", dedup_key),
+        "dedup_key": dedup_key,
+        "detected_at": detected_at,
+        "detected_by": actor,
+        "trigger_type": trigger_type,
+        "trigger_id": trigger_id,
+        "severity": severity,
+        "pipeline_run_id": None,
+        "document_version_ids": None,
+        "proposed_root_cause": proposed_root_cause,
+        "owner": ROOT_CAUSE_OWNER[proposed_root_cause],
+        "status": "triaged",
+        "created_by": actor,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+
+def upsert_candidates(spark: SparkSession, candidates: list[dict]) -> None:
+    """dedup_keyで既存Caseを保持し、新規Caseだけを追加する。"""
+    if not candidates:
+        return
+    spark.createDataFrame(candidates).createOrReplaceTempView("incoming_quality_cases")
+    spark.sql(
+        """
+        MERGE INTO main.llmops_poc.poc_quality_cases AS target
+        USING incoming_quality_cases AS source
+          ON target.dedup_key = source.dedup_key
+        WHEN MATCHED AND target.status NOT IN
+          ('closed', 'duplicate', 'rejected', 'accepted_risk')
+          THEN UPDATE SET target.updated_at = source.updated_at
+        WHEN NOT MATCHED THEN INSERT (
+          quality_case_id, dedup_key, detected_at, detected_by,
+          trigger_type, trigger_id, severity, pipeline_run_id,
+          document_version_ids, proposed_root_cause, owner, status,
+          created_by, created_at, updated_at
+        ) VALUES (
+          source.quality_case_id, source.dedup_key, source.detected_at,
+          source.detected_by, source.trigger_type, source.trigger_id,
+          source.severity, source.pipeline_run_id, source.document_version_ids,
+          source.proposed_root_cause, source.owner, source.status,
+          source.created_by, source.created_at, source.updated_at
+        )
+        """
+    )
+
+
+def main() -> None:
+    """Thresholdを同期し、監視SignalをQuality Caseへ冪等登録する。"""
+    args = parse_args()
+    spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+    actor = current_user(spark)
+    policy = load_threshold_policy(args.threshold_config)
+    sync_thresholds(spark, policy, actor)
+    upsert_candidates(spark, collect_candidates(spark, actor))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`THRESHOLD`の暫定原因は機械的な候補にすぎない。例えばExpectation失敗率上昇を`PARSE`候補として登録しても、担当者はTraceとLayer件数を確認し、最初の破綻点がRetrievalなら`confirmed_root_cause=RETRIEVAL`へ確定する。
+
+##### 3.2.7.8 再評価Evidenceを確認してCaseをCloseする
+
+`poc/src/close_poc_quality_case.py`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | PoC Ownerまたは委任された品質責任者 |
+| Trigger | Caseが`validated`になりClose申請されたとき |
+| 入力 | Quality Case ID、Close承認者 |
+| 出力 | `closed`状態、Close時刻、承認者 |
+| Data Source | `poc_quality_cases`、Evaluation Run／Decisionへの参照 |
+| 通知先 | Close失敗時はCase Owner |
+| 記録先 | `poc_quality_cases` |
+| 正常終了時 | `validated_run_id`と`decision_id`を持つCaseだけCloseされる |
+| 失敗時 | 状態を変更せず不足Evidenceを表示する |
+| 再実行時 | 既に`closed`なら成功扱いにし、重複更新しない |
+| Security | Case参照だけを扱い、Trace本文を取得しない |
+| 権限 | Close承認者だけに対象Table更新権限を委任する |
+| Retention | Close後も監査期間中は削除しない |
+| ファイルパス | `poc/src/close_poc_quality_case.py` |
+
+```python
+"""固定Caseの再評価Evidenceが揃ったPoC Quality CaseだけをCloseする。"""
+
+import argparse
+
+from delta.tables import DeltaTable
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, current_timestamp, lit
+
+
+TABLE_NAME = "main.llmops_poc.poc_quality_cases"
+
+
+def parse_args() -> argparse.Namespace:
+    """Close対象Caseと承認者を受け取る。"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--quality-case-id", required=True)
+    parser.add_argument("--approved-by", required=True)
+    return parser.parse_args()
+
+
+def validate_close_evidence(spark: SparkSession, quality_case_id: str) -> str:
+    """Close前に状態、再評価Run、Decision、原因確定を検証する。"""
+    rows = (
+        spark.table(TABLE_NAME)
+        .where(col("quality_case_id") == lit(quality_case_id))
+        .select(
+            "status",
+            "validated_run_id",
+            "decision_id",
+            "confirmed_root_cause",
+        )
+        .collect()
+    )
+    if len(rows) != 1:
+        raise ValueError("quality case must exist exactly once")
+    row = rows[0]
+    if row.status == "closed":
+        return "already_closed"
+    if row.status != "validated":
+        raise ValueError("quality case must be validated before close")
+    if not row.validated_run_id or not row.decision_id:
+        raise ValueError("validated_run_id and decision_id are required")
+    if not row.confirmed_root_cause:
+        raise ValueError("confirmed_root_cause is required")
+    return "ready"
+
+
+def close_case(
+    spark: SparkSession,
+    quality_case_id: str,
+    approved_by: str,
+) -> None:
+    """検証済みCaseをClosedへ遷移し、承認者と時刻を記録する。"""
+    state = validate_close_evidence(spark, quality_case_id)
+    if state == "already_closed":
+        return
+    DeltaTable.forName(spark, TABLE_NAME).update(
+        condition=col("quality_case_id") == lit(quality_case_id),
+        set={
+            "status": lit("closed"),
+            "close_approved_by": lit(approved_by),
+            "closed_by": lit(approved_by),
+            "closed_at": current_timestamp(),
+            "updated_at": current_timestamp(),
+        },
+    )
+
+
+def main() -> None:
+    """Command引数を検証してQuality CaseをCloseする。"""
+    args = parse_args()
+    spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+    close_case(spark, args.quality_case_id, args.approved_by)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+##### 3.2.7.9 PoC Runbookを事前作成する
+
+`poc/ops/poc_runbook.md`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | PoC開始前 |
+| 初めて必要になる段階 | PoC |
+| 実行主体 | PoC Owner、開発者、Security／Quality担当者 |
+| Trigger | Notification受信、Dashboard日次Review、手動発見 |
+| 入力 | Alert、Run ID、Case ID、Trace ID |
+| 出力 | Acknowledge、担当割当、調査、再評価、Close記録 |
+| Data Source | Jobs／Pipeline／MLflow UI、Dashboard、Quality Case |
+| 通知先 | Severity別のPoC Group |
+| 記録先 | `poc_run_log`、`poc_quality_cases`、`poc_decision_log` |
+| 正常終了時 | Caseが担当済み、またはEvidence付きでCloseされる |
+| 失敗時 | Secondary Owner、PoC Owner、Security責任者へEscalateする |
+| 再実行時 | 同じCase IDで作業を継続し、別Issueを重複作成しない |
+| Security | 通知・Issueへ機密本文を転記しない |
+| 権限 | Runbook閲覧はPoC関係者、Closeは承認者に限定する |
+| Retention | Version付きでGit管理し、各Runに適用Versionを記録する |
+| ファイルパス | `poc/ops/poc_runbook.md` |
+
+```markdown
+# PoC Monitoring Runbook
+
+1. Notificationの`job_run_id`、`alert_id`、`quality_case_id`を確認する。
+2. `Critical`はPoC利用を停止し、15分以内にPoC OwnerとSecurity担当へ連絡する。
+3. `Error`は30分以内、`Warning`は当日ReviewまでにPrimary OwnerがAcknowledgeする。
+4. Jobs UI、Pipeline UI、Event Log View、MLflow Trace UIの順にEvidenceを確認する。
+5. `poc_quality_cases`へOwner、`investigation_started_at`、`linked_issue_id`を保存する。
+6. 自動候補を鵜呑みにせず、最初に破綻したComponentを`confirmed_root_cause`へ保存する。
+7. 実装修正はGitHub／Jira Issueで管理し、Quality Case IDを外部IDとして関連付ける。
+8. 固定EvaluationDatasetまたは対象Security Caseで再評価し、Run IDを`validated_run_id`へ保存する。
+9. 採用、却下、Risk受容を`poc_decision_log`へ記録する。
+10. Close承認者がEvidenceを確認し、`close_poc_quality_case.py`でCloseする。
+```
+
+PoCでは24時間オンコールを置かない。Job／Alert ScheduleはPoC実施時間帯だけ有効にし、期間外はPauseする。ただし、実データ利用中に発生したSecurity Eventの連絡先と利用停止手順はPoCでも省略しない。
+
+### 3.3 PoC実施中の監視・運用
+
+PoCにも限定された運用期間がある。24時間オンコールは置かないが、PoC実施時間帯はPush通知と10分トリアージを有効化し、すべての異常をQuality Caseへ記録する。通知を受けたPrimary OwnerはSeverity別期限内にAcknowledgeし、調査開始時刻を保存する。
+
+| 運用項目 | Trigger | 検知手段 | 確認画面／Dashboard | 通知 | 実施者 | 初動 | 記録先 | Close条件 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Sample文書の投入 | `LIFECYCLE_EVENT`：Sample追加・差替え | Source Hash、Bronze Preflight、Pipeline Event Log | Volume／Catalog Explorer、PoC Dashboard | 通常は通知なし。未承認公開だけCritical通知 | 開発者、PoC Owner | 誤投入を隔離し、対象Runを停止する | MLflow／Pipeline Run、`poc_run_log`、必要時`poc_quality_cases` | 正しいSample Setで再Runし、Bronze件数とHash照合が完了 |
+| Pipeline／Job起動 | `RUN_EVENT`：Start、Success、Failure、Timeout、Duration超過 | Lakeflow Jobs Notification、Pipeline Event Log | Jobs UI、Pipeline UI、Event Log Query | Failure／Duration WarningだけEmail／System Destination | 開発者 | Run ID、Task、Git Commitを確認し、下流公開を止める | `poc_run_log`、失敗時`poc_quality_cases` | 修正後Run成功、Layer件数照合、Caseへvalidated Runを保存 |
+| Pipeline Event Log | `RUN_EVENT`：Update完了、Flow失敗 | Event Logの`update_progress`／`flow_progress` | Pipeline UI、Dashboard Pipeline Page | Error EventだけJob通知またはCase Alert | 開発者 | 最初に失敗したFlowと上流Versionを特定する | Event Log、`poc_quality_cases` | 再Runで同じErrorがなく、対象Flowが成功 |
+| Bronze／Silver／Gold件数 | `RUN_EVENT`：Pipeline完了、`THRESHOLD`：件数差 | Layer Count View、Expectation | Dashboard Medallion Page | 差分がPolicy閾値超過時だけSQL Alert | 開発者 | Version単位で欠落・重複を調べる | `poc_run_log.metric_values`、Quality Case | 期待件数と一致し、回帰Caseが追加済み |
+| Parse／Prep Error | `RUN_EVENT`：Error行生成、`THRESHOLD`：Error率超過・未知Error | Expectations、Error View、SQL Alert | Dashboard Data Quality Page、Error Table | 未知ErrorまたはError閾値超過だけ通知 | Data Engineering担当者 | 原文を隔離し、StageとDocument VersionをCase化する | Error Table、`poc_quality_cases` | 原因確定、再処理成功、固定回帰Case追加 |
+| Quarantine | `THRESHOLD`：隔離件数増加、`SECURITY_EVENT`：危険文書通過 | Quarantine件数Query、手動Review | Dashboard Medallion Page、Quarantine Table | 通常増加は日次、危険文書通過は即時 | 開発者、PoC Owner | Gold／Index公開を止め、影響Versionを特定する | Quality Case、Decision Log | 再処理または除外判断が承認され、公開対象照合完了 |
+| AI Search同期 | `RUN_EVENT`：同期完了・失敗、`CHANGE`：Index変更 | Sync Status、Gold対Index照合Query | AI Search UI、Dashboard Pipeline Page | 同期失敗・旧版残存だけError通知 | Search担当者 | 新Index公開を止め、再同期または切戻しする | `poc_run_log`、Quality Case | GoldとIndex Releaseが一致しGolden Query合格 |
+| 固定EvaluationDataset評価 | `RUN_EVENT`：Evaluation完了、`JUDGE_FEEDBACK`：Gate Fail、Baseline悪化 | `mlflow.genai.evaluate()`、Scorer／Judge | MLflow Evaluation Run、Dashboard Evaluation Page | Release判断に影響するGate Failだけ通知 | LLMOps担当者 | Dataset、Prompt、Model、Index Version固定を確認する | Evaluation Run ID、Quality Case ID | 固定DatasetでBaseline回復、またはRisk受容Decision承認 |
+| 限定Testerの実質問 | `USER_FEEDBACK`：低評価・Comment、`MANUAL_REVIEW`：誤回答等 | MLflow Assessment、手動Review | MLflow Trace UI | 日次トリアージへ追加。重大Security事象だけ即時 | 限定Tester、業務担当者 | Trace IDを保存し、Expectation入力担当へ割当てる | Trace Assessment、Quality Case | Expectation、原因、修正後評価が揃う |
+| MLflow Trace | `MANUAL_REVIEW`、`SECURITY_EVENT`：Span欠落・Masking違反 | Trace Schema検査、Security Scorer | MLflow Trace UI、Security Query | ACL／Secret／PII露出は即時Critical通知 | LLMOps、Security担当者 | PoC利用停止、Evidenceを複製せず影響範囲を調査する | Trace ID、Security Incident／Quality Case | 利用停止、影響調査、Security Gate合格、責任者承認 |
+| Feedback／Expectation | `USER_FEEDBACK`、`SCHEDULE`：未入力Assessment集計 | Assessment必須項目Query | MLflow Trace UI／Review App | 未入力は日次Reminder、即時通知しない | 業務担当者 | Rationaleと期待回答・文書・拒否を確定する | MLflow Assessment、Quality Case | 必須Expectation入力とドメイン確認完了 |
+| EvaluationDataset候補 | `SCHEDULE`：日次トリアージ、Caseが`validated` | Case Query、Masking／重複検査 | Dashboard Quality Cases Page、MLflow UI | 通知なし。日次Reviewで判断 | LLMOps担当者 | 再現可能性、機密性、Case Familyを確認する | Quality Caseの`evaluation_dataset_record_id` | 承認済み回帰CaseだけDatasetへ登録 |
+| 固定条件で再評価 | `CHANGE`：1要素変更、`RUN_EVENT`：Validation Run完了 | Evaluation Run、Release Gate | MLflow Evaluation Run | Gate Failだけ通知 | LLMOps担当者、Quality担当者 | Baselineと同一Dataset／条件か確認する | Evaluation Run、Quality Case、Decision Log | `validated_run_id`保存後に採用／却下Decision確定 |
+| 日次Review／総括 | `SCHEDULE`：PoC実施日18時、PoC終了時 | Open Case、Metric、未入力Assessment Query | PoC Dashboard、Dashboard Subscription | 日次Snapshot／Review Reminder | PoC Owner、各Primary Owner | 未担当Caseを割当て、SLA超過をEscalateする | Review時刻をDecision Log、Case Owner／Status | 対象期間の全Caseが担当済み、終了時はGo／No-Go承認 |
+
+### 3.4 PoC結果の分析観点
+
+PoCでは「一連の処理が動いたか」だけでなく、どのComponentが品質、性能、Cost、安定性を制約しているかを分析する。Metricは全体平均だけで判断せず、失敗が集中するSliceとTraceを結び付ける。
+
+| 分析対象 | 代表的なMetric／事象 | 分析する問い | 主な確認元 |
+| --- | --- | --- | --- |
+| 文書取込 | 取込件数、重複、Preflight Error | 想定した文書を漏れなく取り込めたか | Pipeline Event Log、Bronze |
+| Parse／Prep | 成功率、形式別Error、処理時間 | 特定形式、表、画像、複雑なLayoutで失敗していないか | Attempt／Error Table |
+| Chunk | Chunk数、長さ、境界、欠落 | 意味単位で適切に分割されているか | Silver、Trace |
+| Retrieval | 文書Recall、Chunk Recall、0件率、再検索率 | 正しい文書・Chunkを取得できているか | Retriever Span、Evaluation Run |
+| 回答 | Groundedness、Correctness、Citation | 取得した根拠だけで正しく回答しているか | Trace、Assessment |
+| 拒否 | 拒否一致率、誤回答、誤拒否 | 回答可能／不可能を正しく判断しているか | EvaluationDataset |
+| Agent経路 | Node遷移、再検索回数、Loop | 不要な再検索や誤った分岐がないか | MLflow Trace |
+| Judge | 人間一致率、False Positive／Negative | Judgeを品質判定に利用できるか | Judge Feedback、人間Feedback |
+| 性能 | 検索Latency、初回応答、全体Latency | 業務利用可能な応答時間か | Trace、Serving Metric |
+| Cost | Token、検索回数、Judge費用 | 品質に対してCostが過剰でないか | Trace、Usage |
+| 安定性 | 429、Timeout、Search／Model Error | 外部Service失敗を処理できているか | Trace、Endpoint Metric |
+| Observability | Version、Span、入出力、Masking | 失敗原因を後から再現できるか | MLflow Trace |
+
+最低限、文書形式別、質問カテゴリ別、回答可能／回答不能別、通常質問／略語／表記揺れ別、単一文書／複数文書横断別、Prompt Version別、Model Route別、Index／Chunk Version別、再検索あり／なしでSlice比較する。Tester個人別の優劣ではなく、業務Roleと質問Purpose別に傾向を比較し、個人評価へ転用しない。
+
+### 3.5 問題の原因分類と改善サイクル
+
+低品質Caseは、回答文だけを見てPrompt問題と決めず、Trace、Assessment、Dataset履歴を使って次のComponentへ分類する。
+
+| 原因分類 | 主な問題 | 主な改善対象 |
+| --- | --- | --- |
+| `DOCUMENT` | 必要文書が存在しない、内容が古い・誤っている | Corpus、文書Owner、更新手順 |
+| `PARSE` | 表、画像、Layout、文字が正しく解析されない | Parser、形式別処理、OCR |
+| `PREP` | 検索用整形で重要情報が欠落する | `ai_prep_search`指示、整形規則 |
+| `CHUNK` | 境界、長さ、Metadata継承が不適切 | Chunk方式、Overlap、Metadata |
+| `RETRIEVAL` | 正しい文書・Chunkを取得できない | Query、Filter、Top-k、Rerank、Index |
+| `QUERY_REWRITE` | 略語展開・言い換えで意図が変わる | Query Rewrite Prompt／規則 |
+| `SUFFICIENCY` | 根拠不足なのに回答、または十分なのに再検索する | 十分性判定Prompt／閾値 |
+| `ANSWER_PROMPT` | 根拠は正しいが回答形式・要約・拒否が不適切 | Answer Prompt |
+| `MODEL` | 指示追従、長文理解、生成安定性が不足する | Model Route、Parameter |
+| `ROUTING` | Agentが誤Nodeへ遷移、不要なLoopを行う | Graph条件、上限、Fallback |
+| `CITATION` | 回答と引用の対応、Stable ID、版が不正 | Citation生成・検証 |
+| `ACL` | 権限外検索、過剰拒否、Scope伝播不良 | Identity、ACL Filter、Security Test |
+| `JUDGE` | 人間と自動評価の基準が一致しない | Judge Prompt、Alignment、Validation |
+| `PLATFORM` | 429、Timeout、同期遅延、Service障害 | Retry、Capacity、Runbook、SLA |
+
+EvidenceとWorkflowは次の正本へ分離する。MLflow Traceを状態管理Tableの代わりに使わない。
+
+| 資産 | 保持するもの | 保持しないもの／役割境界 |
+| --- | --- | --- |
+| MLflow Trace | 質問、検索Span、Node遷移、回答、Latency、Token、Git／Prompt／Model／Index Version | Case Ownerや修正状態を直接管理しない |
+| MLflow Assessment | Feedback、Expectation、人間判定、Judge判定、Rationale | 実装修正TaskやClose状態を管理しない |
+| `poc_quality_cases` | Trigger、Severity、担当、原因、状態、Issue、再評価、Close | 質問全文、Chunk全文、Access Token、Email、署名付きURLを複製しない |
+| MLflow EvaluationDataset | 承認済みでMask済み、再現可能な回帰Case | 未診断Case、単発Platform障害、機密性未確認Caseを入れない |
+| GitHub／Jira Issue | 実装作業、PR、担当、期限 | Quality Evidenceの正本にせず`quality_case_id`で関連付ける |
+| `poc_decision_log` | 採用、却下、Risk受容、閾値変更、Go／No-Go | 実行Metric本体を重複保存せずEvidence IDを参照する |
+
+自動処理は`proposed_root_cause`までとし、`confirmed_root_cause`はTraceとExpectationを確認した担当者が確定する。Primary Root Causeは「利用者の期待から見て最初に破綻したComponent」とする。複数原因がある場合はPrimaryを`confirmed_root_cause`、後続要因を`secondary_causes`へ保存し、すべてをPrompt改善へ送らない。
+
+PoC Quality Caseの通常状態は次の順で遷移する。
+
+```text
+detected → triaged → diagnosed → assigned → fixing
+→ ready_for_validation → validated → closed
+```
+
+| 状態 | 開始条件 | 必須項目 | 実行者 | システム処理 | 人の判断 | 終了条件 | 次状態 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `detected` | Triggerを検知 | Trigger、Severity、Evidence ID | Detector Job／担当者 | `dedup_key`で冪等登録 | Securityなら利用停止要否を判断 | 重複・重要度・担当候補を確認 | `triaged`／`duplicate`／`rejected` |
+| `triaged` | Caseが有効 | proposed Cause、Owner候補 | PoC Owner／Triage Job | RuleでPrimary Owner候補を設定 | 調査対象・Severity・Ownerを確定 | OwnerとAcknowledge時刻が保存済み | `diagnosed`／`blocked` |
+| `diagnosed` | TraceとExpectationを確認可能 | confirmed Cause、Rationale、Secondary Cause | Component担当者 | 必須項目を検証 | 最初に破綻したComponentを確定 | 原因と改善対象が説明可能 | `assigned` |
+| `assigned` | 改善先が確定 | improvement Target、linked Issue ID | PoC Owner | Issue参照を保存 | 修正Ownerと期限を承認 | OwnerがIssueを引受け | `fixing`／`blocked` |
+| `fixing` | 修正作業開始 | Git Issue、変更対象、Baseline | 実装担当者 | Change EvidenceをRun／Traceへ記録 | 主要変更を1種類に限定 | 修正版がDeploy可能 | `ready_for_validation` |
+| `ready_for_validation` | 修正版Deploy済み | Candidate Version、固定Case | Quality担当者 | Validation Runを起動 | Dataset・Version固定を確認 | Evaluation Run完了 | `validated`／`fixing` |
+| `validated` | 再評価完了 | `validated_run_id`、比較結果、Decision ID | Quality担当者、PoC Owner | Gate結果をCaseへ同期 | 採用／却下／Risk受容を判断 | 必須Gate合格または承認済み例外 | `closed`／`fixing`／`accepted_risk` |
+| `closed` | `validated`かつClose申請 | validated Run、Decision、Close承認者 | PoC Owner | Close時刻と承認者を固定 | Evidenceが十分か最終確認 | 再評価成功を伴って終了 | 終端 |
+| `duplicate` | 同じEvidenceの既存Caseあり | 重複先Case ID | Triage担当者 | 新Caseを重複先へLink | 本当に同一原因・修正か確認 | 重複先で追跡可能 | 終端 |
+| `rejected` | 誤検知・対象外 | 却下理由、Decision ID | PoC Owner | 状態と理由を保存 | 品質Caseとして扱わない判断 | 監査可能な理由がある | 終端 |
+| `accepted_risk` | 修正しない例外承認 | Risk、期限、承認者、再確認日 | PoC Owner、業務Owner | Decisionと期限を保存 | 影響を受容可能か判断 | 期限付き承認完了 | 終端または再Open |
+| `blocked` | 外部依存・Evidence不足 | Blocker、Owner、再確認日 | Case Owner | Reminder対象へ残す | 待機継続かScope除外か判断 | Blocker解消またはDecision確定 | `triaged`／`fixing`／`rejected` |
+
+`closed`はコード修正完了だけでは認めない。固定EvaluationDatasetまたは対象Security Caseの再評価に成功し、`validated_run_id`、`decision_id`、`close_approved_by`が保存された場合だけ`close_poc_quality_case.py`が遷移させる。
+
+原因分類ごとの改善先は次のとおりである。PoCでは自動配送を必須にせず、`improvement_target`と`linked_issue_id`を保存する。本番では5.1.2.1のReview Workflowで自動配送する。
+
+| Root Cause | 改善先 |
+| --- | --- |
+| `DOCUMENT` | 文書Owner Backlog |
+| `PARSE`／`PREP`／`CHUNK` | Ingestion Backlog |
+| `RETRIEVAL`／`QUERY_REWRITE` | Retrieval EvaluationDataset／Backlog |
+| `SUFFICIENCY`／`ANSWER_PROMPT` | Prompt Training Dataset |
+| `MODEL` | Model Route比較Backlog |
+| `ROUTING` | Agent Routing Dataset／Backlog |
+| `CITATION` | Citation回帰Dataset |
+| `ACL` | Security Incident／ACL回帰Dataset |
+| `JUDGE` | Judge Alignment Dataset |
+| `PLATFORM` | Platform Incident／Runbook改善 |
+
+```mermaid
+flowchart TD
+    A["Trigger検知・Quality Case登録"] --> B["Trace・Assessment・Expectationの確認"]
+    B --> C["proposedからconfirmed原因を確定"]
+    C --> D["改善先とIssueを割当"]
+    D --> E["1要素だけ変更"]
+    E --> F["固定EvaluationDatasetで再評価"]
+    F --> G["変更前後を比較"]
+    G --> H{"判断"}
+    H -->|採用| I["候補Versionとして記録"]
+    H -->|却下| J["Baselineを維持"]
+    H -->|Evidence不足| K["追加調査"]
+    I --> L["validated RunとDecisionを保存"]
+    J --> L
+    L --> M["Close承認"]
+    K --> A
+```
+
+1回の評価でPrompt、Model、Retrieval設定、Chunk、Agent Routingを同時に変更しない。複数要素を変えると改善・悪化の原因を特定できず、本番化判断に使えるEvidenceにならない。
+
+### 3.6 PoC完了判定と本番化Gap
+
+PoC Ownerは、処理成功だけではなく、次の成果物が揃い、業務・品質・Security・運用の各責任者が未解決Riskを理解した状態でGo／No-Goを判断する。
+
+| 成果物 | 必須内容 | 判断への利用 |
+| --- | --- | --- |
+| KPI別の評価結果 | Retrieval、回答、拒否、Citation、性能、Cost | 受入基準を満たすか |
+| ケース別Assessment | Feedback、Expectation、Rationale、Trace ID | 結果を再現・説明できるか |
+| 失敗ケース一覧 | 入力、実績、期待、Version、状態 | 未解決Caseの重要度を判断できるか |
+| 原因分類別の件数 | Component別件数と代表例 | 本番化前の優先改善先はどこか |
+| Slice別の弱点 | 文書形式、質問カテゴリ、回答可否など | 利用範囲を制限すべきか |
+| Cost／Latency実測 | Case別・P95、Token、検索・Judge回数 | 予算と業務SLOが成立するか |
+| Judgeと人間の一致状況 | 一致率、False Positive／Negative | Judgeを参考値またはGateに使えるか |
+| 未解決Risk | 影響、発生条件、暫定回避、Owner | Pilotで受容可能か |
+| 本番化時に追加する統制 | Manifest、職務分離、監視、Runbookなど | 本番Gapが具体化されているか |
+| 本番化時に自動化する手運用 | 登録、同期、Review配送、Alertなど | 運用負荷と実装範囲が妥当か |
+| Go／No-Go判断 | 判断者、条件、対象Scope、有効期限 | Pilotへ進むか、PoCを延長するか |
+| Decision Log | 採否、Evidence、例外、承認者 | 後日の監査・再判断が可能か |
+| 本番化Gap一覧 | Gap、優先度、Owner、期限、完了Evidence | 第4章の構築Backlogへ移せるか |
+
+`Go`は全Caseの完全合格を意味しない。未解決Riskを許容できる業務Scopeへ限定し、第4章のDry RunとPilot Gateで閉じる条件を明示する。重大なACL越境、根拠なし回答、Traceの機密情報露出、再現不能な評価が残る場合は`No-Go`とする。
+
+### 3.7 PoCから本番へ持ち越すもの・置き換えるもの
 
 | 資産 | 本番でも維持 | 本番での変更 |
 | --- | --- | --- |
@@ -705,36 +2585,34 @@ if __name__ == "__main__":
 | Chunk Schema | `chunk_to_embed`／`chunk_to_retrieve`とVersion ID | ACL、公開範囲、Stable Source Refを追加 |
 | PoC Gold | Materialized Viewという形式 | 最新成功版ではなくManifest Pointer一致版へ置換 |
 | AI Search／RAG | Retrieval、Citation、拒否 | ACL Filter、Release Manifest、回答検証を追加 |
-| Evaluation | 固定CaseとTrace | Identity Fixture、Holdout、ACL／旧版Gateを追加 |
+| Evaluation／Assessment | `mlflow.genai.evaluate()`、Trace Schema、決定論的Scorer、RAG Judge、最小Feedback／Expectation | UC Dataset、Identity Fixture、Training／Holdout、正式Reviewer、ACL／旧版Gate、Monitoringを追加 |
 
-## 4. 本番導入時に実装するもの
+## 4. 本番導入時に実施するもの
 
 PoC版を捨てて作り直すのではなく、メダリオンのDataset責務を維持したまま、Manifest、Version Registry、Service Principal、Scanner、公開Pointer、監査、Search Sync、Release Manifestを追加する。以下では本番用Source FileをPoC版とは別に掲載する。
 
-### 4.1 本番導入の完了条件
+### 4.1 本番導入の目的・完了条件
+
+本番導入の目的は、PoCで確認した技術的成立性を、金融機関で継続利用できるIdentity、公開統制、監査証跡、品質Gate、障害対応へ拡張し、限定Pilotから安全に業務利用を開始することである。
 
 - prod専用Identityと最小権限が設定され、登録者と承認者が分離されている。
 - 未登録、未検査、Parse／Prep失敗、未承認、削除、失効VersionがGold／Indexへ到達しない。
-- Search Sync、AI Search、Agent、Trace、Monitoring、Alert、Rollbackが本番相当試験に合格する。
+- PoC EvaluationDatasetをUnity Catalog管理のTraining／Holdoutへ移行し、Lineage、Split、Scorer／Judge Versionを固定している。
+- ACL、旧版、削除、Prompt Injection、回答拒否のGolden TestとRelease Gateが本番相当試験に合格する。
+- Production Trace Schema、Masking、権限、保持期間、正式Assessment Schema、Reviewerを承認している。
+- Production Monitoringを本番開始前に設定・Dry Runし、Sampling Rate、Cost、Alert、Rollbackを検証している。
+- Release Gateへ使うJudgeは、人間との一致率、False Positive、False Negativeを独立Validationで確認している。
 - Deploy成功だけでなく、Pilotで品質・Security・運用KPIを満たし、責任者が業務利用開始を承認する。
 
-### 4.2 開発時の実装
+### 4.2 本番開始前に構築する運用・統制機能
 
-本番開発では、PoC SourceをBaselineとしてManifest契約、Service Principal、登録・承認Workflow、Scanner、Quarantine、Search Sync、Release Manifest、ACL Filter、Holdout Gateを追加する。prod固有値をSourceへ埋め込まず、DAB Target、Terraform、Secret／Federationで環境差を注入する。
+本番開発では、PoC SourceをBaselineとしてManifest契約、Service Principal、登録・承認Workflow、Scanner、Quarantine、Search Sync、Release Manifest、ACL Filter、Training／Holdout Gateを追加する。PoCのTrace Schema、`inputs`／`expectations`契約、決定論的Scorer、RAG Judgeを捨てず、本番用Quality Bundleへ移してVersion固定する。prod固有値をSourceへ埋め込まず、DAB Target、Terraform、Secret／Federationで環境差を注入する。
 
-### 4.3 運用時の実装
+Production Monitoringは「本番導入後に考える機能」ではない。本番Traceへ適用するScorer／Judge、Sampling、Masking、Cost上限、Alert、停止条件をこの段階で実装し、Staging TraceでDry Runする。Pilotまたは本番利用開始と同時に有効化し、本番後は閾値とSamplingを運用実績から調整する。
 
-本番運用では、文書登録・審査・公開、Pipeline、Search Sync、Agent、Monitoringを別責務として運転する。運用担当者はJob Run、Command状態、Quarantine、Reconciliation候補、Index Sync、Trace、Alertを確認し、Runbookに従ってReplayまたはRollbackする。人は例外判断と承認を担当し、定型更新はService PrincipalとJobへ任せる。
+本番運用で使う文書登録・審査・公開、Pipeline、Search Sync、Agent、Monitoring、Assessment、Release／Rollbackの機能は、利用開始後に作るのではなく本番開始前に構築する。人は例外判断と承認を担当し、定型更新はService PrincipalとJobへ委譲する。構築しただけでは運用可能とみなさず、4.3のDry Runで権限、通知、Replay、障害、復旧を検証する。
 
-| 本番運用 | 自動処理 | 人の判断 |
-| --- | --- | --- |
-| 文書登録 | Scan、draft登録、Move、Bronze取込 | 文書・ACL・公開範囲の妥当性 |
-| Version公開 | 技術Gate、Command適用、Gold／Index同期 | Version承認、公開停止、削除 |
-| RAG Release | Holdout／ACL／負荷Gate、Deploy | Go／No-Go、Rollback |
-| 障害対応 | Alert、Retry候補、Reconciliation | 影響判定、Replay、Incident Close |
-| 品質監視 | Trace Sampling、Scorer、Dashboard | 誤回答・誤拒否の優先度判断 |
-
-### 4.4 PoCコードからの主な変更点
+#### 4.2.1 PoCコードからの主な変更点
 
 | PoC Source | 本番Source | 主な変更 |
 | --- | --- | --- |
@@ -744,11 +2622,12 @@ PoC版を捨てて作り直すのではなく、メダリオンのDataset責務�
 | `poc/src/04_chunks_silver.sql` | `04_chunks_silver.sql` | ACL、公開範囲、Stable ID、Source Ref |
 | `poc/src/05_gold_poc.sql` | `05_gold_current.sql` | Manifest最新値と承認Pointerを必須化 |
 | `poc/src/rag_app.py` | `rag_release.py`、`rag_graph.py` | ACL、Snapshot、Prompt／Index／Model／Git固定、回答検証 |
-| `poc/src/evaluate_poc.py` | Quality Bundle | Holdout、Identity Fixture、Release Gate |
+| `poc/src/poc_scorers.py`／`evaluate_poc.py` | Quality Bundle | UC Dataset、Training／Holdout、Identity Fixture、Scorer／Judge Version固定、Release Gate、Monitoring |
+| `poc/src/record_poc_assessments.py` | Label Schema／正式Review契約 | Reviewer権限、Masking、保持期間、監査項目を追加 |
 
 ここからは、前述の正常系と統制を実装するPython、SQL、YAML、Terraformを示す。各コードの直前に実行主体、入力、出力、必要理由、正常時・失敗時・再実行時の状態を記載する。宣言的な表変換はSQL、外部API、File Move、条件付き`MERGE／DELETE`、Reconciliationなどの命令的処理はPythonへ分離する。
 
-### 4.5 本番版の実装順序
+#### 4.2.2 本番版の構築順序
 
 PoC章で成立性を確認した契約とDataset責務をBaselineとして固定し、次の順で本番統制を追加する。
 
@@ -758,7 +2637,7 @@ PoC章で成立性を確認した契約とDataset責務をBaselineとして固�
 4. PoC PipelineへManifest ID、監査列、Error分類、承認Pointer付きGoldを追加する。
 5. Search Sync、Corpus Snapshot、Release単位Index、Reconciliationを自動化する。
 6. RAG Release Manifest、ACL、Identity伝播、回答検証、Agent Server／Appsを構築する。
-7. Holdout、ACL Golden Test、負荷、Retry、Monitoring、Alert、Rollback、Runbookを検証する。
+7. Training／Holdout、ACL等Golden Test、Judge対人間誤差、負荷、Retry、Monitoring Dry Run、Alert、Rollback、Runbookを検証する。
 8. prodへ同一ArtifactをDeployし、Pilot Gateを通して利用範囲を段階拡大する。
 
 最初からUIや複雑な再検索へ着手せず、文書が正しく解析され、期待文書を検索できることを先に確認する。Retrievalが成立していない状態で回答Promptだけを改善しても、根拠不足をLLMが補う挙動を強化する可能性がある。
@@ -773,10 +2652,10 @@ PoC章で成立性を確認した契約とDataset責務をBaselineとして固�
 | 4 | 本番Medallion | Bronze、Attempt、Error、Silver、Manifest連携Gold |
 | 5 | 公開・照合 | Search Sync、Snapshot、Index、Reconciliation |
 | 6 | 本番RAG Runtime | Release Manifest、LangGraph、Agent Server、Apps |
-| 7 | 本番Gate | Invariant、ACL Golden、Holdout、負荷、Rollback Test |
-| 8 | prod導入 | Monitoring、Alert、Runbook、Pilot Release |
+| 7 | 本番Gate | Invariant、Security Golden、Holdout、Judge Validation、負荷、Monitoring Dry Run、Rollback Test |
+| 8 | prod導入 | Monitoring開始、Alert、Runbook、Pilot Release |
 
-### 4.6 本番Project構成
+#### 4.2.3 本番Project構成
 
 ```text
 internal-docs-rag/
@@ -834,8 +2713,13 @@ internal-docs-rag/
 │   │   │   ├── evaluation_job.yml
 │   │   │   ├── optimization_job.yml
 │   │   │   ├── review_queue_job.yml
-│   │   │   └── judge_alignment_job.yml
+│   │   │   ├── judge_alignment_job.yml
+│   │   │   └── operational_monitoring.yml
+│   │   ├── dashboards/
+│   │   │   └── rag_operations.lvdash.json
 │   │   ├── src/
+│   │   │   ├── create_operational_monitoring_assets.sql
+│   │   │   ├── triage_operational_signals.sql
 │   │   │   ├── register_prompts.py
 │   │   │   ├── identity_fixtures.py
 │   │   │   ├── seed_evaluation_dataset.py
@@ -850,6 +2734,8 @@ internal-docs-rag/
 │   │   │   ├── sync_evaluation_dataset.py
 │   │   │   ├── route_specialized_cases.py
 │   │   │   └── align_judge.py
+│   │   ├── ops/
+│   │   │   └── production_runbook.md
 │   │   └── tests/seed_evaluation_cases.json
 │   └── realtime/
 │       ├── databricks.yml
@@ -879,9 +2765,11 @@ internal-docs-rag/
 
 エージェント型RAGでは状態遷移、再検索上限、条件分岐が必要なためLangGraphを使用する。一方、単純なモデル呼び出しだけの箇所へ不要なChainを追加せず、AI Search SDKやMLflow APIは直接呼び出す。
 
-### 4.7 本番Source File
+`quality` Bundleのうち、`seed_evaluation_dataset.py`、`evaluate_rag.py`、`release_gate.py`、`register_monitoring.py`は本番導入／Pilotまでに完成させる。`create_review_queue.py`、`sync_review_assessments.py`、`sync_evaluation_dataset.py`、`align_judge.py`は、本番後の定期Reviewと継続改善で初めて自動運用する。PoC用`poc_scorers.py`の決定論的判定は共通PackageまたはQuality Bundleへ移し、同じ定義を再利用する。
 
-#### 4.5.1 共通のRAG入出力契約
+#### 4.2.4 本番Source File
+
+##### 4.2.4.1 共通のRAG入出力契約
 
 この実装では、検索結果、Citation、Search Attempt、十分性判定、回答検証、Agent State、最終結果を共通Packageへ定義する。`document_id`は文書台帳が付与する版をまたいで不変な論理ID、`document_version_id`は内容から生成する不変Version、`chunk_logical_id`は文書内位置、`chunk_version_id`は文書・版・位置を組み合わせたAI Search Primary Keyである。`citation_id`も検索順位ではなくChunk Versionから安定生成する。
 
@@ -903,9 +2791,9 @@ internal-docs-rag/
 
 | 実装情報 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
+| 導入段階 | PoCでは`poc/src/evaluate_poc.py`の小規模Datasetを使い、本番導入時に本SourceでUC Training／Holdoutへ移行する。 |
 | 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
+| 後続段階で追加される機能 | 本番導入時にFamily Hash Split、Identity Fixture、Lineage、ACL、監査、Release Gateへ接続する。 |
 | 関連Table／Dataset | 入力: 構造化RAGデータ／出力: 共通Pydantic契約 |
 | 関連Job／Pipeline | 全Bundle。該当BundleのJob／Pipelineから実行する。 |
 | 関連する検証 | 同じ型と検証規則を利用する。不正入力をValidation Errorにする。 |
@@ -1225,9 +3113,48 @@ class RagResult(BaseModel):
     validation_failures: list[str]
 ```
 
+**想定出力サンプル（共通契約の`RagResult`）**
+
+```json
+{
+  "answer": "検索にはDatabricks AI Searchを利用します。[SRC-8A10F2C9B331]",
+  "retrieved_document_ids": ["DOC-RAG-001"],
+  "retrieved_document_version_ids": ["ver-a81f..."],
+  "retrieved_chunk_version_ids": ["chk-a110..."],
+  "citations": [{
+    "citation_id": "SRC-8A10F2C9B331",
+    "document_id": "DOC-RAG-001",
+    "document_version_id": "ver-a81f...",
+    "chunk_version_id": "chk-a110...",
+    "title": "社内RAGアーキテクチャガイド",
+    "source_ref": "DOCREF-4e81...",
+    "page_number": 2
+  }],
+  "search_attempts": [{
+    "attempt_number": 1,
+    "query": "RAG基盤 検索サービス",
+    "retrieved_chunk_version_ids": ["chk-a110..."],
+    "accepted_chunk_version_ids": ["chk-a110..."],
+    "sufficiency_reason": "質問へ回答できる根拠がある"
+  }],
+  "search_count": 1,
+  "acl_violation_count": 0,
+  "current_version_violation_count": 0,
+  "refused": false,
+  "refusal_reason": null,
+  "human_review_required": false,
+  "rag_release_id": "rag-release-2026-08-15-01",
+  "corpus_snapshot_id": "corpus-2026-08-15",
+  "index_release_id": "index-2026-08-15",
+  "validation_failures": []
+}
+```
+
+`RagState`は途中の検索語、累積Evidence、`next_step`なども持つが、Agent Serverは機密な内部状態を落として`RagResult`だけを外部契約として返す。
+
 改名・移動は台帳上の同じ`document_id`へ新しい`source_uri`を登録し、内容が同一なら同じ`document_version_id`を維持する。内容訂正は同じ`document_id`の新しい`document_version_id`となり、旧版は履歴へ残るがCurrentから外れる。同一内容を別の論理文書として登録する場合は異なる`document_id`を付与する。旧版参照が必要な監査処理はSilver履歴を直接利用し、Realtime検索はCurrent Indexだけを使う。
 
-#### 4.5.2 Prompt
+##### 4.2.4.2 Prompt
 
 この実装では、十分性判定、検索語言い換え、回答生成を別Promptとして登録する。1回の変更で複数Promptを同時に変えると原因分析が難しいため、名前とAliasを分ける。`register_prompt()`は同じ名前で再実行するたびに不変な新Versionを作り、`development` Aliasだけを更新する。各Promptの解決済みVersionはTraceへ記録する。
 
@@ -1235,9 +3162,9 @@ class RagResult(BaseModel):
 
 | 実装情報 | 内容 |
 | --- | --- |
-| 導入段階 | PoC時に初版を完成させ、本番導入時にIdentity・監査・公開統制を追加する。 |
+| 導入段階 | PoCでは`poc/src/poc_scorers.py`と`evaluate_poc.py`を使い、本番導入時に本Sourceへ移行する。 |
 | 初めて必要になる段階 | PoC時 |
-| 後続段階で追加される機能 | 本番導入時にManifest、Service Principal、ACL、監査、Release Gateへ接続する。 |
+| 後続段階で追加される機能 | 本番導入時にUC Holdout、Identity Fixture、Security Gate、Scorer／Judge Version固定を追加する。 |
 | 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
 | 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
 | 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
@@ -1364,7 +3291,18 @@ if __name__ == "__main__":
     main()
 ```
 
-#### 4.5.3 文書登録・Manifest・Bronze／Silver／Gold
+**想定出力サンプル（本番用Prompt Registry）**
+
+| Prompt名 | 登録Version | Alias | 主な利用Node |
+| --- | ---: | --- | --- |
+| `main.llmops.internal_rag_sufficiency` | 5 | `development -> 5` | `check` |
+| `main.llmops.internal_rag_rewrite` | 3 | `development -> 3` | `rewrite` |
+| `main.llmops.internal_rag_answer` | 8 | `development -> 8` | `answer` |
+| `main.llmops.internal_rag_answer_validation` | 4 | `development -> 4` | `validate_answer` |
+
+本番Release Manifestへ格納する値はAliasではなく、例えば`prompts:/main.llmops.internal_rag_answer/8`という不変URIである。
+
+##### 4.2.4.3 文書登録・Manifest・Bronze／Silver／Gold
 
 この実装では、文書管理台帳`document_source_manifest`を論理ID・ACL・有効状態の正本とし、Auto Loaderは原文書Versionの追加だけを検知する。BronzeとSilverは追記型履歴、Gold Currentは有効・承認済みのVersionだけを公開する。JOIN、Filter、列変換、`variant_explode`、Window関数、成功・失敗の分岐はLakeflow Spark Declarative PipelinesのSQLへ移し、SQLに同等のKey指定Streaming重複排除がない処理と、後続の命令的なDelta操作はPythonへ残す。
 
@@ -1386,11 +3324,11 @@ Lakeflowは同一PipelineにSQLとPythonのSource Fileを混在でき、Dataset�
 
 Pipelineの`configuration`には、`internal_docs.source_path`、`internal_docs.image_output_path`、`internal_docs.ai_parse_document_version`、`internal_docs.ai_prep_search_version`、`internal_docs.chunk_schema_version`、`internal_docs.ingestion_run_id`を設定する。SQLは`${key}`、Pythonは`spark.conf.get("key")`で同じ値を解決する。
 
-##### 4.5.3.1 文書管理台帳の準備と文書登録Workflow
+###### 4.2.4.3.1 文書管理台帳の準備と文書登録Workflow
 
 `document_source_manifest`という名前であるが、JSONやYAMLのManifest Fileではない。Unity Catalogの`main.llmops` Schemaで管理するDelta Tableであり、論理文書の現在状態、最新のACL／Title／公開範囲、有効期間、現在公開する文書VersionへのPointerを保持する。Pipelineは`SELECT`だけを行い、利用者やRealtime Agentから直接更新させない。
 
-###### 4.5.3.1.1 Service Principalの準備とBootstrap
+**4.2.4.3.1.1 Service Principalの準備とBootstrap**
 
 この節のService Principalは、JobやPipelineを実行する非人間Identityである。DABは作成済みIdentityを参照するだけなので、アプリケーションBundleをDeployする前に、Account／IdP管理者とPlatform管理者がIdentityと初期権限をBootstrapする。
 
@@ -1423,7 +3361,7 @@ flowchart TD
 
 Schema Migration SPが自分自身へ`USE CATALOG`、`CREATE TABLE`、Warehouse利用権限を付与する構成にはしない。これらはPlatform管理者または専用IaC Deploy Identityが先に付与する。本資料では運用Service PrincipalへのGrantをTerraformへ分離するため、Schema Migration SPへ`MANAGE`やMetastore Adminを付与しない。DDLも中央IaCへ移管する組織では、Migration SP自体を廃止できる。
 
-##### Service Principal一覧と作成元
+**Service Principal一覧と作成元**
 
 | 論理名 | 表示名の例 | 作成元・Workspace割当 | 実行対象 | `run_as`／参照方法 | 主なUnity Catalog権限 |
 | --- | --- | --- | --- | --- | --- |
@@ -1461,7 +3399,7 @@ Schema Migration SPが自分自身へ`USE CATALOG`、`CREATE TABLE`、Warehouse�
 
 Realtime AgentのService PrincipalはDatabricks AppsがAppごとに自動作成するため、Terraformで重複作成しない。App Resourceを削除すると関連Identityも削除され得るため、再作成時はApplication IDの変化を前提にGrantをBundle Resource参照から再適用する。
 
-##### クラウド非依存のIdentity IaC
+**クラウド非依存のIdentity IaC**
 
 `infra/identity`はアプリケーションDABより先にAccount管理者が適用する。次はDatabricks Terraform ProviderのAccount-level `databricks_service_principal`を使う例であり、`application_id`を指定しなければDatabricks-managed Service Principalを作成する。Azure EntraなどIdP管理Identityを使う場合は、IdP管理者が先にApplicationを作成し、そのApplication IDを`external_application_ids`へ渡す。IdP Object IDやSecretは渡さない。
 
@@ -1672,7 +3610,7 @@ output "service_principal_scim_ids" {
 
 Service Principalを削除すると、所有Resource、Jobの`run_as`、Grant、外部認証が同時に壊れる。最初にJob停止と後継Identityへの所有権・Grant移行を行い、DAB変数を切り替え、監査確認後に`active=false`で無効化する。即時削除ではなく無効化期間を設け、`disable_as_user_deletion=true`のAccount-level動作と組織の退役Policyを確認する。
 
-##### Workspace割当とBootstrap権限
+**Workspace割当とBootstrap権限**
 
 `infra/databricks`はIdentity作成後にPlatform管理者が環境ごとに適用する。ここでは前段のOutputをCI/CDが`TF_VAR_service_principal_application_ids`と`TF_VAR_service_principal_scim_ids`へ渡す。Terraform State間連携を使う場合も、Remote StateへのRead権限を最小化する。
 
@@ -1944,7 +3882,7 @@ resource "databricks_permissions" "schema_migration_warehouse" {
 
 `databricks_permissions`は対象ObjectのACLをAuthoritativeに管理するため、既存Warehouse利用者がいる場合は同じResourceへ全Access Controlを列挙するか、組織の中央IaCへ統合する。Schema Migration SPにMetastore Adminや`MANAGE`を付与せず、運用PrincipalへのGrantはPlatform IaC Deploy Identityが`runtime_grants.tf`で適用する。
 
-##### DAB変数と環境別Deploy
+**DAB変数と環境別Deploy**
 
 `bundles/ingestion/databricks.yml`
 
@@ -5612,7 +7550,9 @@ WHERE manifest.is_deleted = false;
 
 SCIM Principalの存在確認はSQLだけでは完結しないため、登録時のSDK検査に加え、日次Jobで削除・無効化されたUser／Groupを再検証する。
 
-##### 4.5.3.2 Bronze取込とPreflight検査
+###### 4.2.4.3.2 Bronze取込とPreflight検査
+
+本番メダリオンの想定出力も説明用であり、HashやBinaryは短縮する。重要なのは具体的な値そのものではなく、同じ`document_id`のVersionがどの履歴表へ残り、どの条件でErrorまたはGoldへ分岐するかである。
 
 `bundles/ingestion/src/01_bronze_ingestion.sql`
 
@@ -5730,9 +7670,20 @@ INNER JOIN main.llmops.document_source_manifest AS manifest
  AND manifest.is_deleted = false;
 ```
 
+**想定出力サンプル（Bronze／Quarantine分岐）**
+
+| 出力Dataset | `source_uri` | `document_id` | `document_version_id`／`content_hash` | `preflight_error` | `reason` |
+| --- | --- | --- | --- | --- | --- |
+| `internal_docs_source_events` | `/Volumes/prod/docs/rag-guide-v2.pdf` | なし | `hash-b72e...` | `NULL` | なし |
+| `internal_docs_bronze` | `/Volumes/prod/docs/rag-guide-v2.pdf` | `DOC-RAG-001` | `ver-b72e...` | `NULL` | なし |
+| `internal_docs_unregistered_sources` | `/Volumes/prod/docs/unregistered.pdf` | なし | `hash-91ac...` | `NULL` | `UNREGISTERED_SOURCE_URI` |
+| `internal_docs_bronze` | `/Volumes/prod/docs/empty.pdf` | `DOC-EMPTY-001` | `ver-001e...` | `EMPTY_FILE` | なし |
+
+登録済みでもPreflight失敗行はBronze履歴へ残るが、Parse Attemptの`WHERE preflight_error IS NULL`で停止する。未登録行は`document_id`を付与されず、明示Replayなしでは公開経路へ戻らない。
+
 PreflightはAI Functionを呼び出す前に判定できる拡張子、空File、100MB超過をSQLで記録する。Malware Scan、暗号化PDF、Digital Signatureなど外部Toolが必要な検査は、この宣言的変換へ埋め込まず取込前Jobまたは専用Scannerで実施する。`internal_docs_source_events`でFileを1回だけ読み、登録済みはBronze、未登録はQuarantineへ分岐する。後日のManifest登録だけで過去Eventを公開せず、前節の明示Replayが新しいPathで通常経路へ戻す。
 
-##### 4.5.3.3 同一文書Versionの重複排除
+###### 4.2.4.3.3 同一文書Versionの重複排除
 
 `bundles/ingestion/src/01b_deduplicate_versions.py`
 
@@ -5790,9 +7741,19 @@ def internal_docs_unique_versions() -> DataFrame:
     )
 ```
 
+**想定出力サンプル（`internal_docs_unique_versions`）**
+
+| `document_id` | `document_version_id` | Bronze Event数 | Unique Versions出力数 | 説明 |
+| --- | --- | ---: | ---: | --- |
+| `DOC-RAG-001` | `ver-b72e...` | 3 | 1 | 同じ論理文書・内容Versionの再通知を1件へ集約 |
+| `DOC-RAG-001` | `ver-c83f...` | 1 | 1 | 改訂内容のため別Versionとして保持 |
+| `DOC-OPS-010` | `ver-b72e...` | 1 | 1 | 内容Hashが同じでも論理文書IDが異なるため別文書として保持 |
+
+本番では`document_id`もKeyに含めるため、同じBinaryを別の論理文書として登録したケースを誤って消さない。
+
 この処理だけはPythonへ残す。Streaming SQLの`DISTINCT`は全選択列を比較するため、`ingested_at`や`ingestion_run_id`が異なる同一Versionを同一視できない。一方、`dropDuplicates(["document_id", "document_version_id"])`は必要なKeyを明示できる。Watermarkを付けると保持期限を超えた同一Versionが再通過し得るため、本例は金融機関向けの重複課金・再現性を優先して無期限Stateを使用する。State量を監視し、AI Function Version変更時の意図的な全件再処理は新Pipeline Releaseまたは計画したFull Refreshとして実施する。
 
-##### 4.5.3.4 Parse Attempt、成功、Errorの分離
+###### 4.2.4.3.4 Parse Attempt、成功、Errorの分離
 
 `bundles/ingestion/src/02_document_parse.sql`
 
@@ -5962,9 +7923,20 @@ WHERE attempt.parsed_document IS NULL
       ) > 500;
 ```
 
+**想定出力サンプル（Parse Attempt／成功／Error）**
+
+| 出力Dataset | `document_id` | `document_version_id` | `page_count`／`error_code` | `ai_parse_document_version` | `error_class` |
+| --- | --- | --- | --- | --- | --- |
+| `internal_docs_parse_attempts` | `DOC-RAG-001` | `ver-b72e...` | `parsed_document.pages=18` | `2.0` | なし |
+| `internal_docs_parsed` | `DOC-RAG-001` | `ver-b72e...` | `18` | `2.0` | なし |
+| `internal_docs_parse_errors` | `DOC-EMPTY-001` | `ver-001e...` | `EMPTY_FILE` | `2.0` | `PERMANENT` |
+| `internal_docs_parse_errors` | `DOC-SCAN-009` | `ver-ff12...` | `PARSE_ERROR_STATUS` | `2.0` | `TRANSIENT` |
+
+成功Versionは`internal_docs_parsed`だけ、失敗Versionは`internal_docs_parse_errors`だけへ出る。Error行にも入力VersionとFunction Versionが残るため、同じ条件での再現と計画Retryが可能になる。
+
 `ai_parse_document` 2.xの`error_status`は配列であり、ページ数は`document.pages`から数える。旧実装のように`error_status`を`STRING`、`metadata.page_count`を`INT`として直接取得しない。`internal_docs_parse_errors`には監査可能なError JSONと処理Versionを追加し、再試行対象を`document_id`と`document_version_id`で特定する。
 
-##### 4.5.3.5 Prep Attempt、成功、Errorの分離
+###### 4.2.4.3.5 Prep Attempt、成功、Errorの分離
 
 `bundles/ingestion/src/03_search_prep.sql`
 
@@ -6053,9 +8025,19 @@ WHERE attempt.prepared_document IS NULL
       NOT IN ('null', '{}', '[]');
 ```
 
+**想定出力サンプル（Prep Attempt／成功／Error）**
+
+| 出力Dataset | `document_id` | `document_version_id` | Chunk数／`error_message` | `ai_prep_search_version` | `retry_count` |
+| --- | --- | --- | --- | --- | ---: |
+| `internal_docs_prep_attempts` | `DOC-RAG-001` | `ver-b72e...` | `document.contents=7` | `2.0` | なし |
+| `internal_docs_prepared` | `DOC-RAG-001` | `ver-b72e...` | 7 Chunk | `2.0` | なし |
+| `internal_docs_prep_errors` | `DOC-TABLE-004` | `ver-7a21...` | `{"error_code":"PREP_FAILED"}` | `2.0` | 0 |
+
+Parse失敗Versionはこの一覧へ現れない。Prep失敗VersionもSilver Chunkへ展開されず、Error Tableで再試行対象として管理される。
+
 成功表とError表は物理化済み`internal_docs_prep_attempts`だけを参照するため、`ai_prep_search`をそれぞれで再実行しない。Parse失敗VersionはPrep Attemptの入力にならず、Prep失敗VersionはChunk Silverの入力にならない。
 
-##### 4.5.3.6 Chunk Silver履歴
+###### 4.2.4.3.6 Chunk Silver履歴
 
 `bundles/ingestion/src/04_chunks_silver.sql`
 
@@ -6144,9 +8126,18 @@ SELECT
 FROM identified_chunks AS identified;
 ```
 
+**想定出力サンプル（`internal_docs_chunks_silver`）**
+
+| `chunk_logical_id` | `chunk_version_id` | `document_id` | `document_version_id` | `chunk_to_embed` | `chunk_to_retrieve` | `allowed_principals` | `page_number` |
+| --- | --- | --- | --- | --- | --- | --- | ---: |
+| `POS-000000` | `chk-a110...` | `DOC-RAG-001` | `ver-b72e...` | `RAG アーキテクチャ AI Search...` | `検索にはDatabricks AI Searchを利用する。` | `[grp-rag-users]` | 2 |
+| `POS-000001` | `chk-b220...` | `DOC-RAG-001` | `ver-b72e...` | `ACL Filter entitlement...` | `検索前に利用者GroupからACL Filterを生成する。` | `[grp-rag-users]` | 3 |
+
+同じ`chunk_logical_id`でも文書Versionが変われば`chunk_version_id`は変わる。ここにあるACLやTitleは取込時点の監査値であり、公開値はGoldでManifest最新値へ置換される。
+
 `variant_explode`が返す配列位置だけに依存せず、`ai_prep_search`の`chunk_position`を優先し、欠損時だけ`variant_explode.pos`へFallbackする。`chunk_logical_id`は文書内位置、`chunk_version_id`は`document_id`、`document_version_id`、`chunk_logical_id`から決定論的に生成する。
 
-##### 4.5.3.7 Manifest公開条件とGold Current
+###### 4.2.4.3.7 Manifest公開条件とGold Current
 
 `bundles/ingestion/src/05_gold_current.sql`
 
@@ -6248,6 +8239,17 @@ INNER JOIN active_manifest AS manifest
 WHERE versions.version_rank = 1;
 ```
 
+**想定出力サンプル（`internal_docs_current_mv`）**
+
+| `document_id` | SilverのVersion | Manifestの`approved_document_version_id` | Goldへ公開 | 最新ACL | 除外／公開理由 |
+| --- | --- | --- | --- | --- | --- |
+| `DOC-RAG-001` | `ver-a81f...`、`ver-b72e...` | `ver-a81f...` | `ver-a81f...`の全Chunk | `[grp-rag-users, grp-audit]` | v2取込済みでもPointerがv1のためv1を維持 |
+| `DOC-OPS-010` | `ver-c83f...` | `ver-c83f...` | なし | `[grp-ops]` | `approval_status='pending'`のため除外 |
+| `DOC-OLD-003` | `ver-d94a...` | `ver-d94a...` | なし | `[grp-legacy]` | `valid_to`経過のため除外 |
+| `DOC-DEL-007` | `ver-e05b...` | `ver-e05b...` | なし | `[grp-rag-users]` | `is_deleted=true`のため除外 |
+
+`DOC-RAG-001`のTitleやACLはSilver取込時値ではなく、Gold計算時のManifest最新値になる。承認Pointerを`ver-b72e...`へ切り替えると、次回Materialized View更新でv2の全Chunkへ切り替わる。
+
 Version候補を文書単位で先に順位付けしてからChunkへ戻す。Chunk行へ直接`row_number()`を付けると文書ごとに1 Chunkしか残らないためである。Gold生成時にManifestをBatch Readすることで、取込後に変更されたACL、Title、公開範囲、削除状態、有効期間を最新値へ差し替える。`approved_document_version_id`と一致しないVersionは、`approval_status='approved'`の論理文書であっても公開しない。
 
 `ai_prep_search`の`chunk_to_embed`は検索精度向上用の文脈を含み、`chunk_to_retrieve`は回答コンテキストとして利用する原文Chunkである。回答生成へ`chunk_to_embed`をそのまま渡すと付加情報と原文の境界が曖昧になるため、検索と回答で列を分ける。
@@ -6277,7 +8279,7 @@ Version候補を文書単位で先に順位付けしてからChunkへ戻す。Ch
 
 Search Syncが読む`internal_docs_current_mv`の列と`SEARCH_COLUMNS`は変更していないため、後続の物理Delta Table、AI Search Index、Realtime AgentへのSchema影響はない。
 
-##### 4.5.3.8 Dataset依存関係と公開条件の検証
+###### 4.2.4.3.8 Dataset依存関係と公開条件の検証
 
 依存関係は`Source Events → 登録済みBronze／未登録Quarantine`に分岐し、登録済み側だけが`Unique Versions → Parse Attempt → Parse成功 → Prep Attempt → Prep成功 → Chunk Silver → Gold Current`へ進む一方向Graphである。Error表はAttemptから分岐するだけなので循環しない。ManifestのStatic Joinは過去Eventを自動再評価しないため、未登録側は明示Replayで新しいPathへ再投入する。次の検証QueryはPipeline更新後にQuality Gate Jobから実行し、1行でも返ればReleaseを停止する。
 
@@ -6565,7 +8567,7 @@ def publish_current_snapshot(
 
 物理同期表は事前作成時に`delta.enableChangeDataFeed=true`を設定する。新Version登録時は旧VersionがCurrent MVから消え、Publish Jobの`whenNotMatchedBySourceDelete()`が同期表から削除する。文書削除・失効・公開停止も同じ経路でDeleteとしてDelta Syncへ伝播する。履歴はBronze／Silverに残るため、「履歴削除」と「検索対象除外」を混同しない。
 
-#### 4.5.4 Reconciliationと文書Lifecycle
+##### 4.2.4.4 Reconciliationと文書Lifecycle
 
 Auto Loaderの追加・更新検知だけでは、Volumeから消えたFileを文書削除として確実に伝播できない。`document_source_manifest`を正本とし、定期Reconciliation Jobが実在File一覧、台帳、Current、Indexを照合する。
 
@@ -6829,7 +8831,7 @@ if __name__ == "__main__":
 
 Reconciliation Jobは`pending`候補の作成までとし、Source消失だけで自動的に`is_deleted=true`へしない。文書管理者が移動中、一時障害、正式削除を区別し、承認済みLifecycle Workflowが楽観Lock付きでManifestを更新する。その後にPipeline、Current Publish、Triggered Syncを順に実行し、専用Golden Queryで削除・失効文書の`chunk_version_id`が0件になったことを確認する。改名を同一文書移動として扱うには、利用者操作または文書管理Systemが同じ`document_id`を明示する必要があり、Path類似度だけで自動同一視しない。
 
-#### 4.5.5 Search Sync・AI Search
+##### 4.2.4.5 Search Sync・AI Search
 
 この実装では、Current同期用Delta Tableから新しい`index_release_id`ごとにIndexを作成する。既存Indexを名前だけで再利用せず、`describe()`のSource、Primary Key、Embedding列、Embedding Model、Query Model、Pipeline Type、同期列を期待Manifestと比較する。差分があれば破壊更新せず、新Indexを並行作成する。
 
@@ -7089,7 +9091,7 @@ if __name__ == "__main__":
 
 2026年8月時点の公式資料では、Standard EndpointはSource TableのCDFが必要で、Continuous／Triggeredの増分同期を利用できる。Storage-optimizedはTriggeredのみで、同期時に部分再構築し、FilterはSQL風文字列となる。Dedicated Full-Text IndexはBetaである。Endpoint種別、Filter Builder、待機TimeoutはBundle変数へ分離し、Workspaceで利用可能な機能とSDK Versionを固定する。
 
-#### 4.5.6 RAG Release Manifest
+##### 4.2.4.6 RAG Release Manifest
 
 Prompt Alias、Index名、Codeを別々に切り替えると新旧構成が混在するため、Quality Bundleは`main.llmops.rag_release_manifest`へ次の不変Releaseを発行する。
 
@@ -7259,13 +9261,45 @@ def load_rag_release(rag_release_id: str) -> RagRelease:
     return RagRelease(prompt_uris=prompt_uris, **row)
 ```
 
+**想定出力サンプル（`RagRelease`）**
+
+```json
+{
+  "rag_release_id": "rag-release-2026-08-15-01",
+  "git_commit": "8d31a6f...",
+  "build_id": "build-20260815-0142",
+  "common_wheel_version": "1.8.0",
+  "prompt_uris": {
+    "sufficiency": "prompts:/main.llmops.internal_rag_sufficiency/5",
+    "rewrite": "prompts:/main.llmops.internal_rag_rewrite/3",
+    "answer": "prompts:/main.llmops.internal_rag_answer/8",
+    "answer_validation": "prompts:/main.llmops.internal_rag_answer_validation/4"
+  },
+  "model_service": "internal-rag-llm-endpoint",
+  "expected_model_route": "gpt-4o-primary",
+  "index_name": "main.llmops.internal_docs_index_20260815",
+  "index_release_id": "index-2026-08-15",
+  "corpus_snapshot_id": "corpus-2026-08-15",
+  "embedding_model": "databricks-gte-large-en",
+  "ai_parse_document_version": "2.0",
+  "ai_prep_search_version": "2.0",
+  "chunk_schema_version": "chunk-v3",
+  "acl_policy_version": "acl-v4",
+  "judge_version": "internal_rag_quality/7"
+}
+```
+
+Release状態不一致、存在しないIndex、可変Prompt Alias、Build metadata不一致のいずれかがある場合は、このObjectを返さず起動またはRequestをFail Closedにする。
+
 Release Gate合格後に候補ManifestをInsertし、`rag_release_channels`の`production` Pointerを1 Transactionで切り替える。Runtimeは起動時またはRequest開始時に`RAG_RELEASE_ID`を解決し、Stateへ固定する。Rollbackは前Manifest IDを再指定する。`@development`／`@candidate` AliasはPrompt候補作成時だけに使い、本番Applicationは参照しない。Promptだけ、Indexだけ、Modelだけを比較するExperimentでも別Manifestを作り、その他の列を同一にする。
 
 本番Appは`RAG_RELEASE_STATUS=production`、Staging／Evaluation Jobは対象に応じて`candidate`を明示し、状態不一致を拒否する。Channel Pointer更新とManifest行InsertはQuality Service Principalだけに許可する。
 
-#### 4.5.7 LangGraph
+##### 4.2.4.7 LangGraph
 
 この実装は、リクエスト開始時に `rag_release_manifest` と実利用者の Entitlement をStateへ固定し、取得、決定論的検査、意味的十分性判定、再検索、回答、回答検証、拒否または人手確認をNodeとして分離する。検索のたびに過去Evidenceを捨てず、`SearchAttempt` と累積Evidenceを保持する。回答に渡すEvidenceだけはScore順、重複排除、Context上限で選び、採用されなかったChunkも監査履歴へ残す。
+
+エージェント側の想定出力は、同じ正常回答ケースを共通契約、Release、Graph、Identity、SSE、画面表示の順に追跡できるよう、IDを意図的に揃えている。Token、Raw Path、ACL式など本番で記録・表示してはいけない値はサンプルにも含めない。
 
 生成モデルは `ChatDatabricks(endpoint=release.model_service)` がManifestで固定されたServing endpointを呼ぶ。`similarity_search()` はAI Search、Query EmbeddingはIndexに設定されたEmbedding endpointを呼ぶ。PromptはAliasではなくManifestの不変Version URIから解決する。Serving endpoint内で複数Routeを使う場合は、Response metadataの実RouteとRequest IDをTraceへ残し、ResponseでRouteが返らない構成ではInference TableとRequest IDを後続Jobで結合する。
 
@@ -8388,6 +10422,33 @@ def run_graph(
     return result
 ```
 
+**想定処理結果サンプル（LangGraphの状態遷移）**
+
+| 順序 | 完了Node | 主なState差分 | 次のNode |
+| ---: | --- | --- | --- |
+| 1 | `retrieve` | `documents=[chk-a110...]`、`search_count=1`、ACL違反0 | `check` |
+| 2 | `check` | `missing_aspects=[]`、`next_step='answer'` | `answer` |
+| 3 | `answer` | Citation付き`answer`、構造化`citations` | `validate_answer` |
+| 4 | `validate_answer` | `validation_failures=[]`、`next_step='complete'` | 終了 |
+
+```json
+{
+  "answer": "検索にはDatabricks AI Searchを利用します。[SRC-8A10F2C9B331]",
+  "retrieved_document_ids": ["DOC-RAG-001"],
+  "retrieved_document_version_ids": ["ver-a81f..."],
+  "retrieved_chunk_version_ids": ["chk-a110..."],
+  "search_count": 1,
+  "acl_violation_count": 0,
+  "current_version_violation_count": 0,
+  "refused": false,
+  "refusal_reason": null,
+  "human_review_required": false,
+  "validation_failures": []
+}
+```
+
+検索結果が不足する場合は`retrieve -> check -> rewrite -> retrieve`と進む。上限到達、Query重複、ACL／Current疑義、回答検証失敗では、回答本文を公開せず`refuse`または`human_review`へ分岐する。
+
 `allowed_principals` がArray列の場合のFilter意味論は、採用するAI Search SDK／Endpoint TypeでGolden ACL Testを実行して固定する。Workspaceで期待するintersection動作を満たさない場合は、Principal単位の検索用行へ正規化するなど、検索前に完全一致Filterできる物理Schemaへ変更する。曖昧なClient側Filterだけで本番ACLを成立させない。
 
 MLflow Retrieval Scorer向けSpanは、検索Nodeの内部Stateをそのまま出力せず、`page_content`と`metadata.doc_uri`／`chunk_id`を持つDocument一覧へ正規化する。`doc_uri`にはRaw Storage PathではなくOpaqueな`source_ref`を使う。
@@ -8404,7 +10465,7 @@ MLflow Retrieval Scorer向けSpanは、検索Nodeの内部Stateをそのまま�
 
 Model Serving endpointはモデルの実行面、AI Searchは検索面、Agent ServerはGraphとPolicyの実行面である。基盤モデルを変える場合はManifestが参照するServing endpointまたはそのRouteを変更し、Prompt、Index、Code、Model Routeをまとめた別の `rag_release_id` としてGateする。
 
-#### 4.5.8 EvaluationDataset・Scorer
+##### 4.2.4.8 EvaluationDataset・Scorer
 
 Evaluation Caseは質問Familyと実行時Versionを分離する。`case_family_id` は質問の意味、業務目的、文書Familyから作り、Snapshotを含めない。Training／HoldoutはこのIDのHashで固定する。`case_instance_id` はFamily、Identity fixture、Corpus Snapshot、`expectation_version` を含む個別ケースIDであり、文書改訂で期待値が変わる場合は同じFamilyに新Instanceを追加する。
 
@@ -8439,12 +10500,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import mlflow
 from mlflow.genai.datasets import create_dataset
 
 
-DATASET_NAME = "main.llmops.internal_rag_golden"
+TRAIN_DATASET_NAME = "main.llmops.internal_rag_train"
+HOLDOUT_DATASET_NAME = "main.llmops.internal_rag_holdout"
+SPLIT_POLICY_VERSION = "family-hash-v1"
+HOLDOUT_BUCKET_START = 80
 
 
 def stable_id(prefix: str, values: list[str]) -> str:
@@ -8493,8 +10558,17 @@ def stable_citation_id(chunk_version_id: str) -> str:
     return f"SRC-{digest.upper()}"
 
 
-def build_record() -> dict:
-    """SnapshotをFamilyから除外し、個別期待値VersionだけをInstanceへ含める。
+def assign_split(case_family_id: str) -> tuple[str, int]:
+    """Family HashでSplitを固定し、類似CaseのTraining／Holdout跨ぎを防ぐ。"""
+    split_bucket = int(
+        hashlib.sha256(case_family_id.encode("utf-8")).hexdigest()[:8], 16
+    ) % 100
+    dataset_split = "holdout" if split_bucket >= HOLDOUT_BUCKET_START else "train"
+    return dataset_split, split_bucket
+
+
+def build_record(case: dict) -> tuple[str, dict]:
+    """Seed CaseからSplit固定済みEvaluationDataset Recordを作る。
 
     Returns:
         処理結果。
@@ -8508,57 +10582,55 @@ def build_record() -> dict:
     Retry:
         永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
-    case_family_id = stable_id(
-        "family",
-        ["RAG基盤の検索サービス", "architecture", "rag-platform"],
-    )
-    expectation_version = "exp-v1"
-    corpus_snapshot_id = "corpus-2026-08-01"
-    identity_fixture_id = "fixture-engineering-reader-v1"
-    expected_chunk_version_id = "CHUNK-VERSION-ARCH-RAG-001"
+    case_family_id = stable_id("family", case["family_key"])
+    dataset_split, split_bucket = assign_split(case_family_id)
     case_instance_id = stable_id(
         "case",
         [
             case_family_id,
-            identity_fixture_id,
-            corpus_snapshot_id,
-            expectation_version,
+            case["identity_fixture_id"],
+            case["corpus_snapshot_id"],
+            case["expectation_version"],
         ],
     )
-    return {
+    record = {
         "inputs": {
             "case_instance_id": case_instance_id,
-            "question": "RAG基盤で利用している検索サービスは何ですか？",
-            "identity_fixture_id": identity_fixture_id,
-            "rag_release_id": "rag-release-2026-08-01",
-            "corpus_snapshot_id": corpus_snapshot_id,
-            "index_release_id": "index-release-2026-08-01",
+            "question": case["question"],
+            "identity_fixture_id": case["identity_fixture_id"],
+            "rag_release_id": case["rag_release_id"],
+            "corpus_snapshot_id": case["corpus_snapshot_id"],
+            "index_release_id": case["index_release_id"],
         },
         "expectations": {
-            "expectation_version": expectation_version,
-            "expected_response": "Databricks AI Searchを利用している。",
-            "expected_document_ids": ["DOC-ARCH-RAG"],
-            "expected_chunk_version_ids": [expected_chunk_version_id],
+            "expectation_version": case["expectation_version"],
+            "expected_response": case["expected_response"],
+            "expected_document_ids": case["expected_document_ids"],
+            "expected_chunk_version_ids": case["expected_chunk_version_ids"],
             "expected_citation_ids": [
-                stable_citation_id(expected_chunk_version_id)
+                stable_citation_id(chunk_version_id)
+                for chunk_version_id in case["expected_chunk_version_ids"]
             ],
-            "expected_refused": False,
-            "expected_refusal_reason": None,
-            "expected_max_search_attempts": 2,
+            "expected_refused": case["expected_refused"],
+            "expected_refusal_reason": case.get("expected_refusal_reason"),
+            "expected_max_search_attempts": case["expected_max_search_attempts"],
         },
         "tags": {
             "case_family_id": case_family_id,
             "case_instance_id": case_instance_id,
-            "category": "architecture",
-            "acl_category": "engineering",
-            "security_category": "normal",
-            "dataset_split": "train",
+            "category": case["category"],
+            "acl_category": case["acl_category"],
+            "security_category": case["security_category"],
+            "dataset_split": dataset_split,
+            "split_bucket": str(split_bucket),
+            "split_policy_version": SPLIT_POLICY_VERSION,
         },
     }
+    return dataset_split, record
 
 
 def main() -> None:
-    """安定record_idを指定してmergeし、Seed再実行による重複Caseを防ぐ。
+    """Family Hashで分けたSeedを独立Training／Holdout DatasetへMergeする。
 
     Returns:
         なし。
@@ -8573,18 +10645,32 @@ def main() -> None:
         永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     experiment = mlflow.set_experiment("/Shared/llmops/internal-rag-evaluation")
-    dataset = create_dataset(
-        name=DATASET_NAME,
-        experiment_id=experiment.experiment_id,
+    cases = json.loads(
+        Path("tests/seed_evaluation_cases.json").read_text(encoding="utf-8")
     )
-    dataset.merge_records([build_record()])
+    records = {"train": [], "holdout": []}
+    for case in cases:
+        dataset_split, record = build_record(case)
+        records[dataset_split].append(record)
+    if not records["train"] or not records["holdout"]:
+        raise ValueError("Seed must contain both training and holdout case families")
+
+    for dataset_name, dataset_split in (
+        (TRAIN_DATASET_NAME, "train"),
+        (HOLDOUT_DATASET_NAME, "holdout"),
+    ):
+        dataset = create_dataset(
+            name=dataset_name,
+            experiment_id=experiment.experiment_id,
+        )
+        dataset.merge_records(records[dataset_split])
 
 
 if __name__ == "__main__":
     main()
 ```
 
-Golden Setには通常質問だけでなく、文書Version競合、削除／失効、古い文書だけの検索、Parse Error、0件、同一Query Rewrite、再検索上限、ACL境界、Prompt Injection、System Prompt／Secret抽出要求を含める。同じFamilyの旧Snapshot版と新Snapshot版は同じSplitへ置き、Expectation変更は上書きせず `expectation_version` を増やす。
+Golden Setには通常質問だけでなく、文書Version競合、削除／失効、古い文書だけの検索、Parse Error、0件、同一Query Rewrite、再検索上限、ACL境界、Prompt Injection、System Prompt／Secret抽出要求を含める。同じFamilyの旧Snapshot版と新Snapshot版はFamily Hashにより同じSplitへ置き、Expectation変更は上書きせず`expectation_version`を増やす。`seed_evaluation_cases.json`は両Splitへ十分なFamilyが入ること、カテゴリ、ACL、拒否、Security Caseの分布が偏りすぎないことをCIで検査する。
 
 `bundles/quality/src/evaluate_rag.py`
 
@@ -8850,7 +10936,8 @@ def predict_fn(
     ).model_dump()
 
 
-dataset = get_dataset(name="main.llmops.internal_rag_golden")
+# 候補探索は`internal_rag_train`で行い、このRelease判定は未使用Holdoutだけで実行する。
+dataset = get_dataset(name="main.llmops.internal_rag_holdout")
 results = mlflow.genai.evaluate(
     data=dataset,
     predict_fn=predict_fn,
@@ -8884,7 +10971,9 @@ results = mlflow.genai.evaluate(
 
 Primary Key、削除反映、Parse Error率はRAG Responseではなく、Ingestion／Index Release GateがDelta SQLで評価する。意味理解を必要としない条件をLLM Judgeへ委ねない。Hash Split後はカテゴリ、ACL区分、拒否、文書種別、Security Caseの件数と比率をTraining／Holdout間で比較し、少数カテゴリがHoldoutに0件なら品質責任者承認のもとFamily単位でSplit Policy Versionを更新する。
 
-#### 4.5.9 Production Identity・評価Fixture
+EvaluationDatasetはUnity Catalogで管理し、Dataset名、Dataset Version／Digest、Lineage、Split Policy VersionをEvaluation RunとRelease Manifestへ記録する。候補探索は`internal_rag_train`、最終Gateは`internal_rag_holdout`だけを読み、評価結果を見た後にCaseを移動しない。Built-in JudgeとCustom JudgeはExperimentへ登録してVersionを固定する。Code-based ScorerはScorer Registryへ登録できる前提にせず、Git CommitとQuality Wheel Versionを正本として固定する。
+
+##### 4.2.4.9 Production Identity・評価Fixture
 
 Databricks Apps Proxyが付与する `X-Forwarded-Email`、`X-Forwarded-User`、User Authorizationの `x-forwarded-access-token` は、Databricks Apps内の公開入口でだけ信頼する。同じApp内のStreamlitからlocalhost Agent ServerへHeaderは自動継承されないため、StreamlitがTokenを明示的に内部Requestへ転送する。Token、Email、Group一覧はTraceへ保存しない。
 
@@ -9015,6 +11104,24 @@ def resolve_production_identity(user_access_token: str | None) -> EntitlementCon
     )
 ```
 
+**想定出力サンプル（`EntitlementContext`）**
+
+```json
+{
+  "subject_id": "7392018456123",
+  "allowed_principals": [
+    "user:7392018456123",
+    "group:4182057301942",
+    "group:5508120473310"
+  ],
+  "entitlement_hash": "13a9d240...",
+  "acl_policy_version": "acl-v4",
+  "fixture_id": null
+}
+```
+
+Access Token、Email、Group表示名は出力・Traceへ残さない。Token欠落、Principal上限超過、Account API失敗時は`EntitlementContext`を返さず、検索を開始しない。
+
 ProductionはUser Authorization TokenからDatabricks AccountのUser／Groupを解決する。組織独自の権限台帳を使う場合は、上の `principals` を入力に、認可付きSQL Warehouseまたは社内Authorization APIへサーバー側照会する。Identity欠落、Group過多、Policy Version不一致、台帳TimeoutはFail Closedとする。App Service PrincipalはIndex全体へ `SELECT` できるため、Query前Filterと検索後検査の両方を必須にする。
 
 Evaluation JobはToken Headerを偽装せず、`quality` Bundleだけが読める承認済み `identity_fixtures.json` を `resolve_evaluation_fixture()` で読み込む。Fixtureには架空Subject、Group ID、ACL Policy Versionを保存し、Production ResolverからImportしない。
@@ -9031,7 +11138,7 @@ EntitlementContext
 AI Search
 ```
 
-#### 4.5.10 Agent Serverの`@stream`
+##### 4.2.4.10 Agent Serverの`@stream`
 
 `@stream()` を主経路とし、`graph.astream(..., stream_mode="updates")` から実際に完了したNodeを取得する。進捗は `progress_*` Item、最終回答は `answer_*` Itemへ分離するため、Responses APIの完成本文へ「検索しています」などを混ぜない。Chain-of-Thought、Judge理由、ACL詳細は送らない。回答Token自体はModelから逐次転送せず、検証済み完成回答をChunk分割するため、「Node進捗Streaming＋検証後Text Streaming」でありToken Streamingではない。
 
@@ -9373,9 +11480,23 @@ async def stream_rag(
     )
 ```
 
+**想定出力サンプル（Agent Server SSE Event列）**
+
+```text
+data: {"type":"response.output_text.delta","item_id":"progress_a1","delta":"アクセス可能な社内資料を検索しました。"}
+data: {"type":"response.output_text.delta","item_id":"progress_a1","delta":"回答に必要な根拠を確認しました。"}
+data: {"type":"response.output_item.done","item":{"id":"progress_a1","type":"message",...}}
+data: {"type":"response.output_text.delta","item_id":"answer_b2","delta":"検索にはDatabricks AI Searchを利用します。"}
+data: {"type":"response.output_text.delta","item_id":"answer_b2","delta":"[SRC-8A10F2C9B331]"}
+data: {"type":"response.output_item.done","item":{"id":"answer_b2","content":[{"type":"output_text","text":"検索には...","annotations":[...]}]}}
+data: [DONE]
+```
+
+Progress用`item_id`と回答用`item_id`を分けるため、Streamlitは進捗文字列を最終回答へ混入させない。Error時もStack Traceではなく固定拒否Eventを返す。
+
 Node実行やModel呼び出しがExceptionになった場合は、`safe_graph_updates()`がTraceへ`SEARCH_ERROR`または`MODEL_ERROR`を付与し、固定応答へ変換する。Raw Exception、Token、Query Filter、権限外文書候補はClientへ返さない。429、Timeout、Circuit Breakerの再試行回数はSDK共通設定で上限を固定し、同じRequest内で無制限再試行しない。
 
-#### 4.5.11 Agent ServerのBuild metadata検証
+##### 4.2.4.11 Agent ServerのBuild metadata検証
 
 MLflow 3.4以降の現行APIは `mlflow.genai.enable_git_model_versioning()` でありExperimentalである。Git repositoryを読める開発・CI環境ではLoggedModelとTraceを自動関連付けできるが、Databricks Git Foldersは公式に未対応で、Databricks Apps配布物に `.git` がある保証もない。したがってApp Runtimeでは `git rev-parse` や旧Helperへ依存せず、CI/CDが注入したCommit、Repository、Build ID、Dirty=falseを検証し、Release ManifestとTraceへ明示保存する。
 
@@ -9500,6 +11621,16 @@ if __name__ == "__main__":
     main()
 ```
 
+**想定出力サンプル（Agent Server起動時検証）**
+
+| 状態 | 起動結果 | Log例 |
+| --- | --- | --- |
+| 必須Build metadataあり、`APP_GIT_DIRTY=false` | 起動 | `AgentServer ResponsesAgent listening on 127.0.0.1:8001` |
+| `APP_GIT_COMMIT`欠落 | 起動停止 | `RuntimeError: Missing build metadata: ['APP_GIT_COMMIT']` |
+| `APP_GIT_DIRTY=true` | 起動停止 | `RuntimeError: Dirty source build is not allowed in production` |
+
+成功時もAgent Serverを外部へ直接公開せず、同一Databricks App内のStreamlitからlocalhost経由で呼び出す。
+
 CIではClean checkoutで次を実行する。
 
 ```python
@@ -9540,7 +11671,7 @@ def verify_git_versioning_in_ci() -> None:
 
 `APP_GIT_COMMIT` を設定しても `enable_git_model_versioning()` がその環境変数をGit metadataとして読むとは公式に保証されない。自動関連付けが必要な処理はGit checkout上で実行し、App RuntimeはManifestとRoot Trace TagをFallbackの監査正本とする。再現性はCommit単体ではなく、Wheel、Prompt Version、Index Release、Corpus Snapshot、Model Routeを含む `rag_release_id` で保証する。
 
-#### 4.5.12 Streamlit
+##### 4.2.4.12 Streamlit
 
 StreamlitはApps Proxyから受け取ったUser Authorization Tokenをlocalhostへだけ転送する。TokenをPayload、Session State、Log、Traceへ保存しない。`progress_*` のDeltaはStatus表示へ、`answer_*` のDeltaだけを `st.write_stream()` へ渡し、最終EventのCitation annotationを別表で表示する。
 
@@ -9705,9 +11836,21 @@ if question := st.chat_input("技術文書について質問してください")
         st.error("検索処理に失敗しました。時間をおいて再実行してください。")
 ```
 
+**想定画面出力サンプル（Streamlit）**
+
+| 表示領域 | 表示例 | 元Event |
+| --- | --- | --- |
+| Status | `回答に必要な根拠を確認しました。` | `progress_*`の`response.output_text.delta` |
+| 回答 | `検索にはDatabricks AI Searchを利用します。[SRC-8A10F2C9B331]` | `answer_*`のDeltaを`st.write_stream()`で連結 |
+| Citation | `社内RAGアーキテクチャガイド p.2` | 最終`response.output_item.done`の`annotations` |
+| 認証Error | `利用者権限を確認できないため検索できません。` | Token欠落時の`PermissionError` |
+| Runtime Error | `検索処理に失敗しました。時間をおいて再実行してください。` | 内部Errorを安全な固定文へ変換 |
+
+画面にはRaw Volume Path、Access Token、内部ACL Filter、ModelのChain-of-Thoughtを表示しない。
+
 `/citations/{source_ref}` は現在UserのEntitlementを再検証し、文書台帳から現行URIまたは期限付きURLを解決する認可付きEndpointとする。長期Trace、SSE annotation、画面HTMLへ生のVolume Pathや署名付きURLを保存しない。
 
-#### 4.5.13 Databricks Apps Resource
+##### 4.2.4.13 Databricks Apps Resource
 
 `app.yaml` の `valueFrom` はResource Keyを値へ解決するだけであり、任意のManifest Resourceへ自動権限を与えるものではない。AppごとのService Principalへ、Serving endpointは `CAN_QUERY`、AI Search IndexはUI上のCan selectに相当するUC `SELECT`、Experimentは `CAN_EDIT`、SQL Warehouseは `CAN_USE` を付与する。Current／Rollback候補の両方をResourceとして宣言し、Runtime Health CheckがManifestのIndex／Model endpointが許可List内か、各ResourceがReadyかを確認してからReadinessを返す。
 
@@ -9937,19 +12080,467 @@ exec streamlit run streamlit_app.py \
 
 `requirements.txt` は検証済みLockから生成し、少なくとも `mlflow>=3.6`、`databricks-sdk`、`databricks-ai-search`、`databricks-langchain`、`langgraph`、`pydantic>=2`、`requests`、`streamlit` と共通Wheelを固定する。Model endpointが `READY` でない、Indexが `ONLINE` でない、Manifest ResourceがApps許可List外、Prompt Versionが解決不能、Wheel Version不一致のいずれかではHealth Checkを失敗させる。
 
-## 5. 本番導入後に実装するもの
+##### 4.2.4.14 Production Monitoringを本番開始前に設定する
 
-### 5.1 開発時の実装
+Production MonitoringはBeta機能である。本番導入／Pilot時に、PoCとRelease Gateで検証したJudgeを本番Experimentへ登録し、Stagingの本番相当TraceでDry Runしてから開始する。全件集計するLatency、Token、検索件数、拒否率などは決定論的集計へ残し、意味評価だけをSamplingしたJudgeへ任せる。Code-based Scorerはオフライン`mlflow.genai.evaluate()`で使い、Production Monitoringへそのまま自動登録できる前提にしない。
 
-本番導入後の開発は、新規機能の追加よりも本番Evidenceから原因別に改善することが中心となる。文書、Chunk、Retrieval、Prompt、Agent Routing、ACL、Judgeを同時変更せず、変更対象を1つに限定してTrainingで探索し、未使用Holdoutで判定する。Canary／A-Bを追加する場合もRelease ID、Prompt Version、Model Route、Index ReleaseをTraceで識別可能にする。
+`bundles/quality/src/register_monitoring.py`
 
-### 5.2 運用時の実装
+| 実装情報 | 内容 |
+| --- | --- |
+| 導入段階 | 本番導入／Pilot時に設定・Dry Runし、Pilotまたは本番開始と同時に有効化する。 |
+| 初めて必要になる段階 | 本番導入／Pilot時 |
+| 後続段階で追加される機能 | 本番導入後にSampling、Alert閾値、Cost上限、Review Queue連携を実績から調整する。 |
+| 関連Table／Dataset | 入力: 本番相当Trace、検証済みJudge／出力: Registered Judge、Monitoring設定 |
+| 関連Job／Pipeline | Quality SPが実行するMonitoring設定Job。 |
+| 関連する検証 | 固定TraceでJudge Version、対人間一致率、False Positive／Negative、Sampling Costを確認する。 |
+| ファイルパス | `bundles/quality/src/register_monitoring.py` |
+| 実行主体 | Quality SP |
+| 入力 | Judge定義、Experiment、Sampling Rate、Git Commit、Judge Validation結果 |
+| 出力 | 未開始または開始済みのRegistered Judge Version |
+| 必要な理由 | 本番開始後に評価不能な期間を作らず、開発時と同じ品質定義を継続利用するため |
+| 正常終了時 | Dry Runでは登録まで、Pilot開始時は承認済みVersionだけを開始する |
+| 失敗時 | Monitoringを開始せず、Release GateをFail Closedにする |
+| 再実行時 | 登録済みVersionと開始状態を照合し、重複登録・重複開始を防ぐ |
 
-運用では、Trace候補抽出、専門家Review、Assessment同期、改善先割当、EvaluationDataset反映、再評価、段階Releaseを継続する。自動化は候補抽出・配送・Scorer実行までとし、Expectation、root cause、改善採否、Release昇格は担当者が承認する。
+```python
+"""検証済みJudgeを登録し、承認時だけProduction Monitoringを開始する。"""
 
-### 5.3 運用高度化の実装順序
+import os
+from typing import Literal
 
-運用開始後は、次の順番で改善ループを構築する。
+import mlflow
+from mlflow.genai.judges import make_judge
+from mlflow.genai.scorers import ScorerSamplingConfig
+
+
+def build_internal_rag_quality_judge():
+    """Retriever根拠とStable Citationに対する意味的品質Judgeを定義する。"""
+    return make_judge(
+        name="internal_rag_quality",
+        instructions="""
+{{ trace }}を確認し、回答の各主張がRETRIEVER Spanの文書に支持されているか、
+回答内のStable Citation IDが対応Chunkを正しく指すか評価してください。
+すべて満たせばyes、根拠不足または誤引用が1つでもあればnoを返してください。
+""".strip(),
+        feedback_value_type=Literal["yes", "no"],
+        model=os.environ["PRODUCTION_JUDGE_MODEL"],
+    )
+
+
+def main() -> None:
+    """Judge候補をVersion登録し、明示承認された場合だけSampling評価を開始する。"""
+    experiment = mlflow.set_experiment("/Shared/llmops/internal-rag-realtime")
+    registered = build_internal_rag_quality_judge().register(
+        experiment_id=experiment.experiment_id
+    )
+    print(f"registered_judge={registered.name}, version={registered.version}")
+
+    # Staging Dry Runではfalseのまま登録Versionを固定Traceへ明示評価する。
+    # Judge Validation承認とPilot Go判定の両方が揃ったDeployだけが開始できる。
+    if os.getenv("ENABLE_PRODUCTION_MONITORING", "false").lower() == "true":
+        registered.start(
+            sampling_config=ScorerSamplingConfig(
+                sample_rate=float(os.getenv("MONITORING_SAMPLE_RATE", "0.10"))
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+JudgeをRelease Gateへ使う場合、同名のJudge Feedbackと人間Feedbackを用意し、Alignmentを行ったか否かにかかわらず、Alignmentへ使っていないValidation Setで一致率、False Positive、False Negativeを確認する。未検証Judgeだけで金融機関向けReleaseを可決しない。Aligned Judge候補を登録しても自動開始せず、Judge Version、Validation結果、承認者をRelease Manifestへ固定してから`start()`する。
+
+##### 4.2.4.15 Operational Monitoring・Alert・Quality Case基盤を構築する
+
+本番では、監視専用の別Case台帳を増やさず、既存の`main.llmops.internal_rag_review_cases`をQuality CaseのWorkflow正本とする。`review_status`はExpectation入力から改善資産配送まで、`case_status`は検知から再評価・Closeまでを表す。この2軸を分けることで、ラベル付け済みでも修正未完了のCaseを誤ってCloseしない。
+
+```mermaid
+flowchart TD
+    A["Trigger<br/>Run・Threshold・Change・Feedback・Security"] --> B["各Detectorが標準Signalを記録"]
+    B --> C["internal_rag_monitoring_signals"]
+    C --> D["Triage Job<br/>重複排除・Severity・Owner・SLA"]
+    D --> E["internal_rag_review_cases<br/>case_status=triaged"]
+    E --> F["SQL Alert v2がCritical/Errorを通知"]
+    E --> G["AI/BI Dashboardで影響・滞留・Sliceを可視化"]
+    F --> H["Primary OwnerがAcknowledge"]
+    G --> H
+    H --> I["Trace・Event Log・Release Manifestで原因診断"]
+    I --> J["修正・固定Caseで再評価"]
+    J --> K{"承認済みValidationか"}
+    K -->|はい| L["validated_run_idとDecision IDを記録"]
+    K -->|いいえ| M["再修正またはRisk受容審査"]
+    L --> N["Close承認・case_status=closed"]
+```
+
+`bundles/quality/src/create_operational_monitoring_assets.sql`
+
+| 実装情報 | 内容 |
+| --- | --- |
+| Trigger | 初回本番Deploy、Schema Migration承認時 |
+| Data Source | 既存Review Table、各Detectorが作る標準Signal |
+| 出力 | Signal Inbox、Threshold正本、Case監視View |
+| 実行主体 | Quality SP |
+| 通知 | Migration失敗時はJob Failure Notification |
+| 記録先 | Unity Catalog Delta TableとView |
+| 権限 | DetectorはSignal Tableへ`APPEND`相当の最小権限、Quality SPはCaseへ`MODIFY`、閲覧者はViewへ`SELECT` |
+| Retention | Signalは監査Policyの最低保持後に承認済みPurge Jobで削除し、Case・Decisionは業務記録の保持規程に従う |
+
+```sql
+-- 一度だけ実行するVersion付きMigration。
+-- review_statusはLabeling・Dataset配送、case_statusは検知・対応・Closeを表す。
+ALTER TABLE main.llmops.internal_rag_review_cases ADD COLUMNS (
+  trigger_type STRING COMMENT 'RUN_EVENT、THRESHOLD、SCHEDULE、CHANGE、USER_FEEDBACK、JUDGE_FEEDBACK、SECURITY_EVENT、MANUAL_REVIEW、LIFECYCLE_EVENT',
+  trigger_id STRING COMMENT '元Event、Run、Alert、Feedbackを一意に追跡するID',
+  alert_id STRING COMMENT 'Databricks SQL Alert ID',
+  alert_history_url STRING COMMENT 'Alert Historyの参照URL。Credentialを含めない',
+  severity STRING COMMENT 'Critical、Error、Warning、Info',
+  case_status STRING COMMENT 'detected、triaged、diagnosed、assigned、fixing、ready_for_validation、validated、closed等',
+  primary_owner STRING COMMENT '初動とSLAに責任を持つGroup',
+  secondary_owner STRING COMMENT '二次切り分けまたはEscalation先Group',
+  ack_due_at TIMESTAMP COMMENT '一次応答期限',
+  acknowledged_at TIMESTAMP COMMENT 'Primary Ownerの一次応答時刻',
+  investigation_due_at TIMESTAMP COMMENT '原因調査開始期限',
+  investigation_started_at TIMESTAMP COMMENT '原因調査開始時刻',
+  incident_id STRING COMMENT '可用性・Security事故のIncident台帳ID',
+  validated_run_id STRING COMMENT '修正後の再評価Run ID',
+  close_approved_by STRING COMMENT 'Closeを承認した責任者',
+  closed_at TIMESTAMP COMMENT 'Close承認が完了した時刻',
+  retention_class STRING COMMENT '保持期間・Legal Holdを解決するPolicy分類'
+);
+
+-- Job、Alert、Scorer、Security Queryが同じ契約でEventを渡すSignal Inboxを作成する。
+CREATE TABLE IF NOT EXISTS main.llmops.internal_rag_monitoring_signals (
+  signal_id STRING NOT NULL,
+  dedup_key STRING NOT NULL,
+  trigger_type STRING NOT NULL,
+  trigger_id STRING NOT NULL,
+  observed_at TIMESTAMP NOT NULL,
+  severity STRING NOT NULL,
+  signal_type STRING NOT NULL,
+  source_ref STRING NOT NULL,
+  source_trace_id STRING,
+  rag_release_id STRING,
+  proposed_root_cause STRING,
+  metric_name STRING,
+  observed_value DOUBLE,
+  threshold_value DOUBLE,
+  detector_version STRING NOT NULL,
+  ingestion_status STRING NOT NULL,
+  ingested_at TIMESTAMP NOT NULL
+) USING DELTA
+COMMENT '各監視Detectorの出力をQuality Case化する前に正規化する追記型Inbox。質問・Chunk本文は保存しない。';
+
+-- 監視閾値の値、Version、有効期間、承認Decisionを管理する正本を作成する。
+CREATE TABLE IF NOT EXISTS main.llmops.internal_rag_monitoring_thresholds (
+  policy_version STRING NOT NULL,
+  metric_name STRING NOT NULL,
+  warning_threshold DOUBLE,
+  error_threshold DOUBLE,
+  critical_threshold DOUBLE,
+  comparison_operator STRING NOT NULL,
+  effective_from TIMESTAMP NOT NULL,
+  effective_to TIMESTAMP,
+  decision_id STRING NOT NULL,
+  changed_by STRING NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+) USING DELTA
+COMMENT '本番監視ThresholdのVersion付き正本。Source Code内の数値だけで運用変更しない。';
+
+-- DashboardとSQL Alertに、対応中Case、Owner、SLA超過、AlertとEvidenceの関係を公開する。
+CREATE OR REPLACE VIEW main.llmops.internal_rag_open_quality_cases_v AS
+SELECT
+  review_case_id AS quality_case_id,
+  source_trace_id,
+  trigger_type,
+  trigger_id,
+  alert_id,
+  alert_history_url,
+  severity,
+  case_status,
+  review_status,
+  primary_owner,
+  secondary_owner,
+  proposed_root_cause,
+  root_cause AS confirmed_root_cause,
+  improvement_target,
+  rag_release_id,
+  source_git_commit,
+  index_release_id,
+  ack_due_at,
+  acknowledged_at,
+  investigation_due_at,
+  investigation_started_at,
+  validated_run_id,
+  close_approved_by,
+  closed_at
+FROM main.llmops.internal_rag_review_cases
+WHERE coalesce(case_status, 'detected') NOT IN
+  ('closed', 'duplicate', 'rejected', 'accepted_risk');
+```
+
+**想定出力サンプル**
+
+| `quality_case_id` | `trigger_type` | `severity` | `case_status` | `review_status` | `primary_owner` | `validated_run_id` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `qcase-91e2...` | `RUN_EVENT` | `Error` | `triaged` | `pending` | `rag-data-engineering` | `NULL` |
+| `qcase-a75c...` | `JUDGE_FEEDBACK` | `Warning` | `diagnosed` | `diagnosed` | `rag-quality` | `NULL` |
+| `qcase-42bd...` | `SECURITY_EVENT` | `Critical` | `validated` | `approved` | `rag-security` | `eval-security-2208` |
+
+`bundles/quality/src/triage_operational_signals.sql`
+
+```sql
+-- 未取込Signalをdedup_keyで既存Caseと照合し、1 Eventから1 Caseだけを作成する。
+-- 質問内容はTraceへ残し、Workflow TableにはMask済み参照情報だけを記録する。
+MERGE INTO main.llmops.internal_rag_review_cases AS target
+USING (
+  SELECT *
+  FROM main.llmops.internal_rag_monitoring_signals
+  WHERE ingestion_status = 'pending'
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY dedup_key ORDER BY observed_at) = 1
+) AS source
+ON target.trigger_id = source.dedup_key
+WHEN NOT MATCHED THEN INSERT (
+  review_case_id,
+  source_trace_id,
+  question_redacted,
+  proposed_root_cause,
+  review_status,
+  trigger_type,
+  trigger_id,
+  severity,
+  case_status,
+  primary_owner,
+  secondary_owner,
+  ack_due_at,
+  investigation_due_at,
+  retention_class
+) VALUES (
+  sha2(concat('quality-case|', source.dedup_key), 256),
+  source.source_trace_id,
+  NULL,
+  source.proposed_root_cause,
+  'pending',
+  source.trigger_type,
+  source.dedup_key,
+  source.severity,
+  'triaged',
+  CASE source.proposed_root_cause
+    WHEN 'DOCUMENT' THEN 'rag-document-owners'
+    WHEN 'PARSE' THEN 'rag-data-engineering'
+    WHEN 'PREP' THEN 'rag-data-engineering'
+    WHEN 'CHUNK' THEN 'rag-data-engineering'
+    WHEN 'RETRIEVAL' THEN 'rag-search'
+    WHEN 'QUERY_REWRITE' THEN 'rag-search'
+    WHEN 'SUFFICIENCY' THEN 'rag-llmops'
+    WHEN 'ANSWER_PROMPT' THEN 'rag-llmops'
+    WHEN 'MODEL' THEN 'rag-llmops'
+    WHEN 'ROUTING' THEN 'rag-agent'
+    WHEN 'CITATION' THEN 'rag-agent'
+    WHEN 'ACL' THEN 'rag-security'
+    WHEN 'JUDGE' THEN 'rag-quality'
+    ELSE 'rag-platform'
+  END,
+  CASE WHEN source.proposed_root_cause IN ('ACL', 'PLATFORM')
+    THEN 'rag-operations' ELSE 'rag-quality' END,
+  source.observed_at + CASE source.severity
+    WHEN 'Critical' THEN INTERVAL 15 MINUTES
+    WHEN 'Error' THEN INTERVAL 30 MINUTES
+    ELSE INTERVAL 1 DAY
+  END,
+  source.observed_at + CASE source.severity
+    WHEN 'Critical' THEN INTERVAL 30 MINUTES
+    WHEN 'Error' THEN INTERVAL 2 HOURS
+    ELSE INTERVAL 2 DAYS
+  END,
+  CASE WHEN source.trigger_type = 'SECURITY_EVENT'
+    THEN 'SECURITY_AUDIT' ELSE 'QUALITY_AUDIT' END
+);
+
+-- Case化済みSignalだけをprocessedにし、Job再実行で再度配送しない。
+MERGE INTO main.llmops.internal_rag_monitoring_signals AS target
+USING main.llmops.internal_rag_review_cases AS source
+ON target.dedup_key = source.trigger_id
+WHEN MATCHED AND target.ingestion_status = 'pending'
+THEN UPDATE SET target.ingestion_status = 'processed';
+```
+
+**想定出力サンプル**
+
+| `dedup_key` | Signalの実行結果 | Caseの実行結果 |
+| --- | --- | --- |
+| `job:7341:run:98211` | `pending`→`processed` | `qcase-...`を1件作成 |
+| `job:7341:run:98211`の再送 | 同じ`dedup_key` | 既存Caseに一致し追加しない |
+
+`bundles/quality/resources/operational_monitoring.yml`
+
+```yaml
+# このFileが参照するEmail、Group、System Destination、Warehouseは
+# quality/databricks.ymlのBundle変数として環境ごとに注入する。
+resources:
+  jobs:
+    # SignalをQuality Caseへ冪等取込する定期Jobを定義する。
+    rag_operational_triage:
+      name: internal-rag-operational-triage
+      # 10分ごとにSignal Inboxを確認する。
+      schedule:
+        quartz_cron_expression: "0 0/10 * * * ?"
+        timezone_id: Asia/Tokyo
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: triage_operational_signals
+          # DeclarativeなMERGEはSQL WarehouseからVersion管理済みFileを実行する。
+          sql_task:
+            warehouse_id: ${var.sql_warehouse_id}
+            file:
+              path: ../src/triage_operational_signals.sql
+      # Job自体の失敗と長時間化はSQL Alertを待たずPush通知する。
+      email_notifications:
+        on_failure:
+          - ${var.ops_group_email}
+        on_duration_warning_threshold_exceeded:
+          - ${var.ops_group_email}
+      webhook_notifications:
+        on_failure:
+          - id: ${var.ops_system_destination_id}
+        on_duration_warning_threshold_exceeded:
+          - id: ${var.ops_system_destination_id}
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 900
+      run_as:
+        service_principal_name: ${var.quality_sp_application_id}
+
+  alerts:
+    # OpenなCritical・Error CaseまたはAck SLA超過をPush通知するSQL Alert v2を定義する。
+    rag_actionable_quality_cases:
+      display_name: internal-rag-actionable-quality-cases
+      query_text: >-
+        SELECT COUNT(*) AS open_actionable_count
+        FROM main.llmops.internal_rag_open_quality_cases_v
+        WHERE severity IN ('Critical', 'Error')
+           OR (acknowledged_at IS NULL AND ack_due_at < CURRENT_TIMESTAMP())
+      warehouse_id: ${var.sql_warehouse_id}
+      schedule:
+        quartz_cron_schedule: "0 0/5 * * * ?"
+        timezone_id: Asia/Tokyo
+        pause_status: UNPAUSED
+      evaluation:
+        comparison_operator: GREATER_THAN
+        source:
+          aggregation: MAX
+          display: open_actionable_count
+          name: open_actionable_count
+        threshold:
+          value:
+            double_value: 0
+        notification:
+          notify_on_ok: true
+          retrigger_seconds: 1800
+          subscriptions:
+            - destination_id: ${var.ops_system_destination_id}
+
+  dashboards:
+    # Run、Quality、Security、Cost、Case SLAを調査するAI/BI Dashboardを定義する。
+    rag_operations:
+      display_name: internal-rag-production-operations
+      file_path: ../dashboards/rag_operations.lvdash.json
+      dataset_catalog: ${var.catalog}
+      dataset_schema: ${var.schema}
+      embed_credentials: false
+      permissions:
+        - level: CAN_RUN
+          group_name: ${var.quality_ops_group}
+```
+
+**想定デプロイ結果**
+
+| Resource | 動作 | 監査Evidence |
+| --- | --- | --- |
+| `rag_operational_triage` | 10分ごとにSignalを冪等Case化する | Job Run ID、Task Run ID、Git Commit |
+| `rag_actionable_quality_cases` | Open Critical・ErrorまたはAck超過で通知する | Alert ID、Alert History、Case ID |
+| `rag_operations` | Pipeline、Agent、Quality、Security、Cost、SLAをSlice表示する | Dashboard ID、Refresh時刻、Subscription実行履歴 |
+
+DashboardのScheduleとSubscriptionはDeploy後にWorkspace UIまたは公式APIでBootstrapし、Schedule ID、Subscriber Group、有効化時刻をDecision Logへ保存する。Dashboard Subscriptionは日次・週次Snapshot用であり、即時障害通知の代替にはしない。
+
+Operational Monitoringの担当契約は、通知先を個人ではなく管理Groupで定義する。
+
+| Severity | Primary Owner | Ack期限 | 調査開始期限 | Escalation | 記録先 | Close承認 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Critical` | SecurityまたはIncident Commander | 15分 | 30分 | Service Owner、Security責任者、業務Owner | Incident台帳＋Quality Case | Security責任者またはIncident Commander |
+| `Error` | Component Owner | 30分 | 2時間 | 運用責任者、必要時Service Owner | Quality Case、可用性影響があればIncidentも併記 | 品質責任者または運用責任者 |
+| `Warning` | QualityまたはComponent Owner | 1営業日 | 2営業日 | SLA超過時に品質責任者 | Quality Case | 品質責任者 |
+| `Info` | 定例Review担当 | 不要 | 定例会まで | なし | Dashboard・Run Log | 自動集計終了 |
+
+SQL Alertは30分の再通知抑止を設定し、Caseの`acknowledged_at`更新後も条件が継続する場合だけ再通知する。可用性またはSecurityに即時影響する場合はIncidentも起票し、品質改善・回帰CaseはQuality Caseで継続する。Closeには`confirmed_root_cause`、`validated_run_id`、Decision ID、`close_approved_by`を必須とする。
+
+### 4.3 本番開始前のDry Run・運用試験
+
+本番開始前は、Stagingへprodと同じArtifact、権限構造、Trace／Assessment契約をDeployし、正常系だけでなく失敗時の検知、通知、判断、復旧まで通して確認する。Dry Runの結果は、実行者、対象Release、開始・終了時刻、期待結果、実績、Recovery手順、所要時間を試験Evidenceとして保存する。
+
+| 試験項目 | 注入するTrigger／異常 | 検知・確認手段 | 通知・担当割当 | 記録先 | 合格・Close条件 |
+| --- | --- | --- | --- | --- | --- |
+| Production Trace Schema | 検索なし、拒否、再検索、Errorの固定Request | MLflow Trace UIで必須SpanとRelease Versionを確認 | LLMOps担当Groupが試験実施 | 固定Staging Trace、Dry Run台帳 | 全経路でGit、Prompt、Model Route、Index、Citationを再現できる |
+| Masking・Assessment権限 | PII／Secret入力、無権限Reviewerの更新 | Trace、Alert本文、Review App、Audit Logを確認 | Security Groupに即時通知し、過剰権限はPilot停止 | Security試験台帳、Quality Case | 平文露出0件、未許可更新0件、Security責任者承認 |
+| Job／Task Failure Notification | テストTaskを明示的に失敗 | Jobs UIと`system.lakeflow.job_task_run_timeline` | EmailとSystem DestinationがPrimary Ownerへ到達 | Job Run ID、通知履歴、Case ID | Ack SLA内にCaseを更新し、再実行成功をEvidence化 |
+| Duration Warning | 15分を超えるテストRun | Jobs Health RuleとRun Timeline | Duration Warningが運用Groupへ到達 | Run ID、警告時刻、Case ID | 警告時刻が閾値と一致し、長時間化の原因と対応を記録 |
+| SQL Alert閾値 | Staging専用MetricをThreshold超過へ更新 | SQL Alert v2、Alert History | System Destinationへ通知しPrimary Ownerを自動割当 | Alert ID、Alert History URL、Case ID | Alert解消通知まで確認し、Caseと相互参照できる |
+| Dashboard Refresh | 監視Viewに新規Run・Caseを追加 | AI/BI Dashboardの更新時刻と各Widget | 即時通知なし。表示失敗はDashboard Ownerへ連絡 | Dashboard ID、Refresh時刻 | Run、Quality、Security、Cost、Case SLAが同一ReleaseでSliceできる |
+| Dashboard Subscription | Staging専用の定時Subscription | Subscription実行履歴と受信メッセージ | 管理GroupにSnapshotを配信 | Schedule ID、Subscriber Group、実行時刻 | 権限のあるGroupだけが受信し、機密列が含まれない |
+| Scorer→Trace抽出 | 固定TraceにJudge `no`と0件検索を発生 | Production Monitoring結果とTrace Search | Quality GroupにWarning、Security CaseはCritical | Scorer Version、Trace ID、Signal ID | 対象TraceだけがSignal Inboxへ入り、未評価を合格扱いしない |
+| Case重複排除・Owner割当 | 同じ`dedup_key`のSignalを2回追加 | Triage JobとOpen Case View | Root Cause Mappingに従いGroupを割当 | Signal ID、Case ID、Owner、SLA | Caseが1件だけ作成され、Ack・調査期限がSeverityと一致 |
+| Runbook初動・Escalation | CriticalとErrorの模擬Case | Runbookに従いTrace、Event Log、Manifestを確認 | PrimaryからSecondary、責任者へ時限Escalation | Ack時刻、調査開始時刻、Incident ID | 当番者だけで安全停止・影響保全・Escalationを実行できる |
+| Retry／Replay／Index切替 | 中途失敗、同一Command再送、新Index Health失敗 | Command、Event Log、Gold／Index差分、Release Manifest | Component OwnerとRelease Managerへ通知 | Replay Run、Reconciliation、切替Decision | 重複公開なし、Gold／Index／Manifest一致、旧IndexへRollback可能 |
+| Agent／Model／Search障害 | Timeout、429、5xx、Index停止 | Trace、AI Gateway Usage、Endpoint／Index状態 | Errorは運用Group、SLO重大影響はIncident Commander | Trace ID、Case／Incident ID、Release ID | 安全Error／拒否、Retry上限、SLO回復、再発監視完了 |
+| ACL越境 | 権限外Documentを要求するGolden Test | Security Scorer、Search Filter、Citation、Trace | SecurityとIncident CommanderへCritical通知 | Security Case、Incident、Audit Evidence | 越境0件、影響調査とSecurity回帰評価合格、Security責任者承認 |
+| 再評価・Rollback・Close | 修正Releaseと旧ReleaseへのRollback | 固定Case、Holdout、Release Gate、Pilot Metric | 品質責任者とRelease Managerが判断 | `validated_run_id`、Decision ID、Rollback Log | 承認済み再評価、Close承認者、Alert回復、未解決Riskの明記 |
+| Pilot開始判断 | 上記全試験の完了Event | Dry Run台帳、Open Case、Decision Log | 業務Owner、品質、Security、Release Managerが承認 | Pilot Go／No-Go Decision | 必須試験合格、Open Critical 0件、未解決Riskの期限付き受容 |
+
+Production Monitoringでは、**構築**としてScorer登録、Version固定、Sampling、Alert、権限、Cost上限を用意し、**事前検証**としてStaging TraceによるDry Run、誤検知、通知を確認する。登録済みであってもDry Run未完了ならPilotでは開始しない。
+
+### 4.4 Pilot／本番開始時の監視・運用
+
+Pilot開始と同時に監視を有効化し、利用範囲を限定したまま品質、Security、安定性、運用負荷を確認する。自動処理は検知、定型再試行、候補抽出までとし、公開承認、重大Incident判断、Release昇格・Rollbackは担当者が行う。
+
+| 監視対象 | Trigger種別 | 発火条件 | 検知手段／Data Source | 確認画面 | 通知方法 | Severity／Primary Owner | 記録先 | 初動Action | Close条件 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 文書審査・公開 | `LIFECYCLE_EVENT`／`SCHEDULE` | 未承認公開、自己承認、pending SLA超過 | Manifest Audit Event、Reconciliation View | 文書Lifecycle Dashboard | CriticalはSystem Destination、滞留は日次Subscription | Critical／文書Owner | Manifest、Decision Log、Quality Case | 公開Pointerを固定し権限・審査経路を確認 | 承認状態とGold公開対象が一致し、承認者が確認 |
+| Pipeline／Expectation | `RUN_EVENT`／`THRESHOLD` | Run失敗、Duration警告、件数不整合 | Jobs Notification、Pipeline Event Log、System Table | Jobs／Pipeline UI、Operations Dashboard | Failure／DurationはPush、件数はSQL Alert | Error／Data Engineering | Event Log、Signal、Case | 下流公開を停止し、最初の失敗Datasetを特定 | 冪等Replay成功、件数一致、再評価合格 |
+| Parse／Prep／Quarantine | `THRESHOLD`／`RUN_EVENT` | 形式別Error率、未知Error、反復失敗 | Error Table、Attempt Dataset、Threshold View | Data Quality Page | Error率超過はSQL Alert | Error／Data Engineering | Error Table、Case | 隔離を維持し、Version・Processor・文書形式で切り分け | 対象Versionの再処理成功とGold非混入を確認 |
+| Search Sync／Index Release | `RUN_EVENT`／`CHANGE` | Sync失敗、旧Version残存、Manifest不一致 | Sync Log、Reconciliation、Index Health | Search Operations Page | FailureはPush、DriftはSQL Alert | Error／Search | Release Manifest、Case、Decision Log | 新Index公開を停止し旧Releaseを維持 | Gold・Index・Manifestが一致しGolden Query合格 |
+| Agent Server／SSE | `THRESHOLD`／`RUN_EVENT` | 5xx、Loop、初回Event／P95 SLO超過 | Trace、App Log、Request Metric | Realtime Page、MLflow Trace UI | Critical／ErrorはSystem Destination | Error／Agent／Operations | Trace、Case、必要時Incident | Traffic制限、前Release固定、安全Errorを確認 | SLO回復、再発監視完了、Validation Run保存 |
+| Model Route／AI Gateway | `THRESHOLD`／`CHANGE` | 429／5xx、Latency、Token、Route比率Drift | `system.ai_gateway.usage`、Trace Usage | Model／Cost Page | 重大障害はPush、Costは日次Subscription | Error／LLMOps | Case、Decision Log | Rate制御、Capacity確認、承認済みRouteへ戻す | Route・SLO・Cost Guardrailが承認範囲へ回復 |
+| Trace／Masking | `SECURITY_EVENT`／`THRESHOLD` | 必須Span欠落、Version不明、平文機密情報 | Trace Search、決定論的Masking Scorer | MLflow Trace UI、Security Page | 機密露出はCritical Push | Critical／Security・LLMOps | Security Incident／Case | 対象Releaseを停止し転送先と影響Traceを保全 | 露出0件、影響調査、Security回帰評価、責任者承認 |
+| Production Monitoring | `JUDGE_FEEDBACK`／`SCHEDULE` | 品質閾値割れ、評価停止、Judge Cost超過 | Registered Scorer結果、Evaluation Run | Quality Page、MLflow UI | ErrorはSQL Alert、傾向は週次Subscription | Error／Quality | Signal、Case、Evaluation Run | 代表Trace、人間Feedback、Version欠落を確認 | 独立Validationで品質回復、未評価解消 |
+| Assessment／Review SLA | `USER_FEEDBACK`／`MANUAL_REVIEW`／`THRESHOLD` | 👎、重大誤回答、pending・approved滞留 | Assessment、Review Table、Open Case View | Review App、Quality Cases Page | 重大CaseとSLA超過を通知 | Warning〜Critical／Quality | Trace Assessment、Review Table | ドメイン担当へExpectation、技術担当へDiagnosisを割当 | `review_status=synced`と改善先配送確認。Case Closeは再評価後 |
+| ACL／Identity | `SECURITY_EVENT`／`CHANGE` | 越境、Identity不一致、権限変更 | Security Scorer、Audit Log、Search Filter | Security Page | Critical PushとIncident Escalation | Critical／Security | Incident、Case、Audit Log | Traffic／Corpus停止、Access遮断、影響範囲確定 | ACL回帰評価0件、権限正本一致、Security承認 |
+| Latency／Cost | `THRESHOLD`／`SCHEDULE` | P95、Token、Request単価、月次予測超過 | AI Gateway Usage、Billing Usage、Trace | Cost／Performance Page | SLO重大超過はPush、傾向はSubscription | Warning／Service Owner | Case、Cost Report、Decision Log | Model・検索・再検索・Judgeに分解 | 品質Guardrailを維持しSLO／予算内へ回復 |
+| Release Drift／Rollback | `CHANGE`／`RUN_EVENT` | Git、Prompt、Index、Model、Judge、WheelのManifest不一致 | Deploy Job、Trace Tag、Release Manifest | Release Page | Gate失敗はRelease GroupへPush | Critical／Release Manager | Release Manifest、Decision Log、Case | 未検証組合せを停止し旧Manifestへ一体Rollback | 実稼働VersionがManifestと一致しHoldout・Pilot Gate合格 |
+
+Assessmentでは、**運用**としてTraceを選定し、専門家がFeedbackとExpectationを入力する。そこで得たEvidenceは、原因分類、Judge不一致、EvaluationDataset候補の判断へ使い、入力しただけで自動的にPrompt改善へ送らない。
+
+### 4.5 Release・Rollback・利用拡大の判断基準
+
+| 判断 | 必須条件 | 判断者 | Action |
+| --- | --- | --- | --- |
+| Pilot Release | 4.3の必須Dry Run合格、重大Security Riskなし、固定Holdout Gate合格、Monitoring開始準備完了 | 業務Owner、品質責任者、Security責任者、Release Manager | 限定User・限定Corpus・限定期間でReleaseする |
+| Release継続 | Pilot KPI、SLO、Cost、運用負荷が許容範囲で、重大誤回答・ACL越境がない | Service Owner、品質責任者 | 現Releaseを維持しMonitoringを継続する |
+| Rollback | ACL越境、根拠なし重大回答、Release Manifest不一致、SLO重大違反、復旧不能 | Incident Commanderまたは権限を委任されたRelease Manager | Traffic停止または承認済み旧Releaseへ一体Rollbackする |
+| 利用範囲拡大 | 対象Sliceの評価合格、未解決Riskの受容、運用Capacity、文書Owner承認 | 業務Owner、品質責任者、運用責任者 | User Group、Corpus、質問Purposeを段階的に追加する |
+| No-Go／拡大保留 | Evidence不足、Judge未検証、Trace再現不能、重大Gap未解消 | 品質責任者 | Scopeを維持またはPilotを停止し、Gap解消後に再判定する |
+
+Prompt、Index、Code、Model Route、JudgeはRAG Release Manifestで組として固定する。Rollback時にPromptだけ、またはIndexだけを戻して未検証の組合せを作らない。Go／No-Go、例外承認、利用範囲、期限、再判定条件はDecision Logへ残す。
+
+## 5. 本番導入後の監視・運用・継続的改善
+
+### 5.1 本番導入後に構築・高度化する機能
+
+本番導入後は、運用中に得たTrace、Assessment、Incident、Cost、LatencyをEvidenceとして、Review Workflowと改善Jobを段階的に高度化する。新規機能を「開発時」として独立させず、5.2から5.6の定常運用・分析で確認された問題を起点にBacklog化する。文書、Chunk、Retrieval、Prompt、Agent Routing、ACL、Judgeを同時変更せず、変更対象を1つに限定してTrainingで探索し、未使用Holdoutで判定する。
+
+構築・高度化は次の順で行う。自動化は候補抽出・配送・Scorer実行までとし、Expectation、`root_cause`、改善採否、Release昇格は担当者が承認する。
 
 1. 本番Traceへ検索文書、回答、拒否状態、Prompt Version、Index設定を保存する。
 2. 低評価、0件、再検索上限、Judge不一致のTraceをReview Appへ送る。
@@ -9960,14 +12551,14 @@ exec streamlit run streamlit_app.py \
 7. Retrieval設定、Prompt、Agent経路を一度に1種類ずつ改善する。
 8. Holdout Datasetで検索品質、回答品質、拒否品質、アクセス制御を比較する。
 9. 合格したPrompt、Index、Code、Model Routeを不変RAG Release Manifestとして段階的に昇格する。
-10. Production Monitoringで本番Traceをサンプリング評価する。
+10. 導入時に開始済みのProduction Monitoringで本番Traceをサンプリング評価し、Cost、Alert、滞留を見直す。
 11. LLM Judgeと人間の同名Feedbackを蓄積し、Judgeを`align()`する。
 12. Aligned Judgeを未使用Traceで検証してからMonitoringへ反映する。
 13. Gitコミット、Prompt Version、Index設定、基盤モデルの組み合わせを監視する。
 
-RAGでは、低品質の原因を「文書不足」「文書解析・Chunk不良」「検索設定」「十分性判定」「回答Prompt」「権限Filter」に分ける。回答が悪いという理由だけで、すべてのケースをPrompt Optimizationへ渡さない。
+RAGでは、低品質の原因を「文書不足」「文書解析・Chunk不良」「検索設定」「十分性判定」「回答Prompt」「権限Filter」に分ける。回答が悪いという理由だけで、すべてのケースをPrompt Optimizationへ渡さない。Canary／A-Bを追加する場合もRelease ID、Prompt Version、Model Route、Index ReleaseをTraceで識別可能にする。
 
-### 5.4 Quality・Review成果物
+#### 5.1.1 Quality・Review成果物
 
 | 成果物 | 所有Bundle | 用途 |
 | --- | --- | --- |
@@ -9982,15 +12573,15 @@ RAGでは、低品質の原因を「文書不足」「文書解析・Chunk不良
 | Judge Alignment Job | `quality` | 人間とJudgeのFeedback差分からAligned Judgeを作る。 |
 | CI Build Manifest＋任意のGitベースLoggedModel | `realtime` | Apps RuntimeのCommit／Build Tagを正本とし、Git checkout環境ではExperimental自動関連付けも検証する。 |
 
-### 5.5 Quality・Review Source File
+#### 5.1.2 Quality・Review Source File
 
-#### 5.5.1 本番レビュー結果を保存する
+##### 5.1.2.1 本番レビュー結果を保存する
 
 この実装では、本番Traceに対するレビューをDeltaテーブルへ正規化して保存する。ただし、1人の担当者が正解、技術原因、承認、Splitをすべて手入力する構成にはしない。ドメイン担当者は業務上の正解、RAG／LLMOps担当者は技術的な原因、品質責任者は採用可否を担当し、`improvement_target`と`dataset_split`は承認後にQuality Jobが固定ルールで決定する。
 
 MLflow／Databricks標準機能はTrace、Assessment、Feedback、Expectation、Label Schema、Labeling Session、Review App、EvaluationDataset、Registered Scorer／Judgeである。一方、`internal_rag_review_cases`、`pending → labeled → diagnosed → approved → assigned → synced`、`root_cause`、`improvement_target`、Hash Split、専用Backlog配送、職務分離は本資料独自のWorkflowである。PoCは標準機能だけで簡略化できるが、金融機関向け本番では監査証跡、承認権限、Case単位の再試行、配送完了確認のため独自Workflowを正本にする。
 
-##### 人とシステムを含む全体像
+###### 人とシステムを含む全体像
 
 この仕組みは、人がレビュー画面で値を入力する部分だけでは完結しない。本番リクエストからTraceを生成し、システムがレビュー候補を抽出し、人が期待値・原因・採用可否を判断した後、システムが改善先へ配送し、改善版を再評価・再リリースするまでを1つの循環として構築する。
 
@@ -10387,7 +12978,7 @@ if __name__ == "__main__":
 
 Splitの手動変更は原則禁止する。法令対応や重大障害などでHoldoutへ固定する必要がある場合は、`split_override`、変更理由、承認者、変更時刻を別列へ保存し、通常のHash規則と区別する。
 
-#### 5.5.2 MLflow EvaluationDatasetを冪等に育てる
+##### 5.1.2.2 MLflow EvaluationDatasetを冪等に育てる
 
 Quality Jobは `assigned` CaseをTraining／HoldoutへCase単位で配送する。MLflow EvaluationDatasetは同一 `inputs` を同じRecordとしてmergeするため、`case_instance_id` を `inputs` に含めてRecord identityを安定させる。質問だけでなく期待回答・期待文書もMaskingと意味保存を品質責任者が承認してから配送する。
 
@@ -10713,7 +13304,7 @@ Dataset実装VersionによりUC Tableの `inputs` 表現がStructまたはJSON�
 
 Trainingには正常回答、検索失敗、拒否正解、略語、複数文書統合、旧版競合、ACL、削除、解析Error、Prompt Injectionを含める。失敗ケースだけへ偏らせず、カテゴリ、ACL区分、拒否、文書種別の分布をSplitごとにGateする。
 
-#### 5.5.3 Retrieval設定を改善する
+##### 5.1.2.3 Retrieval設定を改善する
 
 この実装では、Promptより先に検索設定を同じTraining Datasetで比較する。Chunk生成Version、`query_type`、`num_results`、Filter、Rerankingを候補として評価し、期待文書Recall、Retrieval Relevance、Latencyを比較する。Embedding ModelやChunk Schemaを変える場合は既存Indexを上書きせず、新しいIndex名で構築して並行評価する。
 
@@ -10727,7 +13318,7 @@ Trainingには正常回答、検索失敗、拒否正解、略語、複数文書
 
 検索設定を選択したTraining Datasetと、最終判定用Holdout Datasetを分離する。検索結果を見ながら期待文書を後から変更すると、検索設定に都合のよい評価になるため、期待文書はドメイン担当者が事前承認する。
 
-#### 5.5.4 固定EvidenceでAnswer Promptだけを最適化する
+##### 5.1.2.4 固定EvidenceでAnswer Promptだけを最適化する
 
 Answer Prompt Optimization用Training Recordは、承認済み `fixed_evidence`、Citation ID、文書Version、Corpus Snapshotを `inputs` に保持する。Evidenceは選定時点でMasking・ACL確認し、Optimizer実行中にAI Search、Sufficiency、Query Rewriteを呼ばない。これにより差分はAnswer Promptだけとなる。Retrieval改善はAnswer PromptとModelを固定し、Sufficiency Prompt改善も固定Evidenceで別Jobとして行う。
 
@@ -10964,7 +13555,7 @@ for optimized_prompt in result.optimized_prompts:
 
 上のJobはPrompt単体Trainingであり、本番Graphの品質を保証しない。候補Promptを不変Versionとして登録した後、別のEnd-to-End JobがRAG Release候補、Training smoke set、未使用Holdoutを使って検索、経路、回答、ACL、Latencyを評価する。Prompt Optimizerの実行Caseと最終Release判定Caseを分離する。
 
-#### 5.5.5 Holdout評価とリリースゲート
+##### 5.1.2.5 Holdout評価とリリースゲート
 
 この実装では、候補と本番を同じHoldout Datasetで比較し、回答スコアだけでなく検索、拒否、ACL、経路、性能を判定する。IndexとPromptを同時に変更せず、Retrieval変更ではPromptを固定し、Prompt変更ではIndexを固定する。
 
@@ -10980,7 +13571,7 @@ for optimized_prompt in result.optimized_prompts:
 
 回答品質が改善しても期待文書Recallが下がった場合は昇格しない。LLMが偶然正解した可能性があり、文書更新や表現変更に対して安定しないためである。
 
-#### 5.5.6 RAG Release Manifestを昇格・ロールバックする
+##### 5.1.2.6 RAG Release Manifestを昇格・ロールバックする
 
 Prompt Aliasは開発候補の探索用であり、本番切替単位ではない。Release Gate合格時に不変Prompt URI、Git Commit、Wheel、Index Release、Corpus Snapshot、Model Service／Route、ACL・Judge Versionを含む新しい`rag_release_manifest`を発行し、`production` Channel Pointerを1 Transactionで切り替える。既存IndexやPrompt Versionを破壊更新しない。
 
@@ -10994,103 +13585,17 @@ Prompt Aliasは開発候補の探索用であり、本番切替単位ではな�
 
 PromptだけのExperimentでもその他列を現行Manifestと同一にし、差分を1要素へ限定する。Model Serving Traffic Splitを使う場合は1 Request内でVariantを固定できるRoute Keyを使うか、すべてのLLM Spanへ実Routeを記録し、Variant混在Requestを評価から分離する。文書更新だけでも新しいCorpus Snapshot／Index ReleaseとしてGolden Queryと削除・ACL回帰に合格してからManifestを切り替える。
 
-#### 5.5.7 Production Monitoring
+##### 5.1.2.7 Production Monitoringを継続運用する
 
-この実装では、運用指標を全件、意味的品質をSampleで評価する。検索件数、検索回数、0件、拒否、Latency、Token、Prompt Version、Git Commitは全Traceから集計し、Groundedness、Relevance、Sufficiencyは登録JudgeでSample評価する。
+Production Monitoringの登録、Dry Run、Pilot開始は`4.2.4.14`で完了している。本番導入後は、運用指標を全件、意味的品質をSampleで評価し、Sampling Rate、Cost上限、Alert閾値、Reviewerへの配送条件を実績から調整する。検索件数、検索回数、0件、拒否、Latency、Token、Prompt Version、Git Commitは全Traceから決定論的に集計し、Groundedness、Relevance、Sufficiencyなど意味評価だけを登録JudgeでSamplingする。
 
-`bundles/quality/src/register_monitoring.py`
+Judge Versionを更新しても過去Traceが自動的に同じ条件で再評価されるとは限らない。旧Judgeと候補Judgeは同じ固定Validation Traceへ明示実行し、人間との一致率、False Positive、False Negative、推定Costを比較する。承認前の候補JudgeをProduction Monitoringへ自動反映せず、旧Versionを停止する前に新Versionの開始状態とAlertを確認する。
 
-| 実装情報 | 内容 |
-| --- | --- |
-| 導入段階 | 本番導入時にPoC版を本番統制付きSourceへ置き換える。 |
-| 初めて必要になる段階 | 本番導入時 |
-| 後続段階で追加される機能 | 本番導入後は運用実績に基づくAlert、容量、閾値、Runbookを高度化する。 |
-| 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
-| 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
-| 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/register_monitoring.py` |
-| 実行主体 | Quality SP |
-| 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
-| 出力 | 評価、Dataset、Prompt／Judge候補 |
-| 必要な理由 | 品質改善を本番実行から分離するため |
-| 正常終了時 | Version付き成果物を保存する |
-| 失敗時 | Releaseへ昇格しない |
-| 再実行時 | 安定Case IDで冪等再評価する |
+##### 5.1.2.8 TraceにAssessmentを収集する
 
-```python
-"""本番Traceへ継続評価Scorerを登録するModule。数値で判定できるLatencyやTokenをLLM Judgeへ委ねない。
+Assessment自体はPoCから収集している。この節で本番導入後に追加するのは、低評価、再検索上限、0件、Judgeの`no`、ACL疑義を定期的にLabeling Session／Review Queueへ配送し、担当割当とDataset同期を自動化する運用である。ドメイン担当者はFeedbackとExpectation、RAG／LLMOps担当者は`root_cause`、品質責任者は`review_decision`を入力する。
 
-主な入出力と更新対象は直前の実装情報表に従う。失敗時は部分結果を公開せず、永続状態を再読して安全に再実行する。
-"""
-
-from typing import Literal
-
-import mlflow
-from mlflow.genai.judges import make_judge
-from mlflow.genai.scorers import ScorerSamplingConfig
-
-
-def build_internal_rag_quality_judge():
-    """回答が取得文書へ忠実で、引用が主張を支持するか評価するJudgeを生成する。
-
-    Returns:
-        処理結果。
-
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
-
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
-
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
-    """
-    return make_judge(
-        name="internal_rag_quality",
-        instructions="""
-{{ trace }}を確認し、回答の各主張がRETRIEVER Spanの文書に支持されているか、
-回答内のStable Citation IDが対応するChunkを正しく指し、その主張を支持するか評価してください。
-すべて満たせばyes、根拠不足または誤引用が1つでもあればnoを返してください。
-""".strip(),
-        feedback_value_type=Literal["yes", "no"],
-        model="databricks:/system.ai.claude-sonnet-4-5",
-    )
-
-
-def main() -> None:
-    """Judgeを本番Experimentへ登録し、Traceの10%を継続評価する。
-
-    Returns:
-        なし。
-
-    Side Effects:
-        Table、Volume、Trace、外部Resourceのうち、この関数が担当する対象を更新する場合がある。
-
-    Security:
-        権限、公開条件、競合状態を確認できない場合はFail Closedで停止する。
-
-    Retry:
-        永続状態を再読し、適用済み処理を重複させない前提で再実行する。
-    """
-    experiment = mlflow.set_experiment("/Shared/llmops/internal-rag-realtime")
-    registered = build_internal_rag_quality_judge().register(
-        experiment_id=experiment.experiment_id
-    )
-    registered.start(
-        experiment_id=experiment.experiment_id,
-        sampling_config=ScorerSamplingConfig(sample_rate=0.10),
-    )
-
-
-if __name__ == "__main__":
-    main()
-```
-
-Judgeを更新しても過去Traceが自動的に再評価されるとは限らない。Judge Version比較が必要な場合は、固定したTrace集合に旧Judgeと候補Judgeを明示的に実行する。
-
-#### 5.5.8 TraceにAssessmentを収集する
-
-この実装では、低評価、再検索上限、0件、Judgeの`no`、ACL疑義をReview Appへ送り、ドメイン担当者、RAG／LLMOps担当者、品質責任者が同じTraceを役割別にレビューする。ドメイン担当者はFeedbackとExpectation、RAG／LLMOps担当者は`root_cause`、品質責任者は`review_decision`を入力する。
+MLflow Review AppとLabeling SessionはTraceへFeedback／Expectationを付与する公式機能である。一方、本資料の状態遷移、原因分類、SLA、Dataset配送は独自Workflowであるため、Runtime更新時にSDK互換性と権限をStagingで再確認する。PoCではTrace UIまたは`record_poc_assessments.py`で少数Caseを直接レビューすればよく、この定期配送Workflowは必須ではない。
 
 | Assessment | 種類 | 用途 |
 | --- | --- | --- |
@@ -11128,6 +13633,8 @@ Judgeを更新しても過去Traceが自動的に再評価されるとは限ら�
 
 主な入出力と更新対象は直前の実装情報表に従う。失敗時は部分結果を公開せず、永続状態を再読して安全に再実行する。
 """
+
+import os
 
 import mlflow
 from mlflow.genai.label_schemas import (
@@ -11214,12 +13721,19 @@ def create_schemas():
         input=InputCategorical(
             options=[
                 "DOCUMENT",
+                "PARSE",
+                "PREP",
                 "CHUNK",
                 "RETRIEVAL",
-                "PROMPT",
+                "QUERY_REWRITE",
+                "SUFFICIENCY",
+                "ANSWER_PROMPT",
+                "MODEL",
                 "ROUTING",
+                "CITATION",
                 "ACL",
                 "JUDGE",
+                "PLATFORM",
             ]
         ),
         enable_comment=True,
@@ -11287,13 +13801,17 @@ def main() -> None:
         永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     schemas = create_schemas()
+    # 通知先をSourceに書かず、認証済みReviewerのEmailをSecret参照でJob環境へ注入する。
+    assigned_users = [
+        user.strip()
+        for user in os.environ["REVIEW_ASSIGNED_USERS"].split(",")
+        if user.strip()
+    ]
+    if not assigned_users:
+        raise ValueError("REVIEW_ASSIGNED_USERS must contain at least one reviewer")
     session = create_labeling_session(
         name="internal-rag-weekly-review",
-        assigned_users=[
-            "domain-reviewers@example.com",
-            "rag-engineers@example.com",
-            "rag-quality-owners@example.com",
-        ],
+        assigned_users=assigned_users,
         label_schemas=[schema.name for schema in schemas],
     )
     traces = mlflow.search_traces(
@@ -11316,17 +13834,19 @@ Review Assessment同期Jobは、Expectationが揃ったら`labeled`、`root_caus
 
 エンドユーザーの👍／👎はレビュー候補の優先順位付けに利用できるが、Judge Alignmentの正解として自動採用しない。社内の品質基準を理解した担当者が、判定理由とともに承認する。
 
-#### 5.5.9 AssessmentでLLM JudgeをAlignmentする
+##### 5.1.2.9 AssessmentでLLM JudgeをAlignmentする
 
-この実装では、`internal_rag_quality`という同一名にLLM Judgeと人間のFeedbackが両方あるTraceだけを`align()`へ渡す。Alignment用Traceと最終Judge検証用Traceは重複させず、Aligned Judgeを人間の判断へ合わせた後も未知ケースへの一致率とFalse Positiveを確認する。
+Judge Alignmentの時期はPoC／本番という環境名ではなく、**同じ評価基準の人間Feedbackが十分にあるか**、**JudgeをRelease GateやProduction Monitoringの判断へ使うか**で決める。JudgeをGateへ使わないPoCでは不要である。一方、専門家ラベルが集まりPilotのGateへ使うならPoC後半またはPilot中に実施する。本番後は基準変更や誤差Driftが確認されたときに再Alignmentする。
+
+この実装では、まず初期Judgeで`internal_rag_quality` Assessmentを作成し、同じTraceへ**完全に同じ名前**の人間Feedbackを収集する。公式上は最低10 TraceでAlignmentできるが、金融機関向けではカテゴリ、拒否、ACL境界を含む50～100 Traceを目安にする。`judge_dataset_split=alignment`と`judge_dataset_split=validation`をCase Family単位で固定し、同じTraceを両方へ入れない。Aligned Judgeを人間へ合わせた後も、未使用Validationで一致率、False Positive、False Negativeを確認し、自動でProduction Monitoringへ反映しない。
 
 `bundles/quality/src/align_judge.py`
 
 | 実装情報 | 内容 |
 | --- | --- |
-| 導入段階 | 本番導入後に本番TraceとAssessmentを使って追加する。 |
-| 初めて必要になる段階 | 本番導入後 |
-| 後続段階で追加される機能 | 改善CycleごとにDataset、Rubric、閾値、Release比較を更新する。 |
+| 導入段階 | JudgeをRelease Gateへ使う場合はPoC後半／Pilotでも実施でき、通常は本番後の継続改善で実施する。 |
+| 初めて必要になる段階 | 人間Feedbackが最低10 Trace、望ましくは50～100 Trace集まり、Judgeを重要判断へ使う段階 |
+| 後続段階で追加される機能 | 基準変更、Judge Drift、Model変更時に再Alignmentし、毎回未使用Validationで検証する。 |
 | 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
 | 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
 | 関連する検証 | Version付き成果物を保存する。Releaseへ昇格しない。 |
@@ -11389,7 +13909,7 @@ def has_alignment_pair(trace) -> bool:
 
 
 def load_alignment_traces(run_id: str):
-    """Review SessionからAlignment条件を満たすTraceを取得する。
+    """Review SessionからAlignment用に固定されたTraceだけを取得する。
 
     Args:
         run_id: 処理に使用する`run_id`。
@@ -11407,7 +13927,56 @@ def load_alignment_traces(run_id: str):
         永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
     traces = mlflow.search_traces(run_id=run_id, return_type="list")
-    return [trace for trace in traces if has_alignment_pair(trace)]
+    return [
+        trace
+        for trace in traces
+        if has_alignment_pair(trace)
+        and (trace.info.tags or {}).get("judge_dataset_split") == "alignment"
+    ]
+
+
+def load_validation_traces(run_id: str):
+    """Alignmentへ未使用のJudge Validation Traceを取得する。"""
+    traces = mlflow.search_traces(run_id=run_id, return_type="list")
+    return [
+        trace
+        for trace in traces
+        if has_alignment_pair(trace)
+        and (trace.info.tags or {}).get("judge_dataset_split") == "validation"
+    ]
+
+
+def human_feedback_value(trace) -> str:
+    """同名Assessmentから人間Feedbackだけを取り出す。"""
+    for assessment in trace.search_assessments(name=JUDGE_NAME):
+        if (
+            assessment.source is not None
+            and assessment.source.source_type == AssessmentSourceType.HUMAN
+        ):
+            return assessment.value
+    raise ValueError(f"Human feedback is missing: {trace.info.trace_id}")
+
+
+def validate_candidate(judge, traces) -> dict[str, float]:
+    """未使用Traceで一致率とJudgeのFalse Positive／Negativeを計算する。"""
+    if not traces:
+        raise ValueError("Judge validation traces are required")
+    pairs = [
+        (judge(trace=trace).value, human_feedback_value(trace))
+        for trace in traces
+    ]
+    agreement = sum(predicted == actual for predicted, actual in pairs) / len(pairs)
+    false_positive = sum(
+        predicted == "no" and actual == "yes" for predicted, actual in pairs
+    ) / len(pairs)
+    false_negative = sum(
+        predicted == "yes" and actual == "no" for predicted, actual in pairs
+    ) / len(pairs)
+    return {
+        "agreement": agreement,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+    }
 
 
 def main() -> None:
@@ -11428,32 +13997,53 @@ def main() -> None:
     Retry:
         永続状態を再読し、適用済み処理を重複させない前提で再実行する。
     """
-    traces = load_alignment_traces(os.environ["LABELING_SESSION_RUN_ID"])
-    if len(traces) < MIN_ALIGNMENT_TRACES:
+    run_id = os.environ["LABELING_SESSION_RUN_ID"]
+    alignment_traces = load_alignment_traces(run_id)
+    validation_traces = load_validation_traces(run_id)
+    alignment_ids = {trace.info.trace_id for trace in alignment_traces}
+    validation_ids = {trace.info.trace_id for trace in validation_traces}
+    if alignment_ids & validation_ids:
+        raise ValueError("Alignment and validation traces must not overlap")
+    if len(alignment_traces) < MIN_ALIGNMENT_TRACES:
         raise ValueError(
-            f"Need {MIN_ALIGNMENT_TRACES} alignment traces; found {len(traces)}"
+            f"Need {MIN_ALIGNMENT_TRACES} alignment traces; found "
+            f"{len(alignment_traces)}"
         )
     optimizer = MemAlignOptimizer(
         reflection_lm="databricks:/system.ai.claude-sonnet-4-5"
     )
     aligned_judge = build_internal_rag_quality_judge().align(
-        traces=traces,
+        traces=alignment_traces,
         optimizer=optimizer,
     )
+    metrics = validate_candidate(aligned_judge, validation_traces)
+    if metrics["agreement"] < float(os.getenv("MIN_JUDGE_AGREEMENT", "0.90")):
+        raise ValueError(f"Judge agreement gate failed: {metrics}")
+    if metrics["false_negative"] > float(
+        os.getenv("MAX_JUDGE_FALSE_NEGATIVE", "0.05")
+    ):
+        raise ValueError(f"Judge false-negative gate failed: {metrics}")
+    if metrics["false_positive"] > float(
+        os.getenv("MAX_JUDGE_FALSE_POSITIVE", "0.05")
+    ):
+        raise ValueError(f"Judge false-positive gate failed: {metrics}")
     experiment = mlflow.set_experiment("/Shared/llmops/internal-rag-realtime")
     candidate = aligned_judge.register(experiment_id=experiment.experiment_id)
     print(candidate)
+    print(metrics)
 
 
 if __name__ == "__main__":
     main()
 ```
 
-Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、JudgeのInstructionsや参照例などを人間Feedbackへ適応させる処理である。それでもAlignment Traceへ過度に適合する可能性があるため、同じTraceで最終検証しない。Prompt TrainingとJudge Alignmentで同じ元ケースを利用することは可能だが、Aligned JudgeをPrompt OptimizerのScorerに使う場合は、Judgeが見たケースをPromptの最終リリース判定へ使わない。
+Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、JudgeのInstructionsや参照例などを人間Feedbackへ適応させる処理である。それでもAlignmentに使った例へ都合よく判定基準が調整されるため、同じTraceで最終検証しない。Prompt TrainingとJudge Alignmentで同じ元ケースを利用することは可能だが、Aligned JudgeをPrompt OptimizerのScorerに使う場合は、Judgeが見たケースをPromptの最終リリース判定へ使わない。
+
+登録結果はあくまで候補Versionである。品質責任者がValidation結果と誤判定例を承認し、Release ManifestへJudge Versionを記録した後に限ってProduction Monitoringを開始する。金融機関向けReleaseを未検証Judgeだけで自動可決しない。
 
 `MemAlignOptimizer`はExperimental APIである。`quality` JobではMLflow、DSPy、Jinja2、tqdmのVersionを固定し、Runtime更新時にAlignmentとJudge Validationを再実行する。
 
-#### 5.5.10 GitコミットベースのVersion Tracking
+##### 5.1.2.10 GitコミットベースのVersion Tracking
 
 この実装では、3 Bundle、共通Package、Prompt利用箇所、Index設定、Scorer、Assessment Schemaを同じGitリポジトリで管理する。Model RegistryをアプリケーションコードのVersion管理に使用しない。
 
@@ -11470,9 +14060,97 @@ Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、Judgeの
 
 本番Traceへ少なくとも、RAG Release ID、Git Commit、Build ID、Wheel、解決済みPrompt Version、Index／Corpus Release、Embedding、Parse／Prep／Chunk Version、Model Service／実Route、ACL Policy Version／Entitlement Hash、検索Attempt、拒否理由、Citation ID、最終文書Versionを記録する。未Commit変更を含む状態から本番デプロイしない。
 
-### 5.6 本番運用上の設計判断
+### 5.2 定常監視
 
-#### 文書更新と再処理
+本番導入後は、Availabilityだけでなく、Corpus公開状態、Retrieval、回答、ACL、Judge、Cost、Review滞留を同じRelease IDで追跡する。全件で決定論的に計測できる件数・Latency・Error・Tokenと、Samplingして意味評価するJudgeを分離する。
+
+| 監視領域 | 定常確認 | 頻度 | Primary Owner | 判断・記録 |
+| --- | --- | --- | --- | --- |
+| 文書Lifecycle | 登録、承認、失効、削除、Pointer、Reconciliation候補 | 日次、変更ごと | 文書管理担当者 | 未承認公開や滞留をManifest／Audit Logで確認する |
+| Pipeline／Error | Run、Event Log、Attempt、Error、Quarantine | Runごと、日次 | Data Engineering担当者 | 形式別Error率と再試行可否をRun Logへ残す |
+| Gold／Search Sync | Gold差分、旧版残存、Index同期、Snapshot | Syncごと | Search担当者 | Release Manifestと実体の一致を照合する |
+| Agent／Model | Availability、429、5xx、Loop、Model Route | 継続集計、日次 | Agent／LLMOps担当者 | SLOとRoute比率をDashboardで確認する |
+| Trace／Masking | 必須Span、Version、機密情報、Trace欠落 | 日次、Releaseごと | LLMOps／Security担当者 | 再現不能またはMasking違反をIncident化する |
+| Retrieval／回答品質 | Recall、0件、再検索、Groundedness、Citation、拒否一致 | 日次集計、週次Review | Quality担当者 | Slice別に閾値とBaseline差を確認する |
+| Assessment／Review | pending滞留、必須Label、原因診断、承認、配送 | 日次、週次Review | 品質責任者 | SLA超過と未配送CaseをReview Tableで追う |
+| Judge品質 | 人間一致率、False Positive／Negative、評価失敗 | 週次、Judge変更時 | Quality担当者 | JudgeをGateへ継続利用できるか判断する |
+| Latency／Cost | P50／P95、初回SSE、Token、検索回数、Judge費用 | 日次、月次 | Service Owner | SLO／予算との差と予測をCost Reportへ残す |
+| Release Drift | Git、Prompt、Index、Model、Judge、Wheel | Deployごと、日次 | Release Manager | 実行中の組合せがRelease Manifestと一致するか確認する |
+
+Dashboardで平均値だけを眺めず、文書形式、業務Role、質問Purpose、回答可否、Prompt Version、Model Route、Index Release、再検索有無でSliceする。閾値変更は監視を静かにする目的で行わず、変更理由、比較期間、承認者をDecision Logへ残す。
+
+### 5.3 Alert・障害・品質問題への対応
+
+Alertは通知で終わらせず、影響範囲、対象Release、暫定措置、恒久対応、再発防止、Close承認へ結び付ける。運用担当者はRunbookで初動し、原因が品質かPlatformか不明な場合もTrace IDとRelease IDを保全してから切り分ける。
+
+| 事象 | 初動 | 切り分け | 復旧・改善 | 終了条件 |
+| --- | --- | --- | --- | --- |
+| ACL越境／機密情報露出 | Trafficまたは対象Corpusを即時停止する | Identity、Filter、Trace、権限変更を調査する | Access遮断、影響調査、修正版Security Gate | Security責任者が影響と再発防止を承認する |
+| 根拠なし重大回答／誤引用 | 対象Releaseの利用範囲を制限する | Retrieval、Sufficiency、Answer、Citationの最初の破綻点を調査する | 旧ReleaseへRollbackまたは対象質問を安全拒否する | 固定Holdoutと重大Case回帰が合格する |
+| Pipeline／Search同期失敗 | 新規公開を停止し既存Releaseを維持する | Event Log、Error、Gold差分、Index状態を照合する | 冪等Replay、Reconciliation、必要ならIndex切戻し | Gold、Index、Manifestが一致する |
+| Agent／Model／Search障害 | Timeout、Retry上限、安全Errorを適用する | 429、5xx、Capacity、Network、Dependencyを調査する | Capacity／Route調整または旧Releaseへ戻す | SLO回復と再発監視期間を満たす |
+| 品質Metric低下 | 影響Sliceと代表Traceを抽出する | DOCUMENTからPLATFORMまで原因分類する | 対象Componentだけを変更して再評価する | Holdout合格後に段階Releaseする |
+| Judge異常 | Judge結果を自動Gateから外し人手確認へ切替える | 人間Feedbackとの差、入力欠落、Model Driftを調査する | 再Alignmentまたは旧Judgeへ戻す | 独立Validationで基準を回復する |
+| Cost／Latency超過 | 高Cost RouteやSampling拡大を抑制する | Token、検索回数、再検索、Judge、Model別に分解する | Prompt／Route／Sampling／Capacityを個別調整する | 品質Guardrailを維持して予算・SLOへ戻る |
+
+Incident Close前に、Monitoringで検知できたか、Runbookで復旧できたか、RTOを満たしたか、同じCaseをEvaluationDatasetまたはSecurity回帰Datasetへ残すべきかを判断する。
+
+### 5.4 品質レビューとAssessment運用
+
+品質Reviewは「悪い回答へ低評価を付ける作業」ではない。システムが候補Traceを抽出し、人が業務上の期待値、技術原因、採用可否を職務分離して確定し、Quality Jobが改善先とDataset Splitを割り当てる。
+
+| 工程 | システム | 人 | 判定Evidence |
+| --- | --- | --- | --- |
+| 候補抽出 | 低評価、0件、Loop、Judge不一致、IncidentからTraceを抽出・Mask・重複排除する | 抽出規則と優先度を承認する | Trace、Scorer、Incident ID |
+| Labeling | Assessmentを同期し必須項目を検証する | ドメイン担当者がExpectationとRationaleを入力する | 期待回答、期待文書、拒否期待 |
+| Diagnosis | Trace、Chunk、Index、Versionを表示・同期する | RAG／LLMOps担当者が`root_cause`を確定する | 最初に破綻したSpan／Dataset |
+| Approval | Roleと必須Fieldを検証する | 品質責任者が採用・却下を決める | 業務影響、再現性、機密性 |
+| Assignment | 固定Mappingと`case_family_id` Hashで改善先・Splitを決める | 例外時だけ承認する | Policy Version、Hash結果 |
+| Sync | EvaluationDatasetまたは専用Backlogへ冪等配送する | 配送失敗・除外理由を確認する | 配送先ID、同期時刻、状態 |
+
+Feedbackは「今回の実績への評価」、Expectationは「同じ入力で期待する正解」であり、用途を分ける。`pending → labeled → diagnosed → approved／rejected → assigned → synced`の状態はDeltaのReview Tableを正本とし、TraceをWorkflow Databaseとして直接更新しない。
+
+### 5.5 本番Evidenceに基づく改善サイクル
+
+改善開発は本番Evidenceから開始し、次のCycleで行う。改善CaseのTraining投入と、最終判定用Holdoutへの固定はQuality JobがPolicy Version付きで行い、評価結果を見てからSplitを入れ替えない。
+
+```mermaid
+flowchart TD
+    A["本番Trace・Assessment・Incident"] --> B["候補抽出とMasking"]
+    B --> C["Expectationと原因の確定"]
+    C --> D["改善先とDataset Splitを割当"]
+    D --> E["Trainingで1要素を改善"]
+    E --> F["未使用HoldoutでRelease Gate"]
+    F --> G{"採用判断"}
+    G -->|採用| H["Release Manifestを作成"]
+    H --> I["Pilot／Canaryで限定公開"]
+    I --> J["本番Monitoring"]
+    J --> A
+    G -->|却下| K["Baseline維持・理由記録"]
+    G -->|Evidence不足| L["追加Case収集"]
+    L --> A
+```
+
+1回の改善で主要変更は1種類に限定する。例えばRetrieval変更の評価中にAnswer PromptとModel Routeも変えると、結果差を説明できない。採用時はGit Commit、Prompt Version、Index Release、Model Route、Judge Version、Dataset Snapshot、Gate結果をRelease ManifestとDecision Logへ固定する。
+
+### 5.6 Judge Alignment、Canary／A-Bなどの高度化
+
+Judge Alignmentとオンライン比較は、PoCの必須機能ではなく、本番Evidenceと十分な運用能力が蓄積してから導入する。
+
+| 高度化 | 開始条件 | 制御方法 | Guardrail |
+| --- | --- | --- | --- |
+| Judge Alignment | 同名の人間FeedbackとJudge Feedbackが十分あり、Label品質を確認済み | Alignment用Traceで`align()`し、別のJudge Validation Setで検証する | Alignment Caseを最終Validationへ再利用しない。False Positive／Negativeを確認する |
+| Judge Version更新 | 独立Validation合格、品質責任者承認 | Registered Judge VersionをRelease Manifestへ固定する | 新Judgeを自動開始せず、旧Judgeへ戻せるようにする |
+| Model Canary | Model Route別のオフライン評価、Capacity、Cost確認済み | Model Serving EndpointのTraffic設定またはAgent側の決定的Routeで比率制御する | User／Case Familyを跨いだ混入を防ぎ、ACLと品質Guardrailを共通化する |
+| Prompt A/B | Prompt候補がHoldout合格し、割当単位と期間を事前定義済み | Agent側で`candidate_id`から不変Prompt URIを選び、Traceへ記録する | Prompt Registry自体のTraffic Splitに依存せず、途中で比率・KPIを恣意的変更しない |
+| Index Canary | 新旧Indexを並行保持し、同一Corpus Snapshotで比較可能 | Release ManifestまたはAgent RouteでIndexを固定する | 文書Snapshot差を検索設定差と混同しない |
+| 自動Rollback | 十分な障害訓練、低誤検知Alert、承認済み停止条件 | Release Manager Jobが不変旧Manifestへ切り戻す | ACL越境など限定条件から開始し、品質Judge単独では自動化しない |
+
+Canary／A-Bでは、評価期間、対象母集団、Primary KPI、Guardrail、最小Sample、停止条件、判断者を開始前にDecision Logへ固定する。本番結果を見ながら都合よく対象やKPIを変更した場合、そのRunを正式な比較Evidenceに使わない。
+
+### 5.7 本番運用上の設計判断
+
+#### 5.7.1 文書更新と再処理
 
 - 原文書の内容Hashを文書IDとして保持する。
 - 文書管理上の論理IDと内容Hashを分け、版更新を追跡する。
@@ -11482,7 +14160,7 @@ Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、Judgeの
 - Delta Sync完了後にGolden Queryを自動評価する。
 - 文書SnapshotまたはIndex Release IDを評価結果へ残す。
 
-#### Retrieval設計
+#### 5.7.2 Retrieval設計
 
 - 製品名、API名、Error Codeを含む質問ではHYBRID Searchを基本とする。
 - `num_results`を増やしすぎず、RecallとLatency、Context Tokenを比較する。
@@ -11491,7 +14169,7 @@ Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、Judgeの
 - 検索Scoreを異なるQuery間の絶対品質値として扱わない。
 - 期待文書RecallとRetrieval Sufficiencyを分けて評価する。
 
-#### アクセス制御
+#### 5.7.3 アクセス制御
 
 - App Service PrincipalへAI SearchとModel Endpointの最小権限だけを付与する。
 - 文書単位ACLは検索後ではなくQuery Filterへ適用する。
@@ -11502,7 +14180,7 @@ Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、Judgeの
 
 AI Search Indexの行・列権限だけで文書単位ACLが自動適用されるとは限らない。アプリケーションレベルのFilter設計と権限テストを必須にする。
 
-#### 回答拒否と再検索
+#### 5.7.4 回答拒否と再検索
 
 - 再検索回数へ必ず上限を設定する。
 - 元質問と検索語を別Stateで保持する。
@@ -11511,7 +14189,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - 拒否回答には、質問の具体化や資料指定など次の行動を含める。
 - 回答拒否率の上昇を品質改善と誤認せず、期待拒否率と比較する。
 
-#### 引用と文書版
+#### 5.7.5 引用と文書版
 
 - 回答とともに文書ID、文書Version ID、Chunk Version ID、Opaque Source Ref、ページを保持する。
 - 回答中のStable Citation IDと取得Chunkの対応を決定論的に検証する。
@@ -11519,7 +14197,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - 回答後に文書が更新されても、Traceから当時の版を特定できるようにする。
 - 署名付きURLなど期限付き情報を長期Traceへ保存しない。
 
-#### EvaluationDatasetの品質管理
+#### 5.7.6 EvaluationDatasetの品質管理
 
 - Prompt TrainingとPrompt Holdoutを分離する。
 - Judge AlignmentとJudge Validationを分離する。
@@ -11529,7 +14207,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - 文書廃止や業務ルール変更時にExpectationを更新する。
 - 同じTemplateの類似質問がTrainingとHoldoutへ偏らないようにする。
 
-#### AssessmentとJudge Alignment
+#### 5.7.7 AssessmentとJudge Alignment
 
 - FeedbackとExpectationを混同しない。
 - Judge名と人間Feedback名を完全に一致させる。
@@ -11539,7 +14217,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - Judgeと人間の一致率、False Positive、文書種別別品質を確認する。
 - Judge変更後に必要な過去Traceを明示的に再評価する。
 
-#### ストリーミング
+#### 5.7.8 ストリーミング
 
 - Agent Serverの`@stream`を主経路にする。
 - 同じ`item_id`でDeltaとDone Eventを返す。
@@ -11548,7 +14226,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - Streamlitで`[DONE]`、Error、Timeout、切断を処理する。
 - Agent ServerとStreamlitのHealth Checkを分ける。
 
-#### 機密情報とTrace
+#### 5.7.9 機密情報とTrace
 
 - 質問、検索Chunk、回答に含まれる機密情報を分類する。
 - 原文全文ではなく、必要なChunk、文書ID、Mask済み抜粋を保存する。
@@ -11556,7 +14234,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - EvaluationDataset追加前に機密情報を再確認する。
 - Debug LogへAccess Token、認証Header、署名付きURLを出力しない。
 
-#### 品質・安定性・性能・コスト
+#### 5.7.10 品質・安定性・性能・コスト
 
 | 分類 | 監視項目 |
 | --- | --- |
@@ -11570,7 +14248,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 数値で判定できるLatency、Token、検索回数、0件率をLLM Judgeへ評価させない。意味理解が必要なGroundedness、Sufficiency、回答品質だけをJudgeへ任せる。
 
-#### デプロイとロールバック
+#### 5.7.11 デプロイとロールバック
 
 | 変更対象 | デプロイ | ロールバック |
 | --- | --- | --- |
@@ -11644,8 +14322,14 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 ### 6.5 抽出・回答品質
 
-- TrainingとHoldoutのEvaluationDatasetがある
+- PoCで`mlflow.genai.evaluate()`、Retriever／LLM／Agent Span、小規模EvaluationDataset、手動Assessmentを実行済みである
+- PoCのPipeline／Evaluation Runごとに、入力、Git Commit、Prompt、Model Route、Index、件数、Error、判断をPoC Run Logへ記録している
+- PoC結果を文書形式、質問カテゴリ、回答可否、Prompt／Model／Index Version、再検索有無でSlice比較している
+- 低品質CaseをDOCUMENT、PARSE、PREP、CHUNK、RETRIEVAL、QUERY_REWRITE、SUFFICIENCY、ANSWER_PROMPT、MODEL、ROUTING、CITATION、ACL、JUDGE、PLATFORMへ分類している
+- PoC完了時にKPI、Assessment、失敗Case、Cost／Latency、未解決Risk、本番化Gap、Go／No-GoをDecision Logへ保存している
+- TrainingとHoldoutのUnity Catalog EvaluationDatasetがあり、Family単位Split、Version、Lineageを固定している
 - Snapshot、Identity Fixture、期待回答・文書・Chunk・Citation・拒否理由を保存している
+- 文書／Chunk Recall、Citation、拒否、ACLは決定論的Scorer、Groundedness、Relevance、Sufficiency、CorrectnessはLLM Judgeへ分離している
 - Answer Prompt Optimizationは固定Evidenceだけを使っている
 - Retrievalと回答と経路を別々に評価している
 - ACL違反をRelease Gateで0件確認している
@@ -11653,13 +14337,31 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 ### 6.6 Assessment・Judge
 
-- Review Appで専門家がTraceを確認できる
-- FeedbackとExpectationのSchemaがある
+- PoCから開発者または少人数の業務担当者がTraceへAssessmentを付与している
+- 実績評価のFeedbackと正解値のExpectationを区別し、期待回答・文書・Chunk・拒否・理由を保持している
+- 本番導入時にAssessment Schema、Reviewer権限、Masking、保持期間を正式化している
+- 本番後はReview Queue／Labeling Sessionで専門家がTraceを定期レビューできる
 - Judgeと人間のFeedback名が一致している
-- AlignmentとJudge ValidationのTraceを分離している
-- Aligned Judgeの一致率とFalse Positiveを確認している
+- Alignmentが必要かをラベル量とJudge用途で判断し、PoC必須・本番後限定のいずれにもしていない
+- Alignment時は最低10 Trace、金融機関向け目安50～100 Traceを確保している
+- AlignmentとJudge ValidationをCase Family単位で分離している
+- Aligned Judgeの一致率、False Positive、False Negativeを確認し、未検証JudgeだけでReleaseを可決していない
+- Aligned Judge候補をProduction Monitoringへ自動反映していない
 
-### 6.7 リアルタイム処理
+### 6.7 Production Monitoring
+
+- Production Monitoringを本番開始前に設定し、StagingでDry Runしている
+- Production Trace Schema、Masking、Assessment権限、Scorer／Judgeの誤検知を固定Staging Traceで検証している
+- Alert通知経路、Runbook、Index切替、Retry／Replay、Agent／Model／Search障害、ACL越境、Rollbackを本番開始前に試験している
+- 障害検知から復旧までのRTOを計測し、試験Evidenceと未解決Riskを保存している
+- Pilotまたは本番開始と同時に承認済みJudge VersionのSamplingを開始している
+- Pilot中に文書公開、Pipeline、Search Sync、Agent、Model、Trace、Assessment、ACL、Latency／Cost、Releaseを担当者別に監視している
+- Release継続、Rollback、No-Go、利用範囲拡大の条件、判断者、EvidenceをDecision Logへ記録している
+- Sampling Rate、Judge Cost、Latency、Alert、停止条件、Rollbackを検証している
+- 全件の決定論的運用指標と、Samplingする意味評価を分離している
+- Judge Version、Git Commit、Prompt、Index、Corpus／Chunk VersionをTraceとRelease Manifestへ記録している
+
+### 6.8 リアルタイム処理
 
 - Agent Serverの`@stream`を使用している
 - StreamlitがSSEを逐次表示している
@@ -11668,7 +14370,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - Chain-of-Thoughtを表示していない
 - Timeout、429、切断、Errorを処理している
 
-### 6.8 Version管理
+### 6.9 Version管理
 
 - CodeはGitコミットベースVersion Trackingを使用している
 - Model RegistryをApplication Code管理に使用していない
@@ -11710,10 +14412,25 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - [Databricks SQL constraints](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-ddl-alter-table-add-constraint)
 - [Databricks `variant_explode`](https://docs.databricks.com/aws/en/sql/language-manual/functions/variant_explode)
 - [MLflow Agent Server](https://mlflow.org/docs/latest/genai/serving/agent-server/)
-- [MLflow Evaluation and Production Monitoring](https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor)
-- [MLflow Evaluation Datasets](https://mlflow.org/docs/latest/genai/datasets/)
+- [MLflow 3 for GenAI: Evaluation and Monitoring](https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor)
+- [Databricks MLflow 3 for GenAI](https://docs.databricks.com/aws/en/mlflow3/genai/)
+- [Databricks Human Feedback](https://docs.databricks.com/aws/mlflow3/genai/human-feedback/)
+- [Databricks Label during development](https://docs.databricks.com/aws/en/mlflow3/genai/human-feedback/dev-annotations)
+- [Databricks Building MLflow evaluation datasets](https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor/build-eval-dataset)
+- [Databricks Labeling Sessions](https://docs.databricks.com/aws/en/mlflow3/genai/human-feedback/concepts/labeling-sessions)
+- [MLflow GenAI Evaluation API](https://mlflow.org/docs/latest/api_reference/python_api/mlflow.genai.html)
+- [MLflow Evaluation Harness](https://docs.databricks.com/gcp/en/mlflow3/genai/eval-monitor/concepts/eval-harness)
+- [MLflow Evaluation Datasets](https://docs.databricks.com/gcp/en/mlflow3/genai/eval-monitor/concepts/eval-datasets)
+- [MLflow RAG Evaluation with Built-in Judges](https://mlflow.org/docs/latest/genai/eval-monitor/scorers/llm-judge/rag/)
+- [MLflow Custom Code-based Scorers](https://mlflow.org/docs/latest/genai/eval-monitor/scorers/custom/)
+- [MLflow Feedback](https://mlflow.org/docs/latest/genai/assessments/feedback/)
+- [MLflow Expectations](https://mlflow.org/docs/latest/genai/assessments/expectations/)
+- [MLflow Review Queues](https://mlflow.org/docs/latest/genai/assessments/review-queues/)
+- [MLflow Production Monitoring](https://docs.databricks.com/gcp/en/mlflow3/genai/eval-monitor/production-monitoring)
+- [MLflow Scorer Versioning](https://mlflow.org/docs/latest/genai/eval-monitor/scorers/versioning/)
 - [MLflow Prompt Optimization](https://mlflow.org/docs/latest/genai/prompt-registry/optimize-prompts)
 - [MLflow Judge Alignment](https://mlflow.org/docs/latest/genai/eval-monitor/scorers/llm-judge/alignment/)
+- [MLflow MemAlign Optimizer](https://mlflow.org/docs/latest/genai/eval-monitor/scorers/llm-judge/memalign/)
 - [Databricks Apps](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/key-concepts)
 - [Databricks Apps authorization](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/auth)
 - [Databricks Apps resources](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/resources)
