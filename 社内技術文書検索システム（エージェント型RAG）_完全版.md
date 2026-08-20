@@ -102,7 +102,9 @@ flowchart LR
 
 #### 1.6.1 本資料の読み方
 
-後続章はPoC、本番導入、本番導入後の順に読む。各Serviceや用語は、必要になる箇所で「目的、物理的実体、実装、実行結果、確認方法」の順に説明する。網羅的な定義を後から確認したい場合は、第8章の用語索引を参照する。
+後続章はPoC、本番導入、本番導入後の順に読む。各フェーズのデータモデル節では、最初に**「まず理解する構成」**として5〜7要素程度へ畳んだ概念図を示し、その後にTable／Dataset一覧、管理系ER図、詳細データフロー図へ段階的に展開する。初読では簡略図と各要素の役割だけを理解し、物理名、Key、書込元／読取元、細かな中間Datasetは実装時に参照すればよい。
+
+個別実装では、各Serviceや用語を必要になる箇所で「目的、物理的実体、実装、実行結果、確認方法」の順に説明する。網羅的な定義を後から確認したい場合は、第8章の用語索引を参照する。資料作成者向けの整合性確認は本文の理解経路から外し、第9章の付録へまとめる。
 
 機能StatusとAPI前提は2026年8月15日時点のDatabricks／MLflow公式資料に基づく。Beta、Public Preview、Experimentalは実行環境更新やRegion差の影響を受けるため、各Deploy前に第7章の公式LinkとStaging Smoke Testで再確認する。
 
@@ -233,7 +235,37 @@ PoCでもLakeflow Spark Declarative PipelinesでBronze／Silver／Goldを実装�
 
 PoCでは、少数文書で「取込 → Parse → Prep → Chunk → 検索 → RAG → 評価」が成立することを優先する。文書マニフェスト、文書バージョン管理台帳、文書変更申請、文書変更履歴は実装しないため、本番の管理ERをPoCへ持ち込まない。
 
-#### 3.2.1 PoC時のTable／Dataset一覧
+#### 3.2.1 まず理解する構成
+
+初読では、PoCを次の7要素だけで理解すればよい。`Attempt`、`Quality`、成功表、隔離表などは、下図の「Parse／Prep」を安全かつ再実行可能にするための**内部実装の展開形**であり、最初から個別Table名を覚える必要はない。
+
+```mermaid
+flowchart TD
+    VOL["1. 文書入力<br/>Unity Catalog Volume"]
+    BRONZE["2. Bronze<br/>原文・取込履歴"]
+    AI["3. Parse／Prep<br/>AI Functionで解析・検索前処理"]
+    SILVER["4. Silver<br/>Chunk履歴"]
+    GOLD["5. PoC Gold<br/>検索対象"]
+    SEARCH["6. AI Search"]
+    RAG["7. RAG・Trace・評価"]
+
+    VOL --> BRONZE --> AI --> SILVER --> GOLD --> SEARCH --> RAG
+    AI -. "失敗は隔離して調査" .-> ERR["隔離"]
+```
+
+この段階で押さえるポイントは次のとおりである。
+
+| 要素 | 初読で押さえる意味 |
+| --- | --- |
+| Bronze | 入力された原文と取込事実を失わず保持する。 |
+| Parse／Prep | 文書解析と検索用前処理を行う。高コスト処理なので試行結果を一度だけ保持し、成功と失敗へ分ける。 |
+| Silver | 文書Version付きのChunk履歴を保持する。 |
+| PoC Gold | PoCで検索対象にするChunkだけを提供する。本番の「人が承認した公開Version」とは異なる。 |
+| AI Search／RAG | GoldをIndex化し、検索・回答・出典・Trace・評価まで成立するかを確認する。 |
+
+以降はこの7要素を物理Tableへ展開する。**初読では次のTable一覧の「主な役割」列を中心に読み、物理種別、Key、書込元／読取元は実装時に参照する**。
+
+#### 3.2.2 PoC時のTable／Dataset一覧
 
 次表は、PoC Sourceで実際に作成・利用するTable／Datasetだけを示す。MLflow Experiment、Prompt Registry、Model Service、AI Search Index、Unity Catalog VolumeはTableではないため、後段の「関連Resource」へ分離する。
 
@@ -264,7 +296,7 @@ PoCでは、少数文書で「取込 → Parse → Prep → Chunk → 検索 →
 | Prompt Registry | UC-backed MLflow Prompt Resource | PoC PromptのVersion／Alias管理 |
 | Answer／Judge Model Service | Unity AI Gateway Model Service | RAG回答生成と意味評価 |
 
-#### 3.2.2 PoC時の管理系ER図
+#### 3.2.3 PoC時の管理系ER図
 
 **該当なし。**
 
@@ -272,7 +304,7 @@ PoCでは、`document_source_manifest`、`document_version_registry`、`document
 
 `main.llmops_poc.internal_rag_poc_evaluation`には評価Case間の参照関係を管理するERを必要とするほどの複数管理Tableがない。MLflow Trace／Assessmentとの関係は評価実行時のResource参照であり、文書管理ERとは別物である。
 
-#### 3.2.3 PoC時のデータフロー図
+#### 3.2.4 PoC時のデータフロー図
 
 PoCの中心はLakeflow Pipelineである。**文書マニフェストとのJOINは存在しない。** `poc_chunks_gold`が選ぶ「最新成功Version」はPoC限定の簡易公開条件であり、人が承認した公開Versionを意味しない。
 
@@ -2538,7 +2570,43 @@ PoC版を捨てて作り直すのではなく、メダリオンのDataset責務�
 
 物理Schemaを無断で別名へ置き換えず、以降はこの実名を使う。
 
-#### 4.2.1 本番導入時のTable／Dataset一覧
+#### 4.2.1 まず理解する構成
+
+本番導入時に最も重要な差分は、**PoCの「最新の処理成功Versionを検索する」構成から、「人が公開すると決定したVersionだけを検索する」構成へ変わること**である。初読では、管理系の4 TableやPipeline内部Tableをいったん畳み、次の構造だけを理解する。
+
+```mermaid
+flowchart TD
+    DUI["1. 文書管理UI<br/>人が審査・公開Version選択"]
+    MAN["2. 文書管理状態<br/>Manifest／Version Registry"]
+    VOL["3. 承認済み文書<br/>監視対象Volume"]
+    PIPE["4. Lakeflow<br/>Bronze → Parse／Prep → Silver"]
+    GOLD["5. Gold Current<br/>公開Versionだけ"]
+    SEARCH["6. Release単位AI Search"]
+    RAG["7. RAG<br/>ACL・出典・Trace・評価"]
+
+    DUI --> MAN
+    DUI --> VOL
+    VOL --> PIPE
+    PIPE --> GOLD
+    MAN -->|"公開Version・ACL"| GOLD
+    GOLD --> SEARCH --> RAG
+```
+
+この図の読み方は次のとおりである。
+
+| 要素 | 初読で押さえる意味 |
+| --- | --- |
+| 文書管理UI／文書管理状態 | 「何を公開してよいか」は人が決め、その結果を文書マニフェスト等へ保存する。 |
+| Lakeflow | 原文を解析してVersion付きChunk履歴を作る。処理成功しただけでは公開されない。 |
+| Gold Current | Silverの処理結果と文書マニフェストの公開Version参照が合流する公開境界。 |
+| AI Search | Gold CurrentをRelease単位で検索可能にし、Snapshotと組み合わせて再現性・ロールバックを確保する。 |
+| RAG | 公開済みIndexだけを参照し、ACL、出典、Trace、品質評価を適用する。 |
+
+`document_workflow_requests`と`document_manifest_audit_events`は、上図の「人の判断を安全に反映し、後から監査できるようにする」ための詳細Tableである。Pipeline内部の`Attempt`／`Quality`／隔離Tableも同様に詳細実装として後段で展開する。
+
+**初読では、次のTable一覧を全列読む必要はない。「1行の意味」と「主な役割」を先に確認し、Key・書込元・読取元は設計／実装時に参照する。**
+
+#### 4.2.2 本番導入時のTable／Dataset一覧
 
 ##### 文書管理
 
@@ -2601,7 +2669,7 @@ PoC版を捨てて作り直すのではなく、メダリオンのDataset責務�
 | Production Monitoring | Registered Scorer／Judge＋Monitoring設定 | Pilot／本番開始時から本番TraceをSampling評価 |
 | SQL Alert／AI/BI Dashboard | Databricks SQL Resource | Monitoring Signal／Quality Caseを通知・可視化 |
 
-#### 4.2.2 本番導入時の管理系ER図
+#### 4.2.3 本番導入時の管理系ER図
 
 本番導入時の文書管理ERは、次の4 Tableを中心にする。
 
@@ -2665,7 +2733,7 @@ erDiagram
 
 `document_workflow_requests`は**「こう変更したい」**という申請・承認済み意図を保持する。`document_manifest_audit_events`は**「実際にこう変更された」**という物理反映結果を保持する。この2つを分離することで、申請済みだが未反映、反映失敗、再実行を監査できる。
 
-#### 4.2.3 本番導入時のデータフロー図
+#### 4.2.4 本番導入時のデータフロー図
 
 本番導入時の最重要点は、**人の文書管理フローと自動PipelineがGold Currentで合流する**ことである。
 
@@ -12695,7 +12763,35 @@ Prompt、Index、Code、Model Route、JudgeはRAGリリース構成台帳で組�
 
 この節では、Baselineの全Tableを再掲せず、追加・高度化される物理Table／Datasetと、それらが既存構成のどこへ接続するかを示す。
 
-#### 5.1.1 本番導入後のTable／Dataset一覧
+#### 5.1.1 まず理解する構成
+
+本番導入後は、新しい巨大Architectureを作る段階ではない。**本番Baselineの外側へ「継続改善ループ」と、必要な場合だけ「Reconciliationループ」を足す**と理解すればよい。
+
+```mermaid
+flowchart TD
+    BASE["1. 本番Baseline<br/>文書管理・Pipeline・Search・RAG"]
+    MON["2. Production Monitoring<br/>Trace・Signal"]
+    REVIEW["3. Review<br/>人が原因・期待値を確定"]
+    IMPROVE["4. 改善<br/>Dataset・Retrieval・Prompt・Judge"]
+    RELEASE["5. Holdout・Release判定<br/>カナリア検証"]
+    RECON["6. Reconciliation<br/>条件付き差分検知"]
+    HUMAN["7. 人が確認<br/>既存Workflowへ戻す"]
+
+    BASE --> MON --> REVIEW --> IMPROVE --> RELEASE --> BASE
+    BASE -. "必要性が確認できた場合のみ" .-> RECON
+    RECON --> HUMAN --> BASE
+```
+
+初読では次の2本のループを区別する。
+
+| ループ | 目的 | 自動化の境界 |
+| --- | --- | --- |
+| 継続改善 | 本番Traceから品質問題を見つけ、Review、Dataset育成、Prompt／Retrieval／Judge改善、再リリースへつなげる | Signal検知や集約は自動化できるが、期待値・根本原因・採否など重要判断は人が確定する |
+| Reconciliation | Volume、文書マニフェスト、Gold、Searchのずれを候補として検知する | 差分候補は自動生成できるが、公開Version変更や削除を直接実行せず、人が確認して既存Workflowへ戻す |
+
+したがって、この章では**本番導入時から存在するBaselineを覚え直す必要はない**。次の一覧では「本番導入後に追加・高度化されるもの」と「どのBaselineへ接続するか」だけを追えばよい。
+
+#### 5.1.2 本番導入後のTable／Dataset一覧
 
 ##### 本番導入時から継続するBaseline
 
@@ -12723,7 +12819,7 @@ Prompt、Index、Code、Model Route、JudgeはRAGリリース構成台帳で組�
 | Judge Alignment | Alignment Run＋候補Judge／Registered Scorer | Judge ResourceとRunで管理する |
 | Production Monitoring高度化 | 既存Registered Scorer／Judge、Sampling、Alert設定 | 本番導入時のMonitoringを作り直さず設定を調整する |
 
-#### 5.1.2 本番導入後の管理系ER図
+#### 5.1.3 本番導入後の管理系ER図
 
 本番導入後も文書管理の正本は4.2の4 Tableである。Reconciliationを導入する場合だけ、**差分候補**を追加する。候補から文書マニフェストへ直接更新する関係は作らず、人が確認した後に既存Workflow Requestへ戻す。
 
@@ -12795,7 +12891,7 @@ erDiagram
 
 `internal_rag_quality_cases`を外部Issue Trackerで置き換える組織では、上図のQuality Case部分は外部Issue ID参照へ読み替える。
 
-#### 5.1.3 本番導入後のデータフロー図
+#### 5.1.4 本番導入後のデータフロー図
 
 本番導入後の追加フローは、通常運用の外側に**継続改善ループ**と、条件付きの**Reconciliationループ**として接続する。
 
@@ -14700,30 +14796,8 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - Workspace初期セットアップとPreflightの合格証跡があり、初見の担当者が「何を作り、何が保存され、どのSourceが動かすか」を追跡できる
 
 
-#### 6.10.1 フェーズ別データモデルのセルフレビュー
 
-- PoC時にTable／Dataset一覧が存在する
-- PoC時に管理系ER図、または「該当なし」の明示的説明がある
-- PoC時にPipelineデータフロー図がある
-- 本番導入時にTable／Dataset一覧がある
-- 本番導入時に管理系ER図がある
-- 本番導入時にPipeline＋文書マニフェストのデータフロー図がある
-- 本番導入後にTable／Dataset一覧がある
-- 本番導入後に管理系ER図がある
-- 本番導入後に継続運用・高度化のデータフロー図がある
-- 各フェーズの図が、その時点で存在しない将来機能を含んでいない
-- 3フェーズのTable一覧が「分類／物理名／物理種別／1行の意味／主なKey／主な役割／書込元／読取元」を共通軸として比較できる
-- 本番導入後に追加されたTableと、本番導入時から継続するBaselineを判別できる
-- PoC → 本番導入 → 本番導入後で何が増えたかを2.3の比較表から理解できる
-- 各フェーズで、個別SQL／Python／YAMLより前にデータモデル全体像が説明されている
-
-### 6.11 資料だけで答えられるべき最終確認
-
-修正後の資料は、個別コードを読まなくても次の3問へ答えられる状態を完了条件とする。
-
-1. **PoC**：PoCではどのTable／Datasetが存在し、どの順序でデータが流れるのか。
-2. **本番導入**：PoCに対してどの管理Tableが追加され、人の文書変更申請とPipelineがどこで接続するのか。
-3. **本番導入後**：本番開始後、どのTable／Workflowが追加され、Monitoring・改善・Reconciliationがどのように既存構成へ接続されるのか。
+設計書そのものの構成・フェーズ別データモデルの網羅性を確認する作成者向けチェック項目は、本文の読み進めを妨げないよう第9章の付録へ分離する。
 
 
 ## 7. 参考資料
@@ -14868,3 +14942,33 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 | Reconciliation | Volume、文書マニフェスト、Gold、Indexの差分候補を作る本番導入後の任意高度化 | Job、Python、候補Delta Table。公開Pointerは更新しない | 4.3.4.4、5.2.4 |
 | Model Route | 用途別Model ServiceとFallbackの固定構成 | リリース構成台帳列とAI Gateway設定 | 4.3.3.2 |
 | Gitによるモデルバージョン管理 | Application CodeをGit Commitで追跡する方式 | Git CommitとTrace／Release Tag | 5.2.2.10 |
+
+## 9. 付録：資料作成・レビュー用チェックリスト
+
+この付録は**資料作成者・レビュー担当者向け**であり、システム設計を理解するための本文ではない。通常の読者は第8章までで読み終えてよい。構成変更、Source追加、Table追加、フェーズ境界変更を行った場合に、資料と実装の整合性を確認するために使用する。
+
+### 9.1 フェーズ別データモデルのセルフレビュー
+
+- PoC時にTable／Dataset一覧が存在する
+- PoC時に管理系ER図、または「該当なし」の明示的説明がある
+- PoC時にPipelineデータフロー図がある
+- 本番導入時にTable／Dataset一覧がある
+- 本番導入時に管理系ER図がある
+- 本番導入時にPipeline＋文書マニフェストのデータフロー図がある
+- 本番導入後にTable／Dataset一覧がある
+- 本番導入後に管理系ER図がある
+- 本番導入後に継続運用・高度化のデータフロー図がある
+- 各フェーズの図が、その時点で存在しない将来機能を含んでいない
+- 3フェーズのTable一覧が「分類／物理名／物理種別／1行の意味／主なKey／主な役割／書込元／読取元」を共通軸として比較できる
+- 本番導入後に追加されたTableと、本番導入時から継続するBaselineを判別できる
+- PoC → 本番導入 → 本番導入後で何が増えたかを2.3の比較表から理解できる
+- 各フェーズで、個別SQL／Python／YAMLより前にデータモデル全体像が説明されている
+
+### 9.2 資料だけで答えられるべき最終確認
+
+修正後の資料は、個別コードを読まなくても次の3問へ答えられる状態を完了条件とする。
+
+1. **PoC**：PoCではどのTable／Datasetが存在し、どの順序でデータが流れるのか。
+2. **本番導入**：PoCに対してどの管理Tableが追加され、人の文書変更申請とPipelineがどこで接続するのか。
+3. **本番導入後**：本番開始後、どのTable／Workflowが追加され、Monitoring・改善・Reconciliationがどのように既存構成へ接続されるのか。
+
