@@ -2861,7 +2861,7 @@ Corpus Snapshotは、ある評価・検索Release時点で「どの文書Version
 
 過去Traceに`rag.corpus_snapshot_id=corpus-101`が残っていれば、そのRequestは`DOC-B/v2`を検索対象としていたと再現できる。Snapshotがないと、後から現在のCorpusだけを見てしまい、「Promptが悪かったのか、文書集合が変わったのか」を切り分けられない。
 
-Corpus Snapshotは文書本文やChunk全体をSnapshotごとに複製するものではなく、**Snapshot IDと文書Version集合の対応を保持する**。
+Corpus Snapshotは文書本文やChunk全体をSnapshotごとに複製するものではなく、**Snapshot IDと文書Version集合の対応を保持する**。 本番障害をStagingで再現する場合は、このMember一覧を使って当時と同じ文書Version集合を再構築できる。したがってCorpus Snapshotは監査・評価再現だけでなく、**Production-equivalent Replay Corpusを作るための再構築仕様**としても機能する。
 
 ##### Index Releaseが必要になる具体例
 
@@ -2874,7 +2874,7 @@ Corpus Snapshotは文書本文やChunk全体をSnapshotごとに複製するも�
 
 この例では文書集合は同じだが、検索品質が低下している。`index_release_id`があれば、「Corpus変更」ではなく「検索構成変更」が原因候補だと切り分けられる。
 
-Index Releaseを持たずIndex名だけを使い回すと、同じ名前のIndexでも中身のEmbeddingや設定が変わり、過去の検索挙動を再現できなくなる。
+Index Releaseを持たずIndex名だけを使い回すと、同じ名前のIndexでも中身のEmbeddingや設定が変わり、過去の検索挙動を再現できなくなる。 Full Snapshot Replayでは、Corpus Snapshotだけ合わせてもEmbeddingやIndex Schemaが異なれば検索順位は一致しないため、元Traceの`index_release_id`からEmbedding、Query Embedding、同期列、Chunk Schema、検索設定を解決し、Staging側の再構築Indexへ適用する。
 
 ##### RAGリリース構成台帳が必要になる具体例
 
@@ -13923,7 +13923,7 @@ RAGでは、低品質の原因を「文書不足」「文書解析・Chunk不良
 
 本番で初めて判明した誤回答、検索失敗、ACL疑義、Judge不一致は、開発環境やStagingで再現・改善できなければ継続改善へつながらない。一方で、本番Trace、実利用者Identity、業務文書、顧客識別子等をそのままDevへ複製すると、環境分離・最小権限・機密データ管理を崩す。
 
-したがって本システムでは、**本番RawデータをDevへ丸ごとコピーするのではなく、本番Quality領域で人が期待値・根本原因・改善対象を確定し、改善に必要な最小限の情報だけを「再現用Case」へ変換して下位環境へ昇格する**。Rawデータを環境外へ出せない場合は逆にCandidate Code／Promptを本番Quality領域へ持ち込み、データを動かさず評価する。
+したがって本システムでは、**本番RawデータをDevへ無条件に丸ごとコピーするのではなく、本番Quality領域で人が期待値・根本原因・改善対象を確定し、まず改善に必要な最小限の情報で再現を試みる**。ただしRAGでは検索順位、類似文書競合、Corpus更新、ACL Filter、Index同期などが**Corpus全体とIndex構成の相対関係**に依存するため、最小Replayで再現できない場合は、承認済みのProduction Corpus SnapshotとIndex ReleaseをStaging／Quality環境へ論理的に同等な状態として再構築する。Rawデータを環境外へ出せない場合は逆にCandidate Code／Prompt／Retrieval設定を本番Quality領域へ持ち込み、データを動かさず同じSnapshotに対して評価する。
 
 ```mermaid
 flowchart TD
@@ -13933,9 +13933,10 @@ flowchart TD
     META["metadata_only<br/>ID・Version・Metricだけ"]
     CASE["sanitized_case<br/>Mask済み質問・Expectation"]
     REPLAY["staging_replay<br/>必要最小の文書・Chunk・ACL Fixture"]
+    FULL["full_snapshot_replay<br/>Production相当Corpus Snapshot＋Index Release"]
     ONLY["prod_only<br/>データを動かさずCandidateを本番Quality側で評価"]
     DEV["Dev<br/>Prompt・Routing・Judge改善"]
-    STG["Staging<br/>Retrieval・Parse・ACL再現"]
+    STG["Staging<br/>Minimal／Full Snapshot Replay"]
     HOLD["Holdout／Security／SLO評価"]
     REL["RAG Release"]
     PROD2["Production"]
@@ -13944,6 +13945,7 @@ flowchart TD
     CLASS --> META --> DEV
     CLASS --> CASE --> DEV
     CLASS --> REPLAY --> STG
+    CLASS --> FULL --> STG
     CLASS --> ONLY --> HOLD
     DEV --> STG --> HOLD --> REL --> PROD2
     ONLY --> REL
@@ -13959,10 +13961,29 @@ Review Caseには、改善に必要なデータ量と機密性に応じて次の
 | --- | --- | --- | --- |
 | `metadata_only` | Release ID、Prompt URI、Index Release、Corpus Snapshot、Metric、原因分類等 | Code／設定差分の調査、再現条件の特定 | Raw質問・文書本文は渡さない |
 | `sanitized_case` | Mask済み質問、承認済みExpectation、必要文書ID、固定証跡のMask済み抜粋 | Prompt Optimization、Agent Routing、Judge改善 | PII、Secret、顧客ID等を除去してから配送 |
-| `staging_replay` | 再現に必要な最小文書Version／Chunk、ACL Fixture、質問、Expectation | Retrieval、Parse／Prep、Chunk、ACL問題 | 全Corpusを複製せず、承認済み最小集合だけStagingへ作る |
-| `prod_only` | 原則としてデータを移動しない | 高機密文書、Raw Trace依存、外部持出し禁止Case | Candidate Code／Prompt／Judgeを本番Quality領域へ持ち込んで評価 |
+| `staging_replay` | 再現に必要な最小文書Version／Chunk、ACL Fixture、質問、Expectation | Retrieval、Parse／Prep、Chunk、ACL問題の一次再現 | まず承認済み最小集合だけStagingへ作り、再現できるか確認する |
+| `full_snapshot_replay` | Productionと同じ`corpus_snapshot_id`の文書Version集合、同等のIndex Release設定、Embedding、Chunk Schema、ACL Fixture | 検索順位、類似文書競合、Corpus更新影響、Index同期、旧Version残存などCorpus全体依存の再現 | Data Owner承認後にProduction相当の検索状態をStaging／Qualityへ再構築する。物理コピーではなく論理的同等性を検証する |
+| `prod_only` | 原則としてデータを移動しない | 高機密文書、Raw Trace依存、外部持出し禁止Case | Candidate Code／Prompt／Judge／Retrieval設定を本番Quality領域へ持ち込んで同じSnapshotで評価 |
 
 `data_transfer_class`はRoot Causeだけで自動決定しない。Quality Jobが候補を出し、品質責任者またはData Ownerが機密区分、再現に必要な情報、規制要件を確認して承認する。
+
+Replayは次の順序で段階的に強くする。
+
+```text
+Level 1: Case Replay
+  質問・Expectation・Trace由来の固定証跡
+        ↓ 再現しない
+Level 2: Minimal Corpus Replay
+  期待文書・誤取得文書・競合文書の最小集合
+        ↓ 再現しない
+Level 3: Full Snapshot Replay
+  Production Corpus Snapshot + Index Release相当
+        ↓ 持出し不可
+Level 4: Prod-only Evaluation
+  Dataを動かさずCandidateをProduction Qualityで評価
+```
+
+この順序は「常に最小Corpusで十分」という意味ではない。RAGの検索結果はCorpus全体の相対順位で決まるため、Minimal Corpusで正解文書が1位になっても、本番100,000文書では多数の類似Chunkに押し下げられることがある。その場合はFull Snapshot Replayが必要である。
 
 ##### Prompt問題をDevへ還流する具体例
 
@@ -14030,9 +14051,44 @@ replay-corpus-2041
   └─ DOC-789/v4   # 同カテゴリの競合文書
 ```
 
-StagingではこのReplay Corpusへ同じChunk Schema、Embedding条件、Query条件を適用し、BaselineとCandidate Retrievalを比較する。これにより、本番100,000文書をDevへ複製せず、失敗の因果関係だけを再現できる。
+StagingではまずこのReplay Corpusへ同じChunk Schema、Embedding条件、Query条件を適用し、BaselineとCandidate Retrievalを比較する。**ここで本番と同じ失敗が再現できればMinimal Corpusのまま改善を進める。再現できない場合は「Subsetを作ったことで競合関係が変わった」可能性があるため、そこで止めずFull Snapshot Replayへ昇格する。**
 
-Parse／Prep／Chunk問題も同様に、問題Versionの原文書を環境間持出し可能ならStaging専用Volumeへ限定複製し、持出し不可なら`prod_only`として本番Quality側の隔離された検証JobでCandidate Parser／Prep設定を評価する。
+##### Minimal Corpusで再現できない場合はProduction相当Snapshotを再構築する
+
+たとえば本番では`DOC-123/v7`が8位だったのに、Minimal Corpusでは1位になった場合、原因は特定の誤取得文書1件ではなく、Corpus全体に存在する多数の類似Chunkとの競合かもしれない。
+
+この場合、元Traceに記録された次の構成をStaging／Qualityで再現する。
+
+```text
+source_rag_release_id   = rag-release-17
+corpus_snapshot_id     = corpus-101
+index_release_id       = index-21
+embedding_model        = embed-v3
+query_embedding_model  = embed-v3
+chunk_schema_version   = chunk-v4
+acl_policy_version     = acl-v7
+```
+
+`corpus_snapshot_members`から`corpus-101`に含まれる文書Version集合を解決し、持出し可能な場合は同じVersion集合をStagingへ再構築する。さらにIndex Releaseに記録されたEmbedding、同期列、Chunk Schema、検索設定を使ってStaging用AI Search Indexを新規作成する。
+
+```text
+Production
+  corpus-101 + index-21
+        ↓ 承認済みSnapshot再構築
+Staging
+  staging-corpus-101
+  staging-index-from-index-21
+        ↓
+同一Query / ACL FixtureでBaseline Replay
+        ↓
+本番と同じ失敗が再現することを確認
+        ↓
+Candidate Retrievalを比較
+```
+
+ここで必要なのはProduction Tableの物理名やStorageを完全コピーすることではなく、**検索結果を決めるCorpus Version集合とIndex構成を論理的に同等にすること**である。再構築後は文書Version件数、Chunk件数、Corpus Snapshot Member Hash、Embedding／Chunk Schema／Index設定Digestを比較し、同等性Gateを通過した環境だけを「Production-equivalent Replay」として扱う。
+
+Parse／Prep／Chunk問題も同様に、問題Versionの原文書を環境間持出し可能ならStaging専用Volumeへ限定複製する。Corpus全体との相互作用まで確認する必要があればFull Snapshot Replayへ上げ、持出し不可なら`prod_only`として本番Quality側の隔離された検証JobでCandidate Parser／Prep設定を評価する。
 
 ##### ACL問題を再現する具体例
 
@@ -14050,7 +14106,7 @@ user-sales が DOC-ENG を取得したら Fail
 user-engineering が DOC-SALES を取得したら Fail
 ```
 
-という回帰テストを行う。Raw User ID、実Group Membership、実Token、実Filter式は下位環境へ複製しない。
+という回帰テストを行う。Raw User ID、実Group Membership、実Token、実Filter式は下位環境へ複製しない。ACL問題が特定文書だけで再現しない、またはCorpus全体のFilter適用・旧ACL残存・Index同期状態に依存する場合は、Identity Fixtureを維持したまま`full_snapshot_replay`へ昇格する。
 
 ##### 本番データを動かせない場合
 
@@ -14070,14 +14126,15 @@ Evaluationのみ実行
 Metric／Assessment／差分だけをDevへ返す
 ```
 
-本番Realtime AppのTrafficへ直接Candidateを当てず、Production Quality用のService Principal、専用Experiment、読取専用権限、出力Maskingを使ってオフライン評価する。合格後に通常のStaging／Release Gate／RAG Release手順へ戻す。
+本番Realtime AppのTrafficへ直接Candidateを当てず、Production Quality用のService Principal、専用Experiment、読取専用権限、出力Maskingを使ってオフライン評価する。Retrieval／Corpus依存問題では、元Traceの`corpus_snapshot_id`と`index_release_id`に対応する検索状態を固定し、その同じ状態にCandidateだけを適用する。合格後に通常のStaging／Release Gate／RAG Release手順へ戻す。
 
 ##### 環境間還流で守る原則
 
 - 本番Trace、業務文書、Identityを無条件にDevへ複製しない。
 - 本番TraceからEvaluationDatasetへ自動直結せず、Human ReviewでExpectation、`root_cause`、改善先、持出し区分を確定する。
 - Devへ渡すのは可能な限り`metadata_only`または`sanitized_case`とする。
-- Retrieval／Parse／ACLの再現で本文が必要な場合だけ、承認済み最小集合を`staging_replay`として作る。
+- Retrieval／Parse／ACLの再現では、まず承認済み最小集合を`staging_replay`として作るが、再現できなければ`full_snapshot_replay`へ昇格する。
+- `full_snapshot_replay`ではCorpus Snapshot Member、Chunk件数、Embedding、Chunk Schema、Index設定Digestを検証し、「本番相当」を名前だけで宣言しない。
 - 実利用者IdentityではなくIdentity Fixtureを使う。
 - Masking後のCaseが元の失敗意味を維持しているか品質責任者が確認する。
 - TrainingとHoldout、Judge AlignmentとJudge ValidationをCase Family単位で分離する。
@@ -14095,7 +14152,8 @@ Metric／Assessment／差分だけをDevへ返す
 | Training EvaluationDataset | `quality` | Prompt Optimizationと検索設定探索に利用する。 |
 | Holdout EvaluationDataset | `quality` | 最終リリース判定専用として隔離する。 |
 | Sanitized Improvement Case | `quality` | 本番TraceからReview済みExpectation、Mask済み入力、Version IDだけを抽出し、Dev／Stagingへ安全に還流する。独立Tableを増やさずReview Case＋EvaluationDataset Recordで表現する。 |
-| Staging Replay Corpus（条件付き） | `quality`＋`ingestion` | Retrieval／Parse／ACL問題を再現する場合だけ、必要最小の文書Version／Chunk／ACL FixtureをStagingへ複製する。全本番Corpusは複製しない。 |
+| Staging Minimal Replay Corpus（条件付き） | `quality`＋`ingestion` | Retrieval／Parse／ACL問題をまず最小集合で再現する。期待文書、誤取得文書、競合文書、ACL Fixtureだけを承認付きでStagingへ作る。 |
+| Production-equivalent Full Snapshot Replay（条件付き） | `quality`＋`ingestion` | Minimal Replayで再現できない場合、ProductionのCorpus SnapshotとIndex Release相当をStaging／Qualityへ再構築し、Corpus全体依存の検索問題を再現する。持出し不可ならProd-only評価へ切り替える。 |
 | Review App／Assessment Schema | `quality` | 専門家のFeedbackとMLflow Expectationを収集する。 |
 | Retrieval Evaluation Job | `quality` | Chunk、検索方式、件数、Filter、Rerankを比較する。 |
 | Prompt Optimization Job | `quality` | 判定・言い換え・回答Promptの候補を個別に生成する。 |
@@ -14210,6 +14268,7 @@ synced
 | `create_review_queue` | 失敗原因グループ作成後 | 代表Trace、Critical、分類不明TraceをReview Sessionへ追加して担当Groupへ通知する |
 | `sync_review_assessments` | 日次またはレビュー締切後 | AssessmentをDelta列へ正規化し、状態を`labeled`、`diagnosed`、`approved`または`rejected`へ進める |
 | `assign_review_cases` | 同期後 | 改善先とSplitを固定ルールで設定する |
+| `prepare_replay_assets` | 割当・持出し承認後 | `data_transfer_class`に応じてSanitized Case、Minimal Replay Corpus、Full Snapshot Replay定義、Prod-only Evaluation定義を作成し、Snapshot／Index同等性を検証する |
 | `sync_evaluation_dataset` | 割当後 | `RETRIEVAL`、`ANSWER_PROMPT`、`AGENT_ROUTING`の`train`と`holdout`を対応Datasetへ反映し、成功時に`synced`へ進める |
 | `route_specialized_cases` | 割当後 | `CORPUS`、`INGESTION`、`SECURITY`、`JUDGE_ALIGNMENT`を専用バックログ／Datasetへ反映し、成功時に`synced`へ進める |
 
@@ -14222,7 +14281,7 @@ Deltaテーブルには次の列を持たせる。
 | `source_environment` | 元証跡の環境 | Quality Job | 候補作成時 | 通常は`production`。環境間Lineageを曖昧にしないため固定値として保存する |
 | `source_rag_release_id` | 問題発生時のRAG Release | Quality Job | 候補作成時 | 元Traceの`rag.release_id`を転記し、当時のPrompt／Index／Corpus等を再現可能にする |
 | `source_corpus_snapshot_id` | 問題発生時のCorpus Snapshot | Quality Job | 候補作成時 | 元TraceのSnapshot IDを転記し、文書更新後も当時の検索集合を特定できるようにする |
-| `data_transfer_class` | `metadata_only`、`sanitized_case`、`staging_replay`、`prod_only` | Quality Job＋品質責任者／Data Owner | Root Cause確定後・配送前 | 再現に必要なデータ量、機密区分、持出し可否から候補を作り、人が承認する |
+| `data_transfer_class` | `metadata_only`、`sanitized_case`、`staging_replay`、`full_snapshot_replay`、`prod_only` | Quality Job＋品質責任者／Data Owner | Root Cause確定後・配送前 | Case→Minimal Corpus→Full Snapshotの順で再現性を確認し、機密区分と持出し可否を含め人が承認する |
 | `sanitization_status` | `not_required`、`pending`、`approved`、`rejected` | Quality Job＋品質責任者 | 下位環境配送前 | Masking済み質問・Expectation・固定証跡が意味を保ち、禁止情報を含まないことを確認する |
 | `promotion_status` | `pending`、`approved`、`promoted`、`rejected`、`prod_only` | Quality Job＋品質責任者 | Dev／Staging配送またはProd-only評価時 | 環境間配送の承認と完了を管理し、Review承認とデータ持出し承認を同一視しない |
 | `question_redacted` | マスキング済み質問 | Quality Job | Delta保存前 | 組織のMasking Policyで個人情報、Secret、顧客識別子を除去し、原文を無条件に複製しない |
@@ -15618,7 +15677,7 @@ Feedbackは「今回の実績への評価」、MLflow Expectationは「同じ入
 
 ### 5.6 本番証跡に基づく改善サイクル
 
-改善開発は本番証跡から開始するが、Production Raw DataをそのままDevへ移動することを前提にしない。5.2で定義した`data_transfer_class`に従い、`metadata_only`／`sanitized_case`はDevへ、`staging_replay`はStagingへ、`prod_only`はProduction Quality領域へ配送する。どの経路でも元Trace、RAG Release、Corpus SnapshotへのLineageを保持する。
+改善開発は本番証跡から開始するが、Production Raw DataをそのままDevへ移動することを前提にしない。5.2で定義した`data_transfer_class`に従い、`metadata_only`／`sanitized_case`はDevへ、`staging_replay`／`full_snapshot_replay`はStaging／Qualityへ、`prod_only`はProduction Quality領域へ配送する。Retrieval系はCase Replay→Minimal Corpus→Full Snapshotの順で再現性を高め、どの経路でも元Trace、RAG Release、Corpus Snapshot、Index ReleaseへのLineageを保持する。
 
 改善開発は本番証跡から開始し、次のCycleで行う。改善CaseのTraining投入と、最終判定用Holdoutへの固定はQuality JobがPolicyバージョン付きで行い、評価結果を見てからSplitを入れ替えない。
 
