@@ -55,9 +55,9 @@ flowchart TD
     PUI --> MAN["文書マニフェスト<br/>人が決めた現在状態"]
     MAN --> GOLD["Gold Current"]
     PIPE --> GOLD
-    GOLD --> SYNC["Search Sync・Corpus Snapshot"]
+    GOLD --> SYNC["Search Sync・Corpus Snapshot<br/>Text＋Page Image参照"]
     SYNC --> IDX["Release単位AI Search Index"]
-    IDX --> AGENT["Agent Server・LangGraph"]
+    IDX --> AGENT["Agent Server・LangGraph<br/>必要時だけVision入力"]
     MAN --> AGENT
     AGENT --> UI["Streamlit・業務利用者"]
     AGENT --> TRACE["MLflow Trace"]
@@ -281,7 +281,7 @@ flowchart TD
 | Pipeline | `poc_prep_quality` | Private Streaming Table | Prep Attemptへ品質判定を付けた1行 | `document_version_id` | NULL／エラー／空Chunkを成功経路から隔離 | `poc/src/03_prep.sql` | `poc_prepared`, `poc_prep_errors` |
 | Pipeline | `poc_prepared` | Streaming Table | Prep成功した1文書Version | `document_version_id` | Chunk展開へ渡せるPrep成功履歴 | `poc/src/03_prep.sql` | `poc_chunks_silver` |
 | Pipeline | `poc_prep_errors` | Streaming Table（隔離） | Prep失敗した1文書Version | `document_version_id` | Prep失敗理由を保持し、原因分類と復旧方法を判断する | `poc/src/03_prep.sql` | PoC隔離調査、件数・傾向確認 |
-| Pipeline | `poc_chunks_silver` | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id` | バージョン付き検索Chunk履歴を追記保持 | `poc/src/04_chunks_silver.sql` | `poc_chunks_gold` |
+| Pipeline | `poc_chunks_silver` | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id` | バージョン付き検索Chunk履歴と代表ページ画像参照を追記保持 | `poc/src/04_chunks_silver.sql` | `poc_chunks_gold` |
 | Pipeline | `poc_chunks_gold` | Materialized View | PoCで現在検索対象とする1 Chunk | `chunk_version_id` | 各`document_id`の最新Parse／Prep成功VersionをPoC限定で公開 | `poc/src/05_gold_poc.sql` | PoC AI Search Delta Sync Index |
 | 監視 | `poc_pipeline_event_log` | Lakeflow Event Log Table | Pipelineの1 Event | `event_id`等 | Update、Flow、Lakeflow Pipeline Expectationの実行証跡 | Lakeflow Pipeline | Pipelines UI、Ad-hoc監視Query |
 | 評価 | `main.llmops_poc.internal_rag_poc_evaluation` | MLflow EvaluationDataset（Unity Catalog Table） | 1評価Case | `case_id` | 固定質問、入力、MLflow Expectationを評価正本として保持 | `seed_poc_evaluation_dataset.py` | `evaluate_poc.py` |
@@ -715,7 +715,7 @@ def poc_unique_versions() -> DataFrame:
 | --- | --- |
 | 責務／Dataset | Parseをバージョンごとに一度だけ実行するPrivate Attemptと、成功／エラーの相互排他的出力を作る |
 | 処理順序 | Preflight合格行→`ai_parse_document`→Attempt物理保持→`error_status`で`poc_parsed`／`poc_parse_errors`へ分岐 |
-| 重要判定 | NULL、VARIANT NULL、エラー配列をすべて失敗とし、エラー バージョンをPrepへ渡さない |
+| 重要判定 | NULL、VARIANT NULL、エラー配列をすべて失敗とし、エラー バージョンをPrepへ渡さない。PDF／PPTXはページ画像をVolumeへ保存し、Figure descriptionを有効化して図表の意味を検索用テキストへ残す |
 | Lakeflow Pipeline Expectation | `valid_parse_result`。`is_quarantined = false`をWarnで計測し、違反行は`poc_parse_errors`へ明示的に保存する |
 | 再試行／後続 | Attemptから再分岐できるためAI Functionを再呼出しせず、成功だけ`03_prep.sql`へ渡す |
 
@@ -728,7 +728,11 @@ SELECT
   source.*,
   ai_parse_document(
     source.content,
-    map('version', '${poc.parse_version}', 'imageOutputPath', '${poc.image_output_path}')
+    map(
+      'version', '${poc.parse_version}',
+      'imageOutputPath', '${poc.image_output_path}',
+      'descriptionElementTypes', '*'
+    )
   ) AS parsed_document,
   current_timestamp() AS parsed_at
 FROM STREAM(poc_unique_versions) AS source
@@ -797,6 +801,38 @@ WHERE is_quarantined = true;
 | `poc_parse_errors` | `ver-c33d...` | `[{"page_id":3,"error_message":"PAGE_PARSE_FAILED"}]` | 失敗したため隔離へ分岐 |
 
 同じ`document_version_id`が`poc_parsed`と`poc_parse_errors`の両方へ入ることはない。
+
+**PDF／PowerPointの画像・図表を扱う境界**
+
+`ai_parse_document`は単なる文字抽出ではなく、文書をページ、Text、Table、Figure、Title、Section Header等へ構造化する。本資料では`imageOutputPath`を指定してレンダリング済みページ画像をUnity Catalog Volumeへ保存し、`descriptionElementTypes='*'`でFigure descriptionを生成する。したがって、図やグラフの意味がFigure descriptionへ十分に落ちる場合は、そのテキストだけでも通常のRAG検索に利用できる。
+
+一方、グラフの細かな数値、Block Diagram内の接続関係、画像主体のSlideなど、**元画像を見なければ正確に答えられない質問**もある。そのためParse後の画像を捨てず、`ai_prep_search`が返すChunkの`pages[].image_uri`から代表ページの`page_image_uri`をSilver、Gold、Search Sync、AI Searchまで伝播する。本番RAGは通常はTextだけで回答し、十分性判定が`requires_visual_context=true`を返した場合だけ、該当ページ画像をVision-capable Modelへ追加で渡す。
+
+この設計では責務を次のように分ける。
+
+```text
+原文 PDF / PPTX
+    ↓
+ai_parse_document
+    ├─ Text / Table / Figure / Layout
+    ├─ Figure description
+    └─ Page image -> Unity Catalog Volume
+    ↓
+ai_prep_search
+    ├─ chunk_to_embed      : 検索用
+    ├─ chunk_to_retrieve   : 回答Context用
+    └─ pages[].image_uri   : 必要時だけVisionへ渡す画像参照
+    ↓
+AI Search
+    ↓
+Textだけで回答可能? ── Yes ──> Text回答
+    │
+    No
+    ↓
+該当page imageをBase64化
+    ↓
+Vision-capable Model
+```
 
 `poc/src/03_prep.sql`
 
@@ -1004,8 +1040,8 @@ Materialized Viewは、上流Tableから導出した現在値をLakeflowがRefre
 | ロジック概要 | 内容 |
 | --- | --- |
 | 責務／Dataset | Prepared VARIANTをChunk単位へ展開し、バージョン付きSilver履歴を追記する |
-| 処理順序 | `variant_explode`→Position補完→Chunkバージョン Hash→Embed／Retrieve本文とPage抽出 |
-| 重要判定 | `chunk_to_embed`と`chunk_to_retrieve`を別列で維持し、文書バージョンとSchemaバージョンを失わない |
+| 処理順序 | `variant_explode`→Position補完→Chunkバージョン Hash→Embed／Retrieve本文→Page／Page Image参照抽出 |
+| 重要判定 | `chunk_to_embed`と`chunk_to_retrieve`を別列で維持し、`pages[].image_uri`の代表値を`page_image_uri`へ残す。画像Pathは回答本文や長期Traceへ出さない |
 | 再試行／後続 | Streaming履歴として再開し、`05_gold_poc.sql`が論理文書ごとの最新成功バージョンを選ぶ |
 
 ```sql
@@ -1032,6 +1068,7 @@ SELECT
   chunk_value:chunk_to_embed::STRING AS chunk_to_embed,
   chunk_value:chunk_to_retrieve::STRING AS chunk_to_retrieve,
   try_variant_get(chunk_value, '$.pages[0].page_id', 'INT') AS page_number,
+  try_variant_get(chunk_value, '$.pages[0].image_uri', 'STRING') AS page_image_uri,
   source_uri,
   source_title,
   prepared_at,
@@ -1041,12 +1078,12 @@ FROM exploded;
 
 **想定出力サンプル（`poc_chunks_silver`）**
 
-| `chunk_version_id` | `document_id` | `document_version_id` | `chunk_position` | `chunk_to_embed` | `chunk_to_retrieve` | `page_number` | `chunk_schema_version` |
-| --- | --- | --- | ---: | --- | --- | ---: | --- |
-| `chunk-01a9...` | `POC-7f1c...` | `ver-a81f...` | 0 | `RAG基盤 Databricks AI Search...` | `当社RAG基盤ではDatabricks AI Searchを利用する。` | 2 | `poc-v1` |
-| `chunk-02b8...` | `POC-7f1c...` | `ver-a81f...` | 1 | `検索方式 HYBRID ANN...` | `検索方式はHYBRIDを既定とする。` | 3 | `poc-v1` |
+| `chunk_version_id` | `document_id` | `document_version_id` | `chunk_position` | `chunk_to_embed` | `chunk_to_retrieve` | `page_number` | `page_image_uri` | `chunk_schema_version` |
+| --- | --- | --- | ---: | --- | --- | ---: | --- | --- |
+| `chunk-01a9...` | `POC-7f1c...` | `ver-a81f...` | 0 | `RAG基盤 Databricks AI Search...` | `当社RAG基盤ではDatabricks AI Searchを利用する。` | 2 | `/Volumes/.../parsed_images/.../page-2.png` | `poc-v1` |
+| `chunk-02b8...` | `POC-7f1c...` | `ver-a81f...` | 1 | `検索方式 HYBRID ANN...` | `検索方式はHYBRIDを既定とする。` | 3 | `/Volumes/.../parsed_images/.../page-3.png` | `poc-v1` |
 
-`chunk_to_embed`は検索照合用、`chunk_to_retrieve`は回答Context用であり、同じ用途として扱わない。
+`chunk_to_embed`は検索照合用、`chunk_to_retrieve`は回答Context用であり、同じ用途として扱わない。`page_image_uri`は内部参照であり、利用者表示、Trace本文、SSEへそのまま出さない。
 
 `poc/src/05_gold_poc.sql`
 
@@ -1853,6 +1890,8 @@ MLflow Traceは1回のRAG Requestの入出力と処理経路を時系列で残�
 """
 
 from dataclasses import dataclass
+import base64
+import mimetypes
 
 import mlflow
 from databricks.ai_search.client import AISearchClient
@@ -1871,6 +1910,7 @@ class RetrievedChunk:
     source_uri: str
     source_title: str
     page_number: int | None
+    page_image_uri: str | None
 
 
 @dataclass(frozen=True)
@@ -1899,6 +1939,7 @@ def retrieve_chunks(question: str, index_name: str) -> list[RetrievedChunk]:
             "source_uri",
             "source_title",
             "page_number",
+            "page_image_uri",
         ],
         num_results=5,
         query_type="HYBRID",
@@ -1913,6 +1954,7 @@ def retrieve_chunks(question: str, index_name: str) -> list[RetrievedChunk]:
             source_uri=row[4],
             source_title=row[5],
             page_number=row[6],
+            page_image_uri=row[7],
         )
         for row in rows
     ]
@@ -1930,6 +1972,7 @@ def retrieve_chunks(question: str, index_name: str) -> list[RetrievedChunk]:
                 "document_version_id": chunk.document_version_id,
                 "source_title": chunk.source_title,
                 "page_number": chunk.page_number,
+                "visual_page_available": bool(chunk.page_image_uri),
             },
         )
         for chunk in chunks
@@ -1938,14 +1981,46 @@ def retrieve_chunks(question: str, index_name: str) -> list[RetrievedChunk]:
     return chunks
 
 
+def image_to_data_uri(image_uri: str) -> str:
+    """Unity Catalog Volume上のページ画像をVision入力用Data URIへ変換する。"""
+    mime_type = mimetypes.guess_type(image_uri)[0] or "image/png"
+    with open(image_uri, "rb") as file:
+        payload = base64.b64encode(file.read()).decode("ascii")
+    return f"data:{mime_type};base64,{payload}"
+
+
 @mlflow.trace(name="poc_generate_answer", span_type=SpanType.LLM)
-def generate_answer(prompt: str, model_service: str) -> str:
-    """Unity AI GatewayのAnswer Model Serviceを呼び、回答本文を生成する。"""
+def generate_answer(
+    prompt: str,
+    model_service: str,
+    image_uris: list[str] | None = None,
+) -> str:
+    """Textを基本とし、画像が指定された場合だけVision入力を追加して回答する。"""
     client = DatabricksOpenAI()
+    unique_images = list(dict.fromkeys(image_uris or []))[:2]
+    content = [{"type": "text", "text": prompt}]
+    content.extend(
+        {
+            "type": "image_url",
+            "image_url": {"url": image_to_data_uri(image_uri)},
+        }
+        for image_uri in unique_images
+    )
     completion = client.chat.completions.create(
         model=model_service,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {
+                "role": "user",
+                "content": content if unique_images else prompt,
+            }
+        ],
         temperature=0,
+    )
+    mlflow.update_current_trace(
+        tags={
+            "poc.visual_context_used": str(bool(unique_images)).lower(),
+            "poc.visual_page_count": str(len(unique_images)),
+        }
     )
     return completion.choices[0].message.content
 
@@ -2006,7 +2081,18 @@ def answer_question(
         f"{citations[i]} {chunk.content}" for i, chunk in enumerate(chunks)
     )
     prompt = registered_prompt.format(question=question, context=context)
-    answer = generate_answer(prompt=prompt, model_service=model_service)
+    # PoCではマルチモーダル経路自体を確認するため、取得Chunkにページ画像があれば最大2枚を渡す。
+    # 本番では十分性判定がrequires_visual_context=trueの場合だけ画像を渡してコストを制御する。
+    image_uris = [
+        chunk.page_image_uri
+        for chunk in chunks
+        if chunk.page_image_uri
+    ]
+    answer = generate_answer(
+        prompt=prompt,
+        model_service=model_service,
+        image_uris=image_uris,
+    )
     if not any(citation in answer for citation in citations):
         return PocResult(
             answer="根拠を検証できないため回答できません。",
@@ -2370,6 +2456,7 @@ PoCでは「一連の処理が動いたか」だけでなく、どのコンポ�
 | Parse／Prep | 成功率、形式別エラー、処理時間 | 特定形式、表、画像、複雑なLayoutで失敗していないか | Attempt／エラーテーブル |
 | Chunk | Chunk数、長さ、境界、欠落 | 意味単位で適切に分割されているか | Silver、Trace |
 | Retrieval | 文書Recall、Chunk Recall、0件率、再検索率 | 正しい文書・Chunkを取得できているか | Retriever Span、Evaluation Run |
+| マルチモーダル | `visual_page_available`、`rag.visual_context_used`、画像付きCase正答率 | 図、グラフ、表、画像主体のPageで必要なときだけVision経路へ入り、画像内容を正しく回答できるか | Silver、Retriever Span、Trace、Evaluation Run |
 | 回答 | Groundedness、Correctness、出典 | 取得した根拠だけで正しく回答しているか | Trace、Assessment |
 | 拒否 | 拒否一致率、誤回答、誤拒否 | 回答可能／不可能を正しく判断しているか | EvaluationDataset |
 | Agent経路 | Node遷移、再検索回数、Loop | 不要な再検索や誤った分岐がないか | MLflow Trace |
@@ -2746,7 +2833,7 @@ flowchart TD
 | Pipeline | `internal_docs_prep_quality` | Private Streaming Table | Prep Attemptへ品質判定を付けた1行 | `document_id`, `document_version_id` | 成功／隔離を同一条件で分岐 | Prep SQL | `internal_docs_prepared`, `internal_docs_prep_errors` |
 | Pipeline | `internal_docs_prepared` | Streaming Table | Prep成功した1文書Version | `document_id`, `document_version_id` | Chunk展開へ渡すPrep成功履歴 | Prep SQL | `internal_docs_chunks_silver`, Registry同期 |
 | Pipeline | `internal_docs_prep_errors` | Streaming Table（隔離） | Prep失敗した1文書Version | `document_id`, `document_version_id` | エラー理由・処理Versionを監査し、原因分類・復旧判断に使う | Prep SQL | 隔離Runbook、Registry同期 |
-| Pipeline | `internal_docs_chunks_silver` | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id` | 全成功Versionの検索Chunk履歴を追記保持 | Chunk SQL | `internal_docs_current_mv` |
+| Pipeline | `internal_docs_chunks_silver` | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id` | 全成功Versionの検索Chunk履歴と代表ページ画像参照を追記保持 | Chunk SQL | `internal_docs_current_mv` |
 | Pipeline | `internal_docs_current_mv` | Materialized View | 現在公開してよい1 Chunk | `chunk_version_id` | SilverとManifest Pointer／ACL／Lifecycleを結合したGold Current | Gold SQL | Search Publish Job |
 
 ##### Search公開
@@ -3836,6 +3923,7 @@ class RetrievedDocument(BaseModel):
         source_ref: `source_ref`に対応する検証済み状態。
         source_title: `source_title`に対応する検証済み状態。
         page_number: `page_number`に対応する検証済み状態。
+        page_image_uri: Vision回答が必要な場合だけ使う内部ページ画像参照。利用者表示やTrace本文へ出さない。
         allowed_principals: `allowed_principals`に対応する検証済み状態。
         data_classification: `data_classification`に対応する検証済み状態。
         publication_scope: `publication_scope`に対応する検証済み状態。
@@ -3861,6 +3949,7 @@ class RetrievedDocument(BaseModel):
     source_ref: str
     source_title: str
     page_number: int | None = None
+    page_image_uri: str | None = None
     allowed_principals: list[str]
     data_classification: str
     publication_scope: str
@@ -3947,6 +4036,7 @@ class SearchDecision(BaseModel):
         missing_aspects: `missing_aspects`に対応する検証済み状態。
         reason: `reason`に対応する検証済み状態。
         recommended_action: `recommended_action`に対応する検証済み状態。
+        requires_visual_context: Textだけでは不足し、取得済みページ画像を確認すべき場合にtrue。
 
     セキュリティ:
         利用者入力を無検証で保持せず、ACL、識別子、公開状態の不整合を拒否する。
@@ -3957,6 +4047,10 @@ class SearchDecision(BaseModel):
     missing_aspects: list[str] = Field(default_factory=list)
     reason: str = Field(description="十分または不十分と判断した理由")
     recommended_action: Literal["answer", "rewrite", "refuse", "human_review"]
+    requires_visual_context: bool = Field(
+        default=False,
+        description="図、グラフ、表、画像の確認が回答に必要ならtrue",
+    )
 
 
 class AnswerValidation(BaseModel):
@@ -4010,6 +4104,7 @@ class RagState(TypedDict):
         search_attempts: `search_attempts`に対応する検証済み状態。
         executed_queries: `executed_queries`に対応する検証済み状態。
         missing_aspects: `missing_aspects`に対応する検証済み状態。
+        requires_visual_context: 回答生成・検証でページ画像をVision Modelへ渡すかを示す。
         rewrite_count: `rewrite_count`に対応する検証済み状態。
         next_step: `next_step`に対応する検証済み状態。
         answer: `answer`に対応する検証済み状態。
@@ -4039,6 +4134,7 @@ class RagState(TypedDict):
     search_attempts: list[SearchAttempt]
     executed_queries: list[str]
     missing_aspects: list[str]
+    requires_visual_context: bool
     rewrite_count: int
     next_step: Literal["answer", "rewrite", "refuse", "human_review", "complete"]
     answer: str
@@ -4184,6 +4280,9 @@ RAG Runtime
 
 検索結果だけで質問へ正確に回答できるか判定してください。
 検索結果にない知識を補ってはいけません。
+各根拠に`visual_page_available=true`があり、質問が図、グラフ、表、画像の読み取りを必要とする場合は`requires_visual_context=true`を返してください。
+Textだけで十分なら`requires_visual_context=false`とし、不要な画像入力を増やさないでください。
+Textだけでは不足していても、取得済みの関連ページ画像を確認すれば回答可能と判断できる場合は、`recommended_action=answer`かつ`requires_visual_context=true`としてください。
 不足観点、理由、推奨ActionをSearchDecision Schemaで返してください。
 ```
 
@@ -4391,7 +4490,7 @@ if __name__ == "__main__":
 
 | Prompt名 | 候補バージョン | エイリアス | 主な利用Node |
 | --- | ---: | --- | --- |
-| `main.llmops.internal_rag_sufficiency` | 5 | 変更なし | `check` |
+| `main.llmops.internal_rag_sufficiency` | 6 | 変更なし | `check` |
 | `main.llmops.internal_rag_rewrite` | 3 | 変更なし | `rewrite` |
 | `main.llmops.internal_rag_answer` | 8 | 変更なし | `answer` |
 | `main.llmops.internal_rag_answer_validation` | 4 | 変更なし | `validate_answer` |
@@ -5508,6 +5607,7 @@ CREATE TABLE IF NOT EXISTS main.llmops.internal_docs_search_sync (
   source_ref STRING NOT NULL,
   source_title STRING NOT NULL,
   page_number INT,
+  page_image_uri STRING,
   allowed_principals ARRAY<STRING> NOT NULL,
   data_classification STRING NOT NULL,
   publication_scope STRING NOT NULL,
@@ -5859,7 +5959,7 @@ resources:
       configuration:
         internal_docs.source_path: ${var.source_path}
         internal_docs.image_output_path: ${var.image_output_path}
-        internal_docs.ai_parse_document_version: '1'
+        internal_docs.ai_parse_document_version: '2.0'
         internal_docs.ai_prep_search_version: '1'
         internal_docs.chunk_schema_version: chunk-v1
 ```
@@ -8465,7 +8565,8 @@ SELECT
     source.content,
     map(
       'version', '${internal_docs.ai_parse_document_version}',
-      'imageOutputPath', '${internal_docs.image_output_path}'
+      'imageOutputPath', '${internal_docs.image_output_path}',
+      'descriptionElementTypes', '*'
     )
   ) AS parsed_document,
   '${internal_docs.ai_parse_document_version}' AS ai_parse_document_version,
@@ -8931,6 +9032,7 @@ SELECT
   identified.chunk_value:chunk_to_retrieve::STRING AS chunk_to_retrieve,
   identified.chunk_value:chunk_to_embed::STRING AS chunk_to_embed,
   try_variant_get(identified.chunk_value, '$.pages[0].page_id', 'INT') AS page_number,
+  try_variant_get(identified.chunk_value, '$.pages[0].image_uri', 'STRING') AS page_image_uri,
   identified.source_uri,
   concat(
     'DOCREF-',
@@ -8954,14 +9056,14 @@ FROM identified_chunks AS identified;
 
 **想定出力サンプル（`internal_docs_chunks_silver`）**
 
-| `chunk_logical_id` | `chunk_version_id` | `document_id` | `document_version_id` | `chunk_to_embed` | `chunk_to_retrieve` | `allowed_principals` | `page_number` |
-| --- | --- | --- | --- | --- | --- | --- | ---: |
-| `POS-000000` | `chk-a110...` | `DOC-RAG-001` | `ver-b72e...` | `RAG アーキテクチャ AI Search...` | `検索にはDatabricks AI Searchを利用する。` | `[grp-rag-users]` | 2 |
-| `POS-000001` | `chk-b220...` | `DOC-RAG-001` | `ver-b72e...` | `ACL Filter entitlement...` | `検索前に利用者GroupからACL Filterを生成する。` | `[grp-rag-users]` | 3 |
+| `chunk_logical_id` | `chunk_version_id` | `document_id` | `document_version_id` | `chunk_to_embed` | `chunk_to_retrieve` | `allowed_principals` | `page_number` | `page_image_uri` |
+| --- | --- | --- | --- | --- | --- | --- | ---: | --- |
+| `POS-000000` | `chk-a110...` | `DOC-RAG-001` | `ver-b72e...` | `RAG アーキテクチャ AI Search...` | `検索にはDatabricks AI Searchを利用する。` | `[grp-rag-users]` | 2 | `/Volumes/main/llmops/internal_docs_images/.../page-2.png` |
+| `POS-000001` | `chk-b220...` | `DOC-RAG-001` | `ver-b72e...` | `ACL Filter entitlement...` | `検索前に利用者GroupからACL Filterを生成する。` | `[grp-rag-users]` | 3 | `/Volumes/main/llmops/internal_docs_images/.../page-3.png` |
 
 同じ`chunk_logical_id`でも文書バージョンが変われば`chunk_version_id`は変わる。ここにあるACLやTitleは取込時点の監査値であり、公開値はGoldで文書マニフェスト最新値へ置換される。
 
-`variant_explode`が返す配列位置だけに依存せず、`ai_prep_search`の`chunk_position`を優先し、欠損時だけ`variant_explode.pos`へFallbackする。`chunk_logical_id`は文書内位置、`chunk_version_id`は`document_id`、`document_version_id`、`chunk_logical_id`から決定論的に生成する。
+`variant_explode`が返す配列位置だけに依存せず、`ai_prep_search`の`chunk_position`を優先し、欠損時だけ`variant_explode.pos`へFallbackする。`chunk_logical_id`は文書内位置、`chunk_version_id`は`document_id`、`document_version_id`、`chunk_logical_id`から決定論的に生成する。`page_image_uri`は`ai_prep_search`が引き継いだ`pages[].image_uri`の代表値であり、検索結果から必要なページ画像を特定するために使う。画像自体をEmbeddingへ直接入れる設計ではない。
 
 ###### 4.3.4.3.8 文書マニフェスト公開条件とGold Current
 
@@ -9095,7 +9197,7 @@ INNER JOIN active_manifest AS manifest
 
 新しいファイルバージョンを取り込んだだけではCurrentへ公開しない。文書管理者／ドメイン担当者がUIで解析結果を確認し、現在公開するVersionを明示的に選択した後、Manifest Executorが`approved_document_version_id`を更新した時点でGold Currentが切り替わる。これにより、論理文書が公開中のままFileだけ差し替えられて未選択Versionが公開されることを防ぐ。
 
-`internal_docs.ai_parse_document_version`、`internal_docs.ai_prep_search_version`、`internal_docs.chunk_schema_version`は`ingestion` Bundleの`configuration`で固定する。現行要件では`ai_parse_document`はDatabricks Runtime 17.3以上、`ai_prep_search`はDatabricks Runtime 18.2以上、ServerlessはEnvironment Version 3以上を必要とするため、Pipeline Computeはより厳しい`ai_prep_search`側へ合わせる。`ai_parse_document`は最大500ページ・100MBの制約があるため、サイズは事前、ページ数は解析直後に検査する。
+`internal_docs.ai_parse_document_version`、`internal_docs.ai_prep_search_version`、`internal_docs.chunk_schema_version`は`ingestion` Bundleの`configuration`で固定する。Figure descriptionと`image_uri`を使う本資料のマルチモーダル経路では`ai_parse_document`を`2.0`へ固定する。現行要件では`ai_parse_document`はDatabricks Runtime 17.3以上、`ai_prep_search`はDatabricks Runtime 18.2以上、ServerlessはEnvironment Version 3以上を必要とするため、Pipeline Computeはより厳しい`ai_prep_search`側へ合わせる。`ai_parse_document`は最大500ページ・100MBの制約があるため、サイズは事前、ページ数は解析直後に検査する。
 
 対応形式、暗号化PDF、Digital Signature、Malware Scanも組織Policyで追加する。AI Functionが行結果として返す`error_status`は隔離へ保存できる一方、無効なBinaryなど関数自体が例外を送出する入力はStreaming Update全体を失敗させる可能性がある。これを行単位で隔離する必要がある組織では、AI Function前のScannerで不正Fileを除外する。一時エラーの再試行は同じ本番Pipelineへ行を再投入せず、エラーテーブルを入力に処理バージョン付きの専用再試行 Jobまたは計画した新Pipeline Releaseで実施し、重複課金と無制限再試行を防ぐ。
 
@@ -9228,6 +9330,7 @@ SELECT
   source_ref,
   source_title,
   page_number,
+  page_image_uri,
   allowed_principals,
   data_classification,
   publication_scope,
@@ -9277,7 +9380,7 @@ SNAPSHOT_MEMBERS_TABLE = "main.llmops.corpus_snapshot_members"
 SEARCH_COLUMNS = [
     "chunk_version_id", "chunk_logical_id", "document_id",
     "document_version_id", "chunk_to_retrieve", "chunk_to_embed",
-    "source_ref", "source_title", "page_number", "allowed_principals",
+    "source_ref", "source_title", "page_number", "page_image_uri", "allowed_principals",
     "data_classification", "publication_scope", "approval_status",
     "is_current", "is_deleted", "ai_prep_search_version",
     "chunk_schema_version",
@@ -9668,6 +9771,7 @@ COLUMNS_TO_SYNC = [
     "source_ref",
     "source_title",
     "page_number",
+    "page_image_uri",
     "allowed_principals",
     "data_classification",
     "publication_scope",
@@ -9866,6 +9970,7 @@ Prompt エイリアス、Index名、Codeを別々に切り替えると新旧構�
 | `common_wheel_version` | 共通契約Package バージョン |
 | `sufficiency_prompt_uri`、`rewrite_prompt_uri`、`answer_prompt_uri`、`answer_validation_prompt_uri` | `prompts:/name/version`形式の不変URI |
 | `model_service`、`expected_model_route` | 生成Model Service FQNと期待Destination／Route |
+| `multimodal_enabled` | 同じModel Serviceへ画像入力を許可するか。Vision Smoke Test合格Releaseだけ`true` |
 | `search_endpoint_name`、`index_name`、`index_release_id`、`corpus_snapshot_id` | 検索基盤Release |
 | `embedding_model`、`query_embedding_model` | Index作成・Query用Embedding |
 | `ai_parse_document_version`、`ai_prep_search_version`、`chunk_schema_version` | 解析・Chunk来歴 |
@@ -9921,6 +10026,7 @@ class RagRelease(BaseModel):
         prompt_uris: `prompt_uris`に対応する検証済み状態。
         model_service: `model_service`に対応する検証済み状態。
         expected_model_route: `expected_model_route`に対応する検証済み状態。
+        multimodal_enabled: Vision Smoke Test合格済みのReleaseだけtrue。
         search_endpoint_name: `search_endpoint_name`に対応する検証済み状態。
         index_name: `index_name`に対応する検証済み状態。
         index_release_id: `index_release_id`に対応する検証済み状態。
@@ -9946,6 +10052,7 @@ class RagRelease(BaseModel):
     prompt_uris: dict[str, str]
     model_service: str
     expected_model_route: str
+    multimodal_enabled: bool
     search_endpoint_name: str
     index_name: str
     index_release_id: str
@@ -10021,13 +10128,14 @@ def load_rag_release(rag_release_id: str) -> RagRelease:
   "build_id": "build-20260815-0142",
   "common_wheel_version": "1.8.0",
   "prompt_uris": {
-    "sufficiency": "prompts:/main.llmops.internal_rag_sufficiency/5",
+    "sufficiency": "prompts:/main.llmops.internal_rag_sufficiency/6",
     "rewrite": "prompts:/main.llmops.internal_rag_rewrite/3",
     "answer": "prompts:/main.llmops.internal_rag_answer/8",
     "answer_validation": "prompts:/main.llmops.internal_rag_answer_validation/4"
   },
   "model_service": "internal-rag-llm-endpoint",
   "expected_model_route": "gpt-4o-primary",
+  "multimodal_enabled": true,
   "index_name": "main.llmops.internal_docs_index_20260815",
   "index_release_id": "index-2026-08-15",
   "corpus_snapshot_id": "corpus-2026-08-15",
@@ -10060,7 +10168,7 @@ flowchart TD
     TRACE --> UI["MLflow Traces UI"]
 ```
 
-この実装は、リクエスト開始時に `rag_release_manifest` と実利用者の Entitlement をStateへ固定し、取得、決定論的検査、意味的十分性判定、再検索、回答、回答検証、拒否または人手確認をNodeとして分離する。検索のたびに過去証跡を捨てず、`SearchAttempt` と累積証跡を保持する。回答に渡す証跡だけはScore順、重複排除、Context上限で選び、採用されなかったChunkも監査履歴へ残す。
+この実装は、リクエスト開始時に `rag_release_manifest` と実利用者の Entitlement をStateへ固定し、取得、決定論的検査、意味的十分性判定、再検索、回答、回答検証、拒否または人手確認をNodeとして分離する。検索のたびに過去証跡を捨てず、`SearchAttempt` と累積証跡を保持する。回答に渡す証跡だけはScore順、重複排除、Context上限で選び、採用されなかったChunkも監査履歴へ残す。PDF／PPTXの図表については、まずParse時のFigure descriptionを含むText Chunkで検索・十分性判定し、`requires_visual_context=true`の場合だけ取得済みChunkの`page_image_uri`をRead-only Volumeから読み、Base64 Data URIへ変換して同じModel Serviceへ追加する。Textだけで回答できるRequestへ画像を無条件に添付しない。
 
 エージェント側の想定出力は、同じ正常回答ケースを共通契約、Release、Graph、Identity、SSE、画面表示の順に追跡できるよう、IDを意図的に揃えている。Token、Raw Path、ACL式など本番で記録・表示してはいけない値はサンプルにも含めない。
 
@@ -10086,9 +10194,13 @@ flowchart TD
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import mimetypes
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 import mlflow
@@ -10112,6 +10224,7 @@ from rag_release import RagRelease
 
 MAX_REWRITES = 2
 MAX_CONTEXT_CHARS = 24_000
+MAX_VISUAL_PAGES = 3
 SEARCH_LIMIT = 10
 ANSWER_CITATION_PATTERN = re.compile(r"\[(SRC-[A-F0-9]{12})\]")
 SENSITIVE_OUTPUT_PATTERNS = (
@@ -10179,17 +10292,55 @@ def get_model_client() -> DatabricksOpenAI:
     return _model_client
 
 
+def page_image_to_data_uri(image_uri: str) -> str:
+    """AppへRead-only Bindingした画像Volume配下だけを読み、Base64 Data URIへ変換する。"""
+    root = Path(os.environ["RAG_PAGE_IMAGE_ROOT"]).resolve()
+    image_path = Path(image_uri).resolve()
+    if root != image_path and root not in image_path.parents:
+        raise PermissionError("page_image_uri is outside the bound image volume")
+    mime_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
+    with image_path.open("rb") as file:
+        payload = base64.b64encode(file.read()).decode("ascii")
+    return f"data:{mime_type};base64,{payload}"
+
+
 @mlflow.trace(name="invoke_model_service", span_type=SpanType.LLM)
-def invoke_model_service(release: RagRelease, instruction: str) -> tuple[str, Any]:
-    """文書マニフェストで固定したModel Service FQNへ推論し、TextとResponse metadataを返す。"""
+def invoke_model_service(
+    release: RagRelease,
+    instruction: str,
+    image_uris: list[str] | None = None,
+) -> tuple[str, Any]:
+    """Textを基本とし、必要時だけ承認済みページ画像をVision入力へ追加する。"""
+    unique_images = list(dict.fromkeys(image_uris or []))[:MAX_VISUAL_PAGES]
+    if unique_images and not release.multimodal_enabled:
+        raise RuntimeError("RAG Release is not approved for multimodal inference")
+    message_content = [{"type": "text", "text": instruction}]
+    message_content.extend(
+        {
+            "type": "image_url",
+            "image_url": {"url": page_image_to_data_uri(image_uri)},
+        }
+        for image_uri in unique_images
+    )
     response = get_model_client().chat.completions.create(
         model=release.model_service,
-        messages=[{"role": "user", "content": instruction}],
+        messages=[
+            {
+                "role": "user",
+                "content": message_content if unique_images else instruction,
+            }
+        ],
         temperature=0.0,
     )
     content = response.choices[0].message.content
     if not content:
         raise ValueError("Model Service returned empty content")
+    mlflow.update_current_trace(
+        tags={
+            "rag.visual_context_used": str(bool(unique_images)).lower(),
+            "rag.visual_page_count": str(len(unique_images)),
+        }
+    )
     record_model_route(response, release)
     return content, response
 
@@ -10198,6 +10349,7 @@ def invoke_structured_model(
     release: RagRelease,
     instruction: str,
     response_type,
+    image_uris: list[str] | None = None,
 ):
     """JSON Schemaを明示し、Pydantic Validationに失敗した出力をFail Closedにする。"""
     schema = json.dumps(
@@ -10208,6 +10360,7 @@ def invoke_structured_model(
     content, _ = invoke_model_service(
         release,
         f"{instruction}\n\nReturn JSON only. JSON Schema:\n{schema}",
+        image_uris=image_uris,
     )
     return response_type.model_validate_json(content)
 
@@ -10288,15 +10441,16 @@ def parse_search_rows(
                 source_ref=str(row[5]),
                 source_title=str(row[6]),
                 page_number=row[7],
-                allowed_principals=list(row[8] or []),
-                data_classification=str(row[9]),
-                publication_scope=str(row[10]),
-                approval_status=str(row[11]),
-                is_current=bool(row[12]),
-                is_deleted=bool(row[13]),
-                corpus_snapshot_id=str(row[14]),
+                page_image_uri=row[8],
+                allowed_principals=list(row[9] or []),
+                data_classification=str(row[10]),
+                publication_scope=str(row[11]),
+                approval_status=str(row[12]),
+                is_current=bool(row[13]),
+                is_deleted=bool(row[14]),
+                corpus_snapshot_id=str(row[15]),
                 index_release_id=state["index_release_id"],
-                ai_prep_search_version=str(row[15]),
+                ai_prep_search_version=str(row[16]),
                 score=float(row[-1]),
             )
         )
@@ -10401,6 +10555,7 @@ def trace_retrieved_documents(
                 "document_id": document.document_id,
                 "document_version_id": document.document_version_id,
                 "citation_id": document.citation_id,
+                "visual_page_available": bool(document.page_image_uri),
             },
         }
         for document in documents
@@ -10440,6 +10595,7 @@ def retrieve_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             "source_ref",
             "source_title",
             "page_number",
+            "page_image_uri",
             "allowed_principals",
             "data_classification",
             "publication_scope",
@@ -10587,7 +10743,11 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
 
     # 決定論的Gateを通った証跡だけを、意味的十分性Judgeへ渡す。
     context = "\n\n".join(
-        f"[{document.citation_id}] {document.content}"
+        (
+            f"[{document.citation_id}] "
+            f"visual_page_available={str(bool(document.page_image_uri)).lower()}\n"
+            f"{document.content}"
+        )
         for document in state["documents"]
     )
     instruction = load_prompt(
@@ -10597,6 +10757,26 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         context=context,
     )
     decision = invoke_structured_model(release, instruction, SearchDecision)
+    if decision.requires_visual_context and not release.multimodal_enabled:
+        return {
+            "next_step": "human_review",
+            "human_review_required": True,
+            "refusal_reason": "INSUFFICIENT_EVIDENCE",
+            "requires_visual_context": True,
+            "validation_failures": state["validation_failures"]
+            + ["VISUAL_CONTEXT_REQUIRED_BUT_RELEASE_DISABLED"],
+        }
+    if decision.requires_visual_context and not any(
+        document.page_image_uri for document in state["documents"]
+    ):
+        return {
+            "next_step": "human_review",
+            "human_review_required": True,
+            "refusal_reason": "INSUFFICIENT_EVIDENCE",
+            "requires_visual_context": True,
+            "validation_failures": state["validation_failures"]
+            + ["VISUAL_CONTEXT_REQUIRED_BUT_IMAGE_MISSING"],
+        }
     if decision.sufficient and decision.recommended_action == "answer":
         next_step = "answer"
     elif decision.recommended_action == "human_review":
@@ -10608,6 +10788,7 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
     return {
         "next_step": next_step,
         "missing_aspects": decision.missing_aspects,
+        "requires_visual_context": decision.requires_visual_context,
         "search_attempts": update_attempt_reason(state, decision.reason),
         "refusal_reason": (
             "INSUFFICIENT_EVIDENCE" if next_step == "refuse" else None
@@ -10688,7 +10869,16 @@ def answer_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         question=state["original_question"],
         context=context,
     )
-    response_text, _ = invoke_model_service(release, instruction)
+    image_uris = [
+        document.page_image_uri
+        for document in state["documents"]
+        if state["requires_visual_context"] and document.page_image_uri
+    ]
+    response_text, _ = invoke_model_service(
+        release,
+        instruction,
+        image_uris=image_uris,
+    )
     citations = [
         Citation(
             citation_id=document.citation_id,
@@ -10776,7 +10966,17 @@ def validate_answer_node(state: RagState, release: RagRelease) -> dict[str, Any]
         context=context,
         answer=state["answer"],
     )
-    validation = invoke_structured_model(release, instruction, AnswerValidation)
+    validation_image_uris = [
+        document.page_image_uri
+        for document in state["documents"]
+        if state["requires_visual_context"] and document.page_image_uri
+    ]
+    validation = invoke_structured_model(
+        release,
+        instruction,
+        AnswerValidation,
+        image_uris=validation_image_uris,
+    )
     semantic_failures = validation.uncited_claims + validation.contradictions
     if not validation.grounded or semantic_failures:
         return {
@@ -10938,6 +11138,7 @@ def initial_state(
         "search_attempts": [],
         "executed_queries": [question],
         "missing_aspects": [],
+        "requires_visual_context": False,
         "rewrite_count": 0,
         "next_step": "rewrite",
         "answer": "",
@@ -12367,6 +12568,9 @@ variables:
   # リリース構成台帳照会に利用するRead-only SQL WarehouseをBindingする。
   release_warehouse_id:
     description: リリース構成台帳参照用SQL Warehouse ID
+  # ai_parse_documentが保存するページ画像VolumeをRealtime AppへRead-onlyでBindingする。
+  page_image_volume_fqn:
+    description: ページ画像を保存するUnity Catalog Volume FQN（例 main.llmops.internal_docs_images）
 
 targets:
   dev:
@@ -12418,6 +12622,11 @@ resources:
           sql_warehouse:
             id: ${var.release_warehouse_id}
             permission: CAN_USE
+        - name: rag-page-images
+          uc_securable:
+            securable_full_name: ${var.page_image_volume_fqn}
+            securable_type: VOLUME
+            permission: READ_VOLUME
 ```
 
 AI Search IndexはApps Resource／Model移行表の公式対応に従い、Bundleでは`uc_securable`、`securable_type: TABLE`、`permission: SELECT`としてBindingする。Apps UIでは`vector-search-index`のCan selectと表示される。Endpoint作成・Sync権限は`ingestion` Bundleだけへ分離する。
@@ -12448,6 +12657,9 @@ env:
     valueFrom: rag-experiment
   - name: RELEASE_WAREHOUSE_ID
     valueFrom: release-warehouse
+  - name: RAG_PAGE_IMAGE_ROOT
+    # Unity Catalog Volume Resourceは/Volumes/<catalog>/<schema>/<volume>へ解決される。
+    valueFrom: rag-page-images
   - name: RAG_RELEASE_ID
     # 環境変数や設定値の固定値を指定する。
     value: rag-release-prd-20260814
@@ -12474,7 +12686,7 @@ env:
     value: "false"
 ```
 
-Commit、Build ID、Release IDはCIがTarget別のDeploy artifactへ埋め込み、dev／stg／prdで別値にする。Secretではないが、手編集ではなく署名済みBuild manifestを正本とする。Resource名はBundle変数でTargetごとに切り替える。
+Commit、Build ID、Release IDはCIがTarget別のDeploy artifactへ埋め込み、dev／stg／prdで別値にする。Secretではないが、手編集ではなく署名済みBuild manifestを正本とする。Resource名はBundle変数でTargetごとに切り替える。`RAG_PAGE_IMAGE_ROOT`はAppsのUnity Catalog Volume Resourceから解決し、`page_image_to_data_uri()`はこのRoot配下以外のPathを拒否する。Raw Volume PathやBase64画像はTrace、Log、SSEへ保存しない。
 
 `bundles/realtime/app/start.sh`
 
@@ -12505,7 +12717,7 @@ exec streamlit run streamlit_app.py \
   --server.headless true
 ```
 
-`requirements.txt`は検証済みLockから生成し、少なくとも`mlflow[databricks]>=3.14,<4`、`databricks-sdk`、`databricks-ai-search`、`databricks-openai`、`langgraph`、`pydantic>=2`、`requests`、`streamlit`と共通Wheelを固定する。Model Serviceへの最小推論が失敗する、Indexが`ONLINE`でない、リリース構成台帳のResourceがApps許可List外、Promptバージョンが解決不能、Wheelバージョン不一致のいずれかではHealth Checkを失敗させる。
+`requirements.txt`は検証済みLockから生成し、少なくとも`mlflow[databricks]>=3.14,<4`、`databricks-sdk`、`databricks-ai-search`、`databricks-openai`、`langgraph`、`pydantic>=2`、`requests`、`streamlit`と共通Wheelを固定する。Model Serviceへの最小推論が失敗する、Indexが`ONLINE`でない、リリース構成台帳のResourceがApps許可List外、Promptバージョンが解決不能、Wheelバージョン不一致のいずれかではHealth Checkを失敗させる。`multimodal_enabled=true`のReleaseでは、Read-only画像Volumeから検証用ページ画像を1枚読み、Base64画像＋短い質問でVision Smoke Testが成功することもReadiness条件にする。
 
 ##### 4.3.4.14 Production Monitoringを本番開始前に設定する
 
@@ -15098,6 +15310,9 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - [AI Search performance guide](https://docs.databricks.com/aws/en/ai-search/best-practices)
 - [Databricks `ai_parse_document`](https://docs.databricks.com/aws/en/sql/language-manual/functions/ai_parse_document)
 - [Databricks `ai_prep_search`](https://docs.databricks.com/aws/en/sql/language-manual/functions/ai_prep_search)
+- [Query vision models with Unity AI Gateway](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-vision-models)
+- [Databricks Apps: Unity Catalog volume resource](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/uc-volumes)
+- [Databricks Apps environment variable resource resolution](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/environment-variables)
 - [Lakeflow pipelines SQL development](https://docs.databricks.com/aws/en/ldp/developer/sql-dev)
 - [Lakeflow pipelines private streaming tables](https://docs.databricks.com/aws/en/ldp/developer/ldp-sql-ref-create-streaming-table)
 - [Lakeflow Pipeline Expectations](https://docs.databricks.com/aws/en/ldp/expectations)
