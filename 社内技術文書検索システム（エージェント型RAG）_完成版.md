@@ -2746,49 +2746,252 @@ PoCの目的は、限定したデータ・利用者・評価Caseで「RAGとし�
 
 本番では前提が変わる。文書、Prompt、Index、Code、Model Routeが独立して更新され、複数利用者が継続利用し、障害・誤回答・監査時に「そのRequestは何を使って動いたか」を後から再現する必要がある。このため、PoCでは省略した**現在状態の正本、変更履歴、不変Snapshot、Release単位、継続監視**を追加する。
 
-| 本番で追加するもの | 物理的な実体 | PoCではどうするか | 本番で必要になる理由 | 防ぎたい問題 |
+ここで重要なのは、各資産の説明を「何を管理するか」だけで終わらせず、**実装しない場合に本番で何が困るか**まで理解することである。次表では、PoCでの代替方法、本番で必要になる理由、未実装時の具体的な問題、導入上の位置づけをまとめる。
+
+| 本番で追加するもの | 物理的な実体 | PoCではどうするか | 本番で必要になる理由 | 実装しない場合に困ること | 位置づけ |
+| --- | --- | --- | --- | --- | --- |
+| 文書マニフェスト | `main.llmops.document_source_manifest` Delta Table | 最新Parse／Prep成功VersionをPoC Goldへ出す | Pipelineの「最新の処理成功Version」と、人が「現在RAGへ公開すると決めたVersion」を分離する。新Versionを取り込んでも内容確認・承認が終わるまでは旧Versionを公開し続けられるようにする | File差替えやParse／Prep成功だけで未確認Versionが検索対象になり得る。問題発生時も「前のVersionへ戻す」を単純なPointer切替として実施できない | 本番Baselineで必須 |
+| 文書バージョン管理台帳 | `main.llmops.document_version_registry` | Bronze／Attempt／Silver履歴で十分 | 各VersionについてParse／Prep／Chunk／Reviewがどこまで完了しているかを履歴として管理し、「Versionの処理・審査状態」と「現在公開中のVersion」を分離する。v1公開中にv2を処理・審査する状態を明示できるようにする | v2が処理失敗中なのか、審査待ちなのか、承認済みなのかを一つの公開状態だけでは表現できない。旧Versionが切戻し候補として技術的に利用可能かも判断しづらくなる | 本番Baselineで必須 |
+| 文書Workflow／監査履歴 | `document_workflow_requests`、`document_manifest_audit_events` | 開発者の手動操作とPoC実行記録 | 文書公開・停止・切戻しを直接Table更新ではなく、申請→承認→実行という管理された操作にし、誰が何を要求し、誰が承認し、実際に何が変更されたかを残す | 「なぜこのVersionが公開されたか」「誰が停止したか」を後から説明できない。直接SQL更新、誤操作、反映失敗、再実行を監査上区別しづらい | 統制が必要な本番では必須 |
+| Search Sync Table | `main.llmops.internal_docs_search_sync` | PoC GoldをAI Searchへ直接同期してよい | Gold Currentが変化しただけではAI Searchを即時変更せず、**検索公開すると確定したGold状態をCDF有効な物理Delta Tableへ反映してからAI Searchへ同期する境界**を作る。追加・更新だけでなく、旧版・削除・失効Chunkの削除もCDFで同期し、同じ公開時点からCorpus Snapshotを確定する | Gold上ではv3へ切り替わっているのにIndexはまだv2、削除済みChunkがIndexに残っている、といった「Goldの現在値」と「検索実体」のずれを管理しづらい。Publish失敗時の再実行境界や、どこまで公開済みかの確認も曖昧になる | 本資料のAI Search構成では必須 |
+| **Corpus Snapshot** | `main.llmops.corpus_snapshot_members` | 原則省略。PoC RunでCorpus VersionをTag記録 | **ある評価・Index Release時点で検索対象だった文書Version集合を不変IDで固定する**。文書本文やChunkを複製するのではなく、`corpus_snapshot_id → document_id + document_version_id`の対応を保持する | 文書更新後に、過去TraceやEvaluationがどの文書集合を検索していたか分からなくなる。Prompt変更による差分なのか、Corpus変更による差分なのかも切り分けにくい | 本番再現性・監査・切戻しのため必須 |
+| **Index Release** | Release ID付きAI Search Index＋Index設定 | PoC Indexを固定して比較 | Corpus Snapshotだけでなく、Embedding Model、Query Embedding、Schema、Index設定を含めて「検索基盤の1 Version」として固定する | 同じCorpusでもEmbeddingやIndex設定が変われば検索結果は変わるが、その差分原因を特定できない。旧検索構成へ確実に戻すことも難しくなる | 本番Baselineで必須 |
+| **RAGリリース構成台帳** | `main.llmops.rag_release_manifest`の1行 | Prompt／Index／Git等をTrace Tagへ個別記録 | **Code、Prompt、Model Route、Index Release、Corpus Snapshot、ACL Policy、Judge等の「評価済み組合せそのもの」を1つのReleaseとして固定する**。本番RAGを部品単位ではなく、評価済み構成単位で扱う | Promptだけ新しくIndexは旧版、など一度も評価していない新旧混在構成が本番で動き得る。障害時も各Resourceを個別に戻す必要があり、完全なロールバックを保証しにくい | 本番Baselineで必須 |
+| Release参照／Channel | `production`等が指す`rag_release_id` | PoCは対象候補を明示して実行 | 本番が使う構成を`production → rag_release_id`という1つのPointerで管理し、昇格・ロールバックをRelease単位の参照切替にする | Prompt、Index、Model等を順番に切り替える途中で新旧構成が混在する。ロールバック時も一部Resourceだけ戻し忘れる可能性がある | RAG Releaseを採用する本番では必須 |
+| Training／Holdout分離 | UC管理MLflow EvaluationDataset | 1つの固定PoC Datasetでもよい | 改善・Prompt Optimizationに利用したCaseと、最終Release可否を判定する未使用Caseを分離し、過学習・評価リークを抑える | Training Caseへ最適化しただけのCandidateを「品質向上」と誤認する。Optimizerや人が見たCaseだけ高スコアになっていても検出しづらい | 継続改善を行うなら必須に近い強い推奨 |
+| Realtime／Evaluation／Labeling Experiment分離 | 用途別MLflow Experiment | PoCは1 Experimentにまとめてよい | 本番Request Trace、Release評価Run、人間Reviewを、書込主体、Reviewer、保持期間、権限、UC Trace要否の違いに合わせて分離する | 本番利用Trace、評価Run、人間Labelが同一Experimentへ混在し、権限・Retention・運用ルールが複雑になる。ただし機能上は1 Experimentでも成立するため、必須機能ではなく運用分離のための推奨設計である | 運用上強く推奨。要件次第で簡略化可能 |
+| Release Gate | `release_gate.py`＋Holdout／Security／SLO／Cost結果 | PoC OwnerがKPIとRiskからGo／No-Go | Accuracyだけでなく、Retrieval、Groundedness、ACL、Latency、Cost等を同じCandidateに対して確認し、必要条件を満たしたものだけを昇格候補にする | 回答品質は良いがACL越境している、LatencyやCostが急増している、といったCandidateを人が見落として本番投入できてしまう | 本番Baselineで必須 |
+| Identity Fixture／ACL Gate | Git Fixture＋Evaluation入力 | 限定Testerと簡易ACL確認 | 「どのIdentityならどの文書を検索できるか」を再現可能なTest Caseとして固定し、Releaseごとに権限制御を回帰試験する | 通常ユーザーの回答品質テストには合格しても、別Groupの利用者が権限外文書を取得する不具合を本番まで検出できない | ACL付きRAGでは必須 |
+| Service Principal職務分離 | Data Pipeline、Quality、Realtime等のSP | 開発者Identityで実行可能 | データ生成、品質判定、Release、本番Runtimeを別Identityへ分け、1つのCredentialで生成から承認・公開まで完結しないようにする | 1つのCredential侵害や誤操作で、文書生成・品質判定・Release・本番実行まで操作できる。監査上も「どの役割が何をしたか」を分離しづらい | 金融等の統制要件では必須。一般用途では分離粒度を簡略化可能 |
+| Production Monitoring | MLflow Production Monitoring、SQL Alert、Monitoring Signal | PoC期間中にRunごと確認 | Release時点の評価だけでなく、本番投入後に発生する入力分布、文書更新、利用量、外部Service、Latency、品質の変化を継続検知する | Release時には正常でも、その後の文書更新によるRecall低下、429増加、Latency悪化、誤回答増加を利用者申告まで発見できない | 本番Baselineで必須 |
+
+##### 文書マニフェストを分ける理由の具体例
+
+文書マニフェストは、「技術的に処理できたVersion」と「業務上いま公開してよいVersion」を分離するために使う。
+
+| Version | Parse／Prep | Review | `approved_document_version_id` | Gold／AI Search |
 | --- | --- | --- | --- | --- |
-| 文書マニフェスト | `main.llmops.document_source_manifest` Delta Table | 最新Parse／Prep成功VersionをPoC Goldへ出す | 「処理に成功した最新版」ではなく「人が現在公開すると決めたVersion」を正本化するため | File差替えだけで未承認Versionが検索公開される |
-| 文書バージョン管理台帳 | `main.llmops.document_version_registry` | Bronze／Attempt／Silver履歴で十分 | Parse／Prep／Review状態をVersion単位で追跡し、公開Pointerと技術状態を分離するため | 公開状態と処理状態が混在し、どのVersionが失敗・承認済みか分からなくなる |
-| 文書Workflow／監査履歴 | `document_workflow_requests`、`document_manifest_audit_events` | 開発者の手動操作とPoC実行記録 | 誰が申請・承認し、どのService Principalが何を変更したかを後から説明するため | 直接更新、承認者不明、変更理由不明 |
-| Search Sync Table | `main.llmops.internal_docs_search_sync` | PoC GoldをAI Searchへ直接同期してよい | Gold CurrentとAI Searchの間にCDF有効な公開境界を置き、Snapshot単位で同期内容を固定するため | Materialized Viewの変化とIndex同期状態が曖昧になる |
-| **Corpus Snapshot** | `main.llmops.corpus_snapshot_members` | 原則省略。PoC RunでCorpus VersionをTag記録 | **ある評価・Release時点で検索対象だった文書Version集合を不変IDで固定するため** | 文書更新後に過去の誤回答・評価を再現できない |
-| **Index Release** | Release ID付きAI Search Index＋Index設定 | PoC Indexを固定して比較 | Corpus、Embedding、Schema、Index設定を1つの検索Releaseとして固定するため | 同じ文書集合でもEmbedding／Index設定が変わり、検索差分の原因が分からない |
-| **RAGリリース構成台帳** | `main.llmops.rag_release_manifest`の1行 | Prompt／Index／Git等をTrace Tagへ個別記録 | **Code、Prompt、Model Route、Index、Corpus、Judge等の「評価済み組合せ」を1つのReleaseとして固定するため** | Promptだけ戻す等で、一度も評価していない新旧混在構成が本番で動く |
-| Release参照／Channel | `production`等が指す`rag_release_id` | PoCは対象候補を明示して実行 | 本番切替を個別Resourceの変更ではなくRelease IDの切替として扱うため | ロールバック時に複数Resourceを個別に戻して戻し忘れる |
-| Training／Holdout分離 | UC管理MLflow EvaluationDataset | 1つの固定PoC Datasetでもよい | 改善に使ったCaseと最終採否Caseを分け、過学習・評価リークを防ぐため | Optimizerが見たCaseでだけ高スコアになり本番品質を誤認する |
-| Realtime／Evaluation／Labeling Experiment分離 | 用途別MLflow Experiment | PoCは1 Experimentにまとめてよい | Trace保持期間、書込主体、Reviewer、UC Trace要否を用途ごとに分離するため | 本番Trace、評価Run、人手Labelが同じ権限・保持Policyに混在する |
-| Release Gate | `release_gate.py`＋Holdout／Security／SLO／Cost結果 | PoC OwnerがKPIとRiskからGo／No-Go | 本番昇格条件を機械判定可能なGuardrailにし、その上で責任者が最終承認するため | 回答品質だけを見てACL違反、Latency、コスト悪化を含むCandidateを昇格する |
-| Identity Fixture／ACL Gate | Git Fixture＋Evaluation入力 | 限定Testerと簡易ACL確認 | 権限条件を再現可能なTest入力として固定し、権限外0件をRelease条件にするため | ユーザーごとに検索可能文書が違うのに通常品質Caseだけで昇格する |
-| Service Principal職務分離 | Data Pipeline、Quality、Realtime等のSP | 開発者Identityで実行可能 | データ生成、品質判定、Release、Runtimeを同一権限にしないため | 1つのCredential侵害や誤操作で生成から承認・公開まで完結する |
-| Production Monitoring | MLflow Production Monitoring、SQL Alert、Monitoring Signal | PoC期間中にRunごと確認 | 本番では入力分布・文書・利用量・失敗が継続変化するため、Release後も異常を検知する必要がある | Release時に正常でも、その後のDrift・障害・品質低下を見逃す |
+| `v1` | `succeeded` | `approved` | `v1` | 公開中 |
+| `v2` | `succeeded` | `pending` | `v1`のまま | 非公開 |
 
-**Corpus Snapshotは文書本文やChunk全体をSnapshotごとに複製するものではない。** `corpus_snapshot_id`に対して`document_id + document_version_id`のMember一覧を不変に保持し、「この時点の検索対象文書集合」を指せるようにする。
+`v2`は技術的には検索可能なChunkまで作成できているが、まだ人の審査が終わっていない。このとき文書マニフェストが`v1`を指しているため、Gold Currentは`v1`を公開し続ける。
+
+文書マニフェストを持たず「最新のParse／Prep成功Version」をそのままGoldへ出すと、`v2`の処理成功だけで未承認Versionが本番検索へ出る。**処理成功は公開承認ではない**ため、本番ではこの2つを分ける。
+
+##### 文書バージョン管理台帳を分ける理由の具体例
+
+文書バージョン管理台帳の役割は、単にVersion番号を保存することではない。たとえば現在`v1`を公開中で、新しい`v2`を取り込み・審査している場合、次の状態を同時に表現する必要がある。
+
+| Version | Parse | Prep | Review | 現在公開 |
+| --- | --- | --- | --- | --- |
+| `v1` | `succeeded` | `succeeded` | `approved` | ○ |
+| `v2` | `succeeded` | `succeeded` | `pending` | × |
+
+`document_version_registry`は`v1`、`v2`それぞれの技術状態・審査状態を保持し、`document_source_manifest.approved_document_version_id`は「現在公開するVersion」として`v1`を指し続ける。これにより、`v2`がParse／Prepへ成功しただけで自動公開されず、審査完了後にだけ公開Pointerを切り替えられる。
+
+この台帳がないと、「`v2`は処理失敗中なのか、処理済みで審査待ちなのか、承認済みだが未公開なのか」を一つの公開状態だけでは表現できない。過去Versionがロールバック先として利用可能かも判断しづらくなる。
+
+##### 文書Workflow／監査履歴を分ける理由の具体例
+
+文書公開を単なるTable Updateではなく、「申請」「承認」「実反映」に分けると、操作の意図と結果を分離して追跡できる。
+
+| 時刻 | 資産 | 状態 |
+| --- | --- | --- |
+| 10:00 | `document_workflow_requests` | `action=publish_v2`, `status=approved`, `requested_by=user-a`, `approved_by=user-b` |
+| 10:01 | Manifest Executor | `v1 → v2`への切替を実行 |
+| 10:01 | `document_manifest_audit_events` | `previous=v1`, `new=v2`, `outcome=succeeded` |
+
+もしExecutorが失敗した場合、Requestは「承認済み」でもAudit Eventは`outcome=failed`になる。これにより、**人は公開を承認したが、システム反映は失敗した**という状態を区別できる。
+
+Workflow／監査履歴がないと、現在のPointerだけを見ても「誰が、なぜ、いつ切り替えたか」「反映失敗後の再実行だったか」が分からない。
+
+##### Search Sync Tableを分ける理由の具体例
+
+Search Sync Tableは過去のCorpus Snapshotを全件保持する履歴Tableではない。**現在AI Searchへ同期する物理データを保持する公開境界**であり、過去の文書Version集合を不変に残す役割は`corpus_snapshot_members`が担う。
+
+たとえば文書Aを`v2`から`v3`へ公開切替すると、次のように状態が変わる。
+
+| 段階 | 文書Aの状態 |
+| --- | --- |
+| Silver | `v2`と`v3`のChunkを両方保持 |
+| Gold Current | `v3`だけがCurrent |
+| Search Sync反映前 | まだ`v2`が同期済み状態として残る可能性がある |
+| Search Publish成功後 | `v3`をInsert／Updateし、`v2`をDelete |
+| AI Search同期後 | `v3`だけが検索対象 |
 
 ```text
-corpus-2026-08-15
-  ├─ DOC-A / ver-3
-  ├─ DOC-B / ver-2
-  └─ DOC-C / ver-5
+Silver
+  └─ 全VersionのChunk履歴
+       ↓
+Document Manifest
+  └─ 現在公開するVersionを選択
+       ↓
+Gold Current
+  └─ 現在公開してよいChunk
+       ↓
+Search Publish Job
+  ├─ 件数・ACL・Version・Keyを検証
+  ├─ Corpus Snapshotを確定
+  └─ Search Sync TableへMERGE／DELETE
+       ↓ CDF
+AI Search Index
 ```
 
-たとえば翌日にDOC-Bが`ver-3`へ更新されても、過去Traceの`rag.corpus_snapshot_id=corpus-2026-08-15`から、当時は`DOC-B/ver-2`を検索していたことを再現できる。MLflow Trace Tagは「そのRequestがどのSnapshotを使ったか」を記録する参照であり、Snapshot Member集合そのものの正本ではない。
+Search Publish JobはSearch Sync Tableへ`v3`をInsert／Updateし、`v2`をDeleteする。このDeleteもCDFへ記録されるため、AI Search側へ「旧Versionを検索対象から外す」という変更を差分として伝えられる。
 
-**RAG Releaseも同じ考え方をRAG全体へ広げたものである。** RAGはModel単体ではVersionが決まらず、Code、Prompt、Model Route、Index、Corpus、Parser／Prep、ACL Policy、Judgeの組合せで挙動が決まる。
+Search Sync Tableを挟まない場合、Gold Currentの変更とAI Searchへの公開完了が同じものとして扱われやすい。結果として、**Goldではv3なのにIndexはまだv2、削除済みChunkがIndexへ残っている**といった公開状態のずれを検出・復旧しにくくなる。
 
-```text
-rag-release-17
-  ├─ Git Commit        = abc123
-  ├─ Answer Prompt     = prompts:/.../12
-  ├─ Model Route       = route-a
-  ├─ Index Release     = index-8
-  ├─ Corpus Snapshot   = corpus-21
-  ├─ Parse / Prep      = 2.0 / 2.0
-  ├─ ACL Policy        = acl-v4
-  └─ Judge             = judge-v7
-```
+##### Corpus Snapshotが必要になる具体例
 
-このReleaseがHoldout、ACL、Latency、コスト等のGateに合格した単位である。問題が出た場合は「Promptをv12へ戻し、Indexをv8へ戻し、Corpusをv21へ戻す」のような個別復旧ではなく、**直前の`rag_release_id`へ戻す**。これにより、過去に評価していない組合せを誤って作らない。
+Corpus Snapshotは、ある評価・検索Release時点で「どの文書Version集合を検索していたか」を固定する。
+
+| `corpus_snapshot_id` | `document_id` | `document_version_id` |
+| --- | --- | --- |
+| `corpus-101` | `DOC-A` | `v3` |
+| `corpus-101` | `DOC-B` | `v2` |
+| `corpus-101` | `DOC-C` | `v5` |
+
+翌日に`DOC-B`が`v3`へ更新され、新しいSnapshotが次のようになったとする。
+
+| `corpus_snapshot_id` | `document_id` | `document_version_id` |
+| --- | --- | --- |
+| `corpus-102` | `DOC-A` | `v3` |
+| `corpus-102` | `DOC-B` | `v3` |
+| `corpus-102` | `DOC-C` | `v5` |
+
+過去Traceに`rag.corpus_snapshot_id=corpus-101`が残っていれば、そのRequestは`DOC-B/v2`を検索対象としていたと再現できる。Snapshotがないと、後から現在のCorpusだけを見てしまい、「Promptが悪かったのか、文書集合が変わったのか」を切り分けられない。
+
+Corpus Snapshotは文書本文やChunk全体をSnapshotごとに複製するものではなく、**Snapshot IDと文書Version集合の対応を保持する**。
+
+##### Index Releaseが必要になる具体例
+
+同じCorpus Snapshotでも、Embedding ModelやIndex設定が変わると検索結果は変わり得る。
+
+| Index Release | Corpus | Embedding | Query Embedding | Schema | Recall@5 |
+| --- | --- | --- | --- | --- | ---: |
+| `index-21` | `corpus-101` | `embed-v1` | `embed-v1` | `chunk-v3` | 0.92 |
+| `index-22` | `corpus-101` | `embed-v2` | `embed-v2` | `chunk-v3` | 0.84 |
+
+この例では文書集合は同じだが、検索品質が低下している。`index_release_id`があれば、「Corpus変更」ではなく「検索構成変更」が原因候補だと切り分けられる。
+
+Index Releaseを持たずIndex名だけを使い回すと、同じ名前のIndexでも中身のEmbeddingや設定が変わり、過去の検索挙動を再現できなくなる。
+
+##### RAGリリース構成台帳が必要になる具体例
+
+RAGはModel単体ではVersionが決まらず、Code、Prompt、Model Route、Index、Corpus、ACL Policy、Judge等の組合せで挙動が決まる。
+
+| 項目 | `rag-release-17` | `rag-release-18` |
+| --- | --- | --- |
+| Git Commit | `abc123` | `def456` |
+| Answer Prompt | `prompts:/.../12` | `prompts:/.../13` |
+| Model Route | `route-a` | `route-a` |
+| Index Release | `index-21` | `index-22` |
+| Corpus Snapshot | `corpus-101` | `corpus-102` |
+| ACL Policy | `acl-v4` | `acl-v4` |
+| Judge | `judge-v7` | `judge-v7` |
+
+`rag-release-18`に問題があれば、本番参照を`rag-release-17`へ戻すことで、PromptだけでなくIndex、Corpus、Codeも含めて**過去に評価済みの組合せ**へ戻せる。
+
+この台帳がないと、「Promptは旧版へ戻したがIndexは新版のまま」のような、一度も評価していない新旧混在構成を作りやすい。
+
+##### Release参照／Channelが必要になる具体例
+
+RAG Releaseを作っても、本番がどのReleaseを使うかを1つのPointerとして管理しなければ、切替操作は複数Resourceへ分散する。
+
+| Channel | 切替前 | 切替後 |
+| --- | --- | --- |
+| `production` | `rag-release-17` | `rag-release-18` |
+| `candidate` | `rag-release-18` | `rag-release-19` |
+
+本番昇格は`production → rag-release-18`の参照切替だけで済み、問題があれば`production → rag-release-17`へ戻す。
+
+Channelがない場合、Prompt、Index、Model、Code等を個別に切り替える必要があり、途中状態で新旧構成が混在したり、ロールバック時に一部だけ戻し忘れたりする。
+
+##### Training／Holdoutを分ける理由の具体例
+
+改善に使ったCaseと、最終判定に使うCaseを同じにすると、Candidateが「見たことのある問題」だけに最適化される。
+
+| Dataset | Case | Baseline | Candidate |
+| --- | --- | ---: | ---: |
+| Training | `Q-001` | 0.70 | 0.98 |
+| Training | `Q-002` | 0.75 | 0.97 |
+| Holdout | `Q-101` | 0.82 | 0.80 |
+| Holdout | `Q-102` | 0.84 | 0.79 |
+
+Trainingだけを見ると大幅改善に見えるが、Holdoutではむしろ悪化している。このCandidateを本番昇格すると、学習・調整に使ったCaseだけへ過剰適合した可能性がある。
+
+そのためTrainingは改善探索、Holdoutは最終Release Gateと役割を分ける。
+
+##### Realtime／Evaluation／Labeling Experimentを分ける理由の具体例
+
+MLflow Experimentは機能上1つでも運用できるが、本番では用途によってデータの性質が異なる。
+
+| Experiment | 主なRecord | 書込主体 | 想定保持 |
+| --- | --- | --- | --- |
+| Realtime | 本番Request Trace | Realtime App | 長期または監査要件準拠 |
+| Evaluation | Release評価Run | Quality Job | Release比較に必要な期間 |
+| Labeling | 人手Assessment | Reviewer | Review／Dataset育成に必要な期間 |
+
+1つにまとめると、本番Traceを見られる人が人手Labelまで編集できる、評価Runだけ消したいのに本番Traceと同じRetentionになる、といった運用上の衝突が起きやすい。
+
+ただしこれはRAGを成立させるための必須機能ではなく、**権限・保持期間・運用責務を分離しやすくする推奨設計**である。
+
+##### Release Gateが必要になる具体例
+
+回答品質が高いだけでは、本番昇格条件として不十分である。
+
+| 指標 | Baseline | Candidate | Gate |
+| --- | ---: | ---: | --- |
+| Groundedness | 0.90 | 0.94 | Pass |
+| Recall@5 | 0.91 | 0.93 | Pass |
+| ACL違反件数 | 0 | 1 | **Fail** |
+| p95 Latency | 2.1秒 | 4.8秒 | Fail |
+| 平均Cost | 1.0 | 1.7 | Fail |
+
+Candidateは回答品質だけ見ると改善しているが、ACL違反が1件あり、Latency／Costも悪化している。この状態で昇格させるべきではない。
+
+Release Gateは複数の非機能・安全性条件を同時に確認し、「回答品質だけ良ければ昇格」という判断を防ぐ。
+
+##### Identity Fixture／ACL Gateが必要になる具体例
+
+ACL付きRAGでは、同じ質問でも利用者Identityによって検索結果が変わる。
+
+| Fixture | 所属 | 検索してよい文書 | 実際の取得 |
+| --- | --- | --- | --- |
+| `user-sales` | `sales` | `DOC-SALES` | `DOC-SALES` |
+| `user-engineering` | `engineering` | `DOC-ENG` | `DOC-ENG` |
+| `user-sales` | `sales` | `DOC-SALES`のみ | `DOC-ENG`も取得 → **Fail** |
+
+通常の回答品質Caseだけでは、最後の権限越境を検出できない。Identity Fixtureを固定し、「このIdentityならこの文書だけ」という期待値をReleaseごとに再実行することでACL回帰を検出する。
+
+##### Service Principalを分ける理由の具体例
+
+本番では、同じCredentialがデータ生成・評価・Release・Runtimeをすべて実行できる状態を避ける。
+
+| Service Principal | 主な権限 |
+| --- | --- |
+| Data Pipeline SP | Bronze／Silver／Gold更新 |
+| Quality SP | Evaluation、Release Manifest発行 |
+| Realtime SP | Release読取、AI Search Query、Model呼出し |
+| Manifest Executor SP | 承認済み文書公開状態の反映 |
+
+たとえばRealtime SPが侵害されても、文書マニフェストやRelease Manifestを書き換えられなければ、攻撃者が自分で不正文書を公開し、そのまま本番Releaseへ昇格することはできない。
+
+すべてを1つのSPへ集約すると、1つのCredential侵害や誤操作の影響範囲が大きくなり、監査上も「どの役割が変更したか」を区別しづらい。
+
+##### Production Monitoringが必要になる具体例
+
+Release時に合格していても、本番環境はその後変化する。
+
+| 日付 | Recall | p95 Latency | 429率 | 主な変化 |
+| --- | ---: | ---: | ---: | --- |
+| 8/1 Release直後 | 0.92 | 2.1秒 | 0.1% | 正常 |
+| 8/15 | 0.90 | 2.3秒 | 0.2% | 許容範囲 |
+| 8/30 | 0.76 | 5.8秒 | 4.2% | 文書大量更新＋Model Service混雑 |
+
+Release Gateは8/1時点の品質しか保証しない。8/30の劣化はProduction Monitoringが継続観測しなければ発見できない。
+
+Monitoringがないと、品質低下や429、Latency悪化を利用者からの問い合わせで初めて知る可能性がある。**Release前評価とRelease後監視は役割が異なる**。
 
 PoCでは、これらをすべて実装すると検証対象より運用基盤の構築が大きくなるため、Trace Tag、固定Dataset、固定Index、明示Prompt Versionで代替する。本番化時に、**人が覚えていなくても再現・承認・ロールバックできる状態**へ拡張するのが第4章の役割である。
 
@@ -13715,6 +13918,174 @@ flowchart TD
 
 RAGでは、低品質の原因を「文書不足」「文書解析・Chunk不良」「検索設定」「十分性判定」「回答Prompt」「権限Filter」に分ける。回答が悪いという理由だけで、すべてのケースをPrompt Optimizationへ渡さない。カナリアリリース／A-Bを追加する場合もRelease ID、Promptバージョン、Model Route、Index ReleaseをTraceで識別可能にする。
 
+
+#### 5.2 本番証跡をDev／Stagingへ安全に還流する
+
+本番で初めて判明した誤回答、検索失敗、ACL疑義、Judge不一致は、開発環境やStagingで再現・改善できなければ継続改善へつながらない。一方で、本番Trace、実利用者Identity、業務文書、顧客識別子等をそのままDevへ複製すると、環境分離・最小権限・機密データ管理を崩す。
+
+したがって本システムでは、**本番RawデータをDevへ丸ごとコピーするのではなく、本番Quality領域で人が期待値・根本原因・改善対象を確定し、改善に必要な最小限の情報だけを「再現用Case」へ変換して下位環境へ昇格する**。Rawデータを環境外へ出せない場合は逆にCandidate Code／Promptを本番Quality領域へ持ち込み、データを動かさず評価する。
+
+```mermaid
+flowchart TD
+    PROD["Production Runtime<br/>Trace・Assessment・Monitoring"]
+    Q["Production Quality領域<br/>Review・Expectation・root_cause確定"]
+    CLASS{"環境間持出し区分"}
+    META["metadata_only<br/>ID・Version・Metricだけ"]
+    CASE["sanitized_case<br/>Mask済み質問・Expectation"]
+    REPLAY["staging_replay<br/>必要最小の文書・Chunk・ACL Fixture"]
+    ONLY["prod_only<br/>データを動かさずCandidateを本番Quality側で評価"]
+    DEV["Dev<br/>Prompt・Routing・Judge改善"]
+    STG["Staging<br/>Retrieval・Parse・ACL再現"]
+    HOLD["Holdout／Security／SLO評価"]
+    REL["RAG Release"]
+    PROD2["Production"]
+
+    PROD --> Q --> CLASS
+    CLASS --> META --> DEV
+    CLASS --> CASE --> DEV
+    CLASS --> REPLAY --> STG
+    CLASS --> ONLY --> HOLD
+    DEV --> STG --> HOLD --> REL --> PROD2
+    ONLY --> REL
+```
+
+この境界では、**Production Traceは証拠、EvaluationDatasetは再現テスト**として扱う。Trace自体をDevへ複製してワークフロー状態を管理せず、Review済みのExpectation、Version ID、必要な固定証跡、Mask済み入力をEvaluationDatasetまたは専用Replay資産へ配送する。
+
+##### 環境間持出し区分
+
+Review Caseには、改善に必要なデータ量と機密性に応じて次の区分を持たせる。
+
+| `data_transfer_class` | Dev／Stagingへ渡すもの | 主な用途 | 本番Rawデータの扱い |
+| --- | --- | --- | --- |
+| `metadata_only` | Release ID、Prompt URI、Index Release、Corpus Snapshot、Metric、原因分類等 | Code／設定差分の調査、再現条件の特定 | Raw質問・文書本文は渡さない |
+| `sanitized_case` | Mask済み質問、承認済みExpectation、必要文書ID、固定証跡のMask済み抜粋 | Prompt Optimization、Agent Routing、Judge改善 | PII、Secret、顧客ID等を除去してから配送 |
+| `staging_replay` | 再現に必要な最小文書Version／Chunk、ACL Fixture、質問、Expectation | Retrieval、Parse／Prep、Chunk、ACL問題 | 全Corpusを複製せず、承認済み最小集合だけStagingへ作る |
+| `prod_only` | 原則としてデータを移動しない | 高機密文書、Raw Trace依存、外部持出し禁止Case | Candidate Code／Prompt／Judgeを本番Quality領域へ持ち込んで評価 |
+
+`data_transfer_class`はRoot Causeだけで自動決定しない。Quality Jobが候補を出し、品質責任者またはData Ownerが機密区分、再現に必要な情報、規制要件を確認して承認する。
+
+##### Prompt問題をDevへ還流する具体例
+
+本番で次のTraceが見つかったとする。
+
+| 項目 | 値 |
+| --- | --- |
+| `source_trace_id` | `trace-981` |
+| `rag_release_id` | `rag-release-17` |
+| 質問 | 「海外送金の承認上限は？」 |
+| 取得文書 | `DOC-A/v3` |
+| Answer Prompt | `prompts:/.../12` |
+| Human Feedback | `incorrect` |
+| Judge Feedback | `incorrect` |
+| `root_cause` | `PROMPT` |
+
+このRaw TraceをDevへそのままコピーするのではなく、本番Quality領域で次の再現用Caseへ変換する。
+
+```text
+case_instance_id       = case-2041
+source_trace_id        = trace-981
+source_rag_release_id  = rag-release-17
+source_corpus_snapshot = corpus-101
+
+question_redacted      = 「海外送金の承認上限は？」
+expected_response_redacted = 「承認済み資料に基づく期待回答」
+expected_document_ids  = ["DOC-A"]
+improvement_target     = ANSWER_PROMPT
+data_transfer_class    = sanitized_case
+sanitization_status    = approved
+promotion_status       = approved
+dataset_split          = train
+```
+
+DevではこのCaseをTraining EvaluationDatasetへ取り込み、Answer Promptだけを変更してCandidateを作る。CandidateはStagingで固定証跡と必要な検索Caseを再評価し、未使用Holdoutで合格してからRAG Releaseへ昇格する。
+
+##### Judge Alignmentへ還流する具体例
+
+同じ本番Traceでも、次のような場合はPromptではなくJudge改善へ使う。
+
+| Human Feedback | Judge Feedback | アプリ回答 | 改善先 |
+| --- | --- | --- | --- |
+| `correct` | `incorrect` | 正しい | `JUDGE_ALIGNMENT` |
+| `incorrect` | `correct` | 誤り | `JUDGE_ALIGNMENT`候補＋回答側Root Cause調査 |
+
+Judge Alignment用Caseは、人間が確定したFeedbackを教師情報として使う。ただし、**Alignmentに使ったTraceを同じJudgeの最終Validationへ再利用しない**。Case Family単位でAlignment用とJudge Validation用を分け、候補Judgeが未使用Caseでも人間判定と一致することを確認してからMonitoringへ反映する。
+
+##### Retrieval／Parse／Chunk問題でStaging Replay Corpusを作る具体例
+
+検索問題では質問だけをDevへ持ってきても再現できない。
+
+```text
+質問       = 「製品Xの障害コードE123の対処方法は？」
+期待文書   = DOC-123/v7
+実際取得   = DOC-456/v2
+root_cause = RETRIEVAL
+```
+
+この場合は本番Corpus全体を複製せず、再現に必要な最小集合だけでStaging Replay Corpusを作る。
+
+```text
+replay-corpus-2041
+  ├─ DOC-123/v7   # 本来取得すべき文書
+  ├─ DOC-456/v2   # 誤って上位取得された文書
+  └─ DOC-789/v4   # 同カテゴリの競合文書
+```
+
+StagingではこのReplay Corpusへ同じChunk Schema、Embedding条件、Query条件を適用し、BaselineとCandidate Retrievalを比較する。これにより、本番100,000文書をDevへ複製せず、失敗の因果関係だけを再現できる。
+
+Parse／Prep／Chunk問題も同様に、問題Versionの原文書を環境間持出し可能ならStaging専用Volumeへ限定複製し、持出し不可なら`prod_only`として本番Quality側の隔離された検証JobでCandidate Parser／Prep設定を評価する。
+
+##### ACL問題を再現する具体例
+
+ACL問題は質問と文書だけでなく、実行時の権限条件も必要になる。ただし、本番利用者IdentityをStagingへコピーしない。
+
+| Fixture | 所属Group | 検索可能文書 |
+| --- | --- | --- |
+| `user-sales` | `sales` | `DOC-SALES` |
+| `user-engineering` | `engineering` | `DOC-ENG` |
+
+Replay Corpusには`DOC-SALES`と`DOC-ENG`を置き、Stagingでは承認済み`identity_fixture_id`を使って、
+
+```text
+user-sales が DOC-ENG を取得したら Fail
+user-engineering が DOC-SALES を取得したら Fail
+```
+
+という回帰テストを行う。Raw User ID、実Group Membership、実Token、実Filter式は下位環境へ複製しない。
+
+##### 本番データを動かせない場合
+
+金融・機密文書等では、Maskingしても再現に必要な意味を保てない、または規制上Dev／Stagingへの持出し自体が不可の場合がある。その場合は`data_transfer_class=prod_only`とし、DataではなくCandidateを本番Quality領域へ持ち込む。
+
+```text
+Dev
+  Candidate Prompt / Code / Judge
+        ↓
+承認済みBuild Artifact
+        ↓
+Production Quality領域
+  本番データを読める限定Job
+        ↓
+Evaluationのみ実行
+        ↓
+Metric／Assessment／差分だけをDevへ返す
+```
+
+本番Realtime AppのTrafficへ直接Candidateを当てず、Production Quality用のService Principal、専用Experiment、読取専用権限、出力Maskingを使ってオフライン評価する。合格後に通常のStaging／Release Gate／RAG Release手順へ戻す。
+
+##### 環境間還流で守る原則
+
+- 本番Trace、業務文書、Identityを無条件にDevへ複製しない。
+- 本番TraceからEvaluationDatasetへ自動直結せず、Human ReviewでExpectation、`root_cause`、改善先、持出し区分を確定する。
+- Devへ渡すのは可能な限り`metadata_only`または`sanitized_case`とする。
+- Retrieval／Parse／ACLの再現で本文が必要な場合だけ、承認済み最小集合を`staging_replay`として作る。
+- 実利用者IdentityではなくIdentity Fixtureを使う。
+- Masking後のCaseが元の失敗意味を維持しているか品質責任者が確認する。
+- TrainingとHoldout、Judge AlignmentとJudge ValidationをCase Family単位で分離する。
+- 本番データを移動できない場合は、Dataを動かすのではなくCandidate Artifactを本番Quality領域へ持ち込む。
+- Dev／StagingからProductionのRaw Tableを自由に直接参照させない。
+- 環境間配送は一方向の承認済みArtifactとして扱い、元Trace ID、Release ID、Corpus Snapshot IDをLineageとして残す。
+
+
 #### 5.2.1 Quality・Review成果物
 
 | 成果物 | 所有Bundle | 用途 |
@@ -13723,6 +14094,8 @@ RAGでは、低品質の原因を「文書不足」「文書解析・Chunk不良
 | Quality Case／外部Issue対応 | `quality`または外部Tracker | 確認済み失敗原因グループの改善、再評価、Closeを追跡する。外部Tracker利用時はStatus等を外部側の正本とする。 |
 | Training EvaluationDataset | `quality` | Prompt Optimizationと検索設定探索に利用する。 |
 | Holdout EvaluationDataset | `quality` | 最終リリース判定専用として隔離する。 |
+| Sanitized Improvement Case | `quality` | 本番TraceからReview済みExpectation、Mask済み入力、Version IDだけを抽出し、Dev／Stagingへ安全に還流する。独立Tableを増やさずReview Case＋EvaluationDataset Recordで表現する。 |
+| Staging Replay Corpus（条件付き） | `quality`＋`ingestion` | Retrieval／Parse／ACL問題を再現する場合だけ、必要最小の文書Version／Chunk／ACL FixtureをStagingへ複製する。全本番Corpusは複製しない。 |
 | Review App／Assessment Schema | `quality` | 専門家のFeedbackとMLflow Expectationを収集する。 |
 | Retrieval Evaluation Job | `quality` | Chunk、検索方式、件数、Filter、Rerankを比較する。 |
 | Prompt Optimization Job | `quality` | 判定・言い換え・回答Promptの候補を個別に生成する。 |
@@ -13786,6 +14159,7 @@ MLflow／Databricks標準機能はTrace、Assessment、Feedback、MLflow Expecta
 | 原因診断 | MLflow Expectation確定 | Trace、Span、Chunk、Indexへの参照を提示し、診断結果を同期する | RAG／LLMOps担当者が最初に破綻した工程を特定する | Assessment、Delta | `diagnosed` |
 | 承認 | 原因診断完了 | 承認者の権限、必須項目、機密情報を検証し、判断を同期する | 品質責任者が採用または却下を判断する | Assessment、Delta | `approved`／`rejected` |
 | 改善先・Split割当 | `approved` | 固定Mappingで改善先を決め、`case_family_id`のHashでSplitを固定する | なし | Delta | `assigned` |
+| 環境間持出し判定 | `assigned` | `data_transfer_class`候補、Masking結果、必要なReplay資産を生成する | 品質責任者／Data Ownerが持出し可否と意味保存を承認する | Review Case、Mask済みArtifact | `promotion_status=approved`または`prod_only` |
 | 改善資産への配送 | `assigned` | EvaluationDatasetまたは専用バックログ／Datasetへ冪等に反映する | なし | 各改善資産、Delta | `synced` |
 | 改善・再リリース | 改善資産へ配送済み | 改善Job、Holdout評価、リリース判定、バージョン記録を実行する | 担当チームが修正し、責任者がリリースを承認する | MLflow Run、Git、Prompt、Index | 新しい本番Traceへ循環 |
 
@@ -13845,6 +14219,12 @@ Deltaテーブルには次の列を持たせる。
 | --- | --- | --- | --- | --- |
 | `review_case_id` | レビューケースID | Quality Job | レビュー候補作成時 | 元Trace IDとレビューCycleからUUIDまたは安定Hashを生成し、重複登録を防ぐ |
 | `source_trace_id` | 元の本番Trace ID | Quality Job | レビュー候補作成時 | `mlflow.search_traces()`で取得した元TraceのIDをそのまま保存する |
+| `source_environment` | 元証跡の環境 | Quality Job | 候補作成時 | 通常は`production`。環境間Lineageを曖昧にしないため固定値として保存する |
+| `source_rag_release_id` | 問題発生時のRAG Release | Quality Job | 候補作成時 | 元Traceの`rag.release_id`を転記し、当時のPrompt／Index／Corpus等を再現可能にする |
+| `source_corpus_snapshot_id` | 問題発生時のCorpus Snapshot | Quality Job | 候補作成時 | 元TraceのSnapshot IDを転記し、文書更新後も当時の検索集合を特定できるようにする |
+| `data_transfer_class` | `metadata_only`、`sanitized_case`、`staging_replay`、`prod_only` | Quality Job＋品質責任者／Data Owner | Root Cause確定後・配送前 | 再現に必要なデータ量、機密区分、持出し可否から候補を作り、人が承認する |
+| `sanitization_status` | `not_required`、`pending`、`approved`、`rejected` | Quality Job＋品質責任者 | 下位環境配送前 | Masking済み質問・Expectation・固定証跡が意味を保ち、禁止情報を含まないことを確認する |
+| `promotion_status` | `pending`、`approved`、`promoted`、`rejected`、`prod_only` | Quality Job＋品質責任者 | Dev／Staging配送またはProd-only評価時 | 環境間配送の承認と完了を管理し、Review承認とデータ持出し承認を同一視しない |
 | `question_redacted` | マスキング済み質問 | Quality Job | Delta保存前 | 組織のMasking Policyで個人情報、Secret、顧客識別子を除去し、原文を無条件に複製しない |
 | `entitlement_hash`、`acl_policy_version` | 実行時権限の非可逆識別子 | Realtime Agent、Quality Job | Trace生成時、候補作成時 | Raw User／GroupやFilter式を保存せず、Server解決済みPrincipal集合とPolicyバージョンのHashを転記する |
 | `identity_fixture_id` | 再現評価用の承認済み権限Fixture | Quality Job | Case承認・配送時 | Production Identityを複製せず、同等のACL条件を持つ架空Fixtureを品質責任者が承認する |
@@ -15237,6 +15617,8 @@ Incident Close前に、Monitoringで検知できたか、Runbookで復旧でき�
 Feedbackは「今回の実績への評価」、MLflow Expectationは「同じ入力で期待する正解」であり、用途を分ける。Review Caseの`pending → labeled → diagnosed → approved／rejected → assigned → synced`は証跡配送の状態であって、外部Issueの作業状態ではない。
 
 ### 5.6 本番証跡に基づく改善サイクル
+
+改善開発は本番証跡から開始するが、Production Raw DataをそのままDevへ移動することを前提にしない。5.2で定義した`data_transfer_class`に従い、`metadata_only`／`sanitized_case`はDevへ、`staging_replay`はStagingへ、`prod_only`はProduction Quality領域へ配送する。どの経路でも元Trace、RAG Release、Corpus SnapshotへのLineageを保持する。
 
 改善開発は本番証跡から開始し、次のCycleで行う。改善CaseのTraining投入と、最終判定用Holdoutへの固定はQuality JobがPolicyバージョン付きで行い、評価結果を見てからSplitを入れ替えない。
 
