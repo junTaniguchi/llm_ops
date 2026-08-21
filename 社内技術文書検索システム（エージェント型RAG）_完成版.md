@@ -96,7 +96,7 @@ flowchart LR
 | 文書マニフェスト | 人が決定した論理文書の現在公開状態と公開バージョン参照を保持し、Goldへ強制するUnity Catalog上の薄い管理用Delta Table。 |
 | 公開バージョン参照 | 現在公開すると人が選んだ文書バージョンを指す値。本資料では互換性のため列名`approved_document_version_id`を維持するが、意味は`published_document_version_id`と同じ「現在公開Versionへの参照」である。個々のVersionの審査合格状態とは分ける。 |
 | Bronze／Silver／Gold | 取込履歴、処理済み履歴、現在公開してよいデータを分離する三層構成。 |
-| 隔離 | **隔離（Quarantine）**。無効な行を正常処理経路から分離し、調査・再試行のために保持するパターン。テーブル名や`TBLPROPERTIES ('quality' = 'quarantine')`は変更しない。 |
+| 隔離 | **隔離（Quarantine）**。無効な行を正常処理経路から分離し、原因調査、原因分類、復旧方法の決定、必要な場合の計画再試行のために保持するパターン。隔離は「削除」でも「自動再試行待ち」でもない。テーブル名や`TBLPROPERTIES ('quality' = 'quarantine')`は変更しない。 |
 | 試行結果データセット | **試行結果データセット（Attempt Dataset）**。AI Functionの結果とエラーをPrivate Streaming Tableへ一度だけ物理保持し、成功表と失敗表へAI Functionの再呼出しなしで分岐する中間Dataset。単なる論理Viewではなく、重い処理結果を再利用する物理キャッシュとして機能する。 |
 | RAGリリース | **RAGリリース（RAG Release）**。Code、Prompt、Model Route、Index、Corpus Snapshot、評価器を一体として固定した実行構成。 |
 
@@ -276,11 +276,11 @@ flowchart TD
 | Pipeline | `poc_parse_attempts` | Private Streaming Table | 1文書Versionに対する1回のParse試行結果 | `document_version_id` | `ai_parse_document`の生結果を一度だけ物理保持 | `poc/src/02_parse.sql` | `poc_parse_quality` |
 | Pipeline | `poc_parse_quality` | Private Streaming Table | Parse Attemptへ品質判定を付けた1行 | `document_version_id` | `is_quarantined`を一元判定し成功／隔離を同一条件で分岐 | `poc/src/02_parse.sql` | `poc_parsed`, `poc_parse_errors` |
 | Pipeline | `poc_parsed` | Streaming Table | Parse成功した1文書Version | `document_version_id` | Prepへ渡せるParse成功履歴 | `poc/src/02_parse.sql` | `poc_prep_attempts` |
-| Pipeline | `poc_parse_errors` | Streaming Table（隔離） | Parse失敗した1文書Version | `document_version_id` | Parse失敗理由を調査・再試行用に保持 | `poc/src/02_parse.sql` | PoC調査、件数確認 |
+| Pipeline | `poc_parse_errors` | Streaming Table（隔離） | Parse失敗した1文書Version | `document_version_id` | Parse失敗理由を保持し、原因分類と復旧方法を判断する | `poc/src/02_parse.sql` | PoC隔離調査、件数・傾向確認 |
 | Pipeline | `poc_prep_attempts` | Private Streaming Table | 1文書Versionに対する1回のPrep試行結果 | `document_version_id` | `ai_prep_search`の生結果を一度だけ物理保持 | `poc/src/03_prep.sql` | `poc_prep_quality` |
 | Pipeline | `poc_prep_quality` | Private Streaming Table | Prep Attemptへ品質判定を付けた1行 | `document_version_id` | NULL／エラー／空Chunkを成功経路から隔離 | `poc/src/03_prep.sql` | `poc_prepared`, `poc_prep_errors` |
 | Pipeline | `poc_prepared` | Streaming Table | Prep成功した1文書Version | `document_version_id` | Chunk展開へ渡せるPrep成功履歴 | `poc/src/03_prep.sql` | `poc_chunks_silver` |
-| Pipeline | `poc_prep_errors` | Streaming Table（隔離） | Prep失敗した1文書Version | `document_version_id` | Prep失敗理由を調査・再試行用に保持 | `poc/src/03_prep.sql` | PoC調査、件数確認 |
+| Pipeline | `poc_prep_errors` | Streaming Table（隔離） | Prep失敗した1文書Version | `document_version_id` | Prep失敗理由を保持し、原因分類と復旧方法を判断する | `poc/src/03_prep.sql` | PoC隔離調査、件数・傾向確認 |
 | Pipeline | `poc_chunks_silver` | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id` | バージョン付き検索Chunk履歴を追記保持 | `poc/src/04_chunks_silver.sql` | `poc_chunks_gold` |
 | Pipeline | `poc_chunks_gold` | Materialized View | PoCで現在検索対象とする1 Chunk | `chunk_version_id` | 各`document_id`の最新Parse／Prep成功VersionをPoC限定で公開 | `poc/src/05_gold_poc.sql` | PoC AI Search Delta Sync Index |
 | 監視 | `poc_pipeline_event_log` | Lakeflow Event Log Table | Pipelineの1 Event | `event_id`等 | Update、Flow、Lakeflow Pipeline Expectationの実行証跡 | Lakeflow Pipeline | Pipelines UI、Ad-hoc監視Query |
@@ -882,6 +882,118 @@ WHERE is_quarantined = true;
 | `poc_prep_errors` | `ver-d44e...` | `{"error_code":"PREP_FAILED"}` | 隔離へ分岐 |
 
 成功表とエラー表は、試行結果データセットのNULL、`error_status`、Parseページ有無、Prep Chunk有無をまとめた同じ隔離条件から相互排他的に生成される。
+
+##### 3.3.4.1 隔離後に何を調査するか
+
+隔離された文書は、単に「エラー件数を確認して終わり」ではない。**隔離の目的は、公開経路を止めた状態で「入力文書の問題か、Parse／Prep処理の問題か、一時的なPlatform障害か」を切り分け、次の処置を決めること**である。PoCでは専用のCase Tableを作らず、調査対象、原因、処置、再実行結果を簡易なPoC実行記録へ残せばよい。
+
+最初に、Parse／Prepの隔離行を同じ形式で一覧化する。
+
+```sql
+SELECT
+  'PARSE' AS stage,
+  document_id,
+  document_version_id,
+  source_uri,
+  source_extension,
+  processor_version,
+  error_message,
+  occurred_at
+FROM poc_parse_errors
+
+UNION ALL
+
+SELECT
+  'PREP' AS stage,
+  document_id,
+  document_version_id,
+  source_uri,
+  source_extension,
+  processor_version,
+  error_message,
+  occurred_at
+FROM poc_prep_errors
+
+ORDER BY occurred_at DESC;
+```
+
+次に、1件だけの文書固有問題か、同じ形式／処理Versionで多数発生している共通問題かを確認する。
+
+```sql
+WITH errors AS (
+  SELECT
+    'PARSE' AS stage,
+    source_extension,
+    processor_version,
+    error_message,
+    occurred_at
+  FROM poc_parse_errors
+  UNION ALL
+  SELECT
+    'PREP' AS stage,
+    source_extension,
+    processor_version,
+    error_message,
+    occurred_at
+  FROM poc_prep_errors
+)
+SELECT
+  stage,
+  source_extension,
+  processor_version,
+  error_message,
+  count(*) AS error_count,
+  min(occurred_at) AS first_seen_at,
+  max(occurred_at) AS last_seen_at
+FROM errors
+GROUP BY stage, source_extension, processor_version, error_message
+ORDER BY error_count DESC, last_seen_at DESC;
+```
+
+調査は次の順序で行う。
+
+| 順序 | 確認するもの | 何を判断するか |
+| --- | --- | --- |
+| 1 | `document_id`、`document_version_id`、`source_uri` | どの原文書・内容Versionが失敗したか |
+| 2 | `error_message`、`processor_version`、発生時刻 | 入力固有か、特定Processor Version／時間帯に集中した障害か |
+| 3 | 原文書を人が開けるか、ページや本文が存在するか、想定形式か | 原文書そのものの破損、空File、暗号化、想定外形式等が疑われるか |
+| 4 | Parse成功後にPrepだけ失敗しているか | Parse以前の問題か、検索用前処理だけの問題か |
+| 5 | 同形式の別文書が同じ処理Versionで成功しているか | 文書固有か、実装／Processor／Platform側の共通障害か |
+| 6 | 原因分類と次Action | 再分類、原文書修正、計画再試行、Processor修正のどれに進むか |
+
+典型的な判断は次のようにする。
+
+| 症状 | 主に確認すること | 原因候補 | PoCでの処置 |
+| --- | --- | --- | --- |
+| Parseの`PARSE_NULL_RESULT`／`PARSE_EMPTY_PAGES` | 原文書が開けるか、実ページがあるか、同形式の別文書は成功するか | 文書固有、Parse一時障害、Processor不具合 | 原文書が正常なら同条件で1回だけ再現確認。複数文書で同時発生ならProcessor／Platform側を先に調査 |
+| Parseのページ単位`error_status` | 失敗ページ、画像・表・レイアウト等の共通点 | 特定ページ構造、Parse仕様、入力破損 | 失敗ページを確認し、必要なら元文書の修正版を新Versionとして投入 |
+| Prepの`PREP_NULL_RESULT`／`PREP_EMPTY_CONTENTS` | Parse結果にページ・本文が存在するか | Prep一時障害、Parse結果品質、Prep仕様 | Parse結果が正常ならPrep側を調査。Parse結果自体が不正ならParse／原文書側へ戻す |
+| 同じ`processor_version`で多数文書が同時失敗 | 直前のVersion変更、同時間帯のPipeline／Service状態 | Processor Regression、Platform障害 | 個別文書を何度も再試行せず、共通原因を直してからまとめて再評価 |
+| 1文書だけ繰り返し失敗 | 同形式の他文書との違い | 文書固有 | 原文書修正・変換・分割等を行い、内容が変わる場合は新しい`document_version_id`として扱う |
+
+ここで、**再分類と再試行は別物**である。
+
+- **再分類**：AI Functionの生結果は正常だが、`is_quarantined`の判定条件が誤っていた場合。保存済みAttemptを同じ条件で再評価し、AI Functionを不要に再呼出ししない。
+- **真の再試行**：`ai_parse_document`／`ai_prep_search`自体がNULLやエラーを返した場合。AI Functionの再呼出しが必要であり、同じPipelineを原因確認なしに何度もRunすることではない。
+- **原文書修正**：破損、暗号化、空File、ページ構造等を直した場合。内容Hashが変わるため、新しい文書Versionとして通常経路から処理する。
+- **Processor修正**：複数文書で同じ失敗が出る場合。文書を個別に直すのではなく、Parse／Prep Versionまたは処理ロジックを修正し、新しいEvaluation Runで比較する。
+
+PoCでは「失敗したら3回再試行」のような自動Loopを作らない。まず原因を分類し、**何も条件を変えずに同じ入力を繰り返す再試行は1回の再現確認まで**とする。再現する場合は、原文書、Processor Version、エラー内容をPoC実行記録へ残して改善対象へ送る。
+
+```mermaid
+flowchart TD
+    Q["Parse／Prep隔離"] --> E["エラー行・原文書・処理Version確認"]
+    E --> P{"同種エラーが<br/>複数文書で発生?"}
+    P -->|はい| SYS["Processor／Platform側を調査"]
+    P -->|いいえ| DOC{"原文書に問題?"}
+    DOC -->|はい| FIX["原文書を修正<br/>新Versionとして再投入"]
+    DOC -->|いいえ| STAGE{"Parse結果は正常?"}
+    STAGE -->|いいえ| PARSE["Parse側を調査"]
+    STAGE -->|はい| PREP["Prep側を調査"]
+    SYS --> RETEST["修正後に固定条件で再評価"]
+    PARSE --> RETEST
+    PREP --> RETEST
+```
 
 #### 3.3.5 Silver ChunkとPoC Gold
 
@@ -2629,11 +2741,11 @@ flowchart TD
 | Pipeline | `internal_docs_parse_attempts` | Private Streaming Table | 1文書Versionに対する1回のParse試行結果 | `document_id`, `document_version_id` | `ai_parse_document`結果を一度だけ物理保持 | Parse SQL | `internal_docs_parse_quality` |
 | Pipeline | `internal_docs_parse_quality` | Private Streaming Table | Parse Attemptへ品質判定を付けた1行 | `document_id`, `document_version_id` | 成功／隔離を同一条件で分岐 | Parse SQL | `internal_docs_parsed`, `internal_docs_parse_errors` |
 | Pipeline | `internal_docs_parsed` | Streaming Table | Parse成功した1文書Version | `document_id`, `document_version_id` | Prepへ渡すParse成功履歴 | Parse SQL | `internal_docs_prep_attempts`, Registry同期 |
-| Pipeline | `internal_docs_parse_errors` | Streaming Table（隔離） | Parse失敗した1文書Version | `document_id`, `document_version_id` | エラー理由・処理Versionを監査／再試行用に保持 | Parse SQL | 運用調査、Registry同期 |
+| Pipeline | `internal_docs_parse_errors` | Streaming Table（隔離） | Parse失敗した1文書Version | `document_id`, `document_version_id` | エラー理由・処理Versionを監査し、原因分類・復旧判断に使う | Parse SQL | 隔離Runbook、Registry同期 |
 | Pipeline | `internal_docs_prep_attempts` | Private Streaming Table | 1文書Versionに対する1回のPrep試行結果 | `document_id`, `document_version_id` | `ai_prep_search`結果を一度だけ物理保持 | Prep SQL | `internal_docs_prep_quality` |
 | Pipeline | `internal_docs_prep_quality` | Private Streaming Table | Prep Attemptへ品質判定を付けた1行 | `document_id`, `document_version_id` | 成功／隔離を同一条件で分岐 | Prep SQL | `internal_docs_prepared`, `internal_docs_prep_errors` |
 | Pipeline | `internal_docs_prepared` | Streaming Table | Prep成功した1文書Version | `document_id`, `document_version_id` | Chunk展開へ渡すPrep成功履歴 | Prep SQL | `internal_docs_chunks_silver`, Registry同期 |
-| Pipeline | `internal_docs_prep_errors` | Streaming Table（隔離） | Prep失敗した1文書Version | `document_id`, `document_version_id` | エラー理由・処理Versionを監査／再試行用に保持 | Prep SQL | 運用調査、Registry同期 |
+| Pipeline | `internal_docs_prep_errors` | Streaming Table（隔離） | Prep失敗した1文書Version | `document_id`, `document_version_id` | エラー理由・処理Versionを監査し、原因分類・復旧判断に使う | Prep SQL | 隔離Runbook、Registry同期 |
 | Pipeline | `internal_docs_chunks_silver` | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id` | 全成功Versionの検索Chunk履歴を追記保持 | Chunk SQL | `internal_docs_current_mv` |
 | Pipeline | `internal_docs_current_mv` | Materialized View | 現在公開してよい1 Chunk | `chunk_version_id` | SilverとManifest Pointer／ACL／Lifecycleを結合したGold Current | Gold SQL | Search Publish Job |
 
@@ -8610,7 +8722,155 @@ Parse失敗バージョンはこの一覧へ現れない。Prep失敗バージ�
 
 成功表とエラー表は物理化済み`internal_docs_prep_attempts`だけを参照するため、`ai_prep_search`をそれぞれで再実行しない。Parse失敗バージョンはPrep Attemptの入力にならず、Prep失敗バージョンはChunk Silverの入力にならない。
 
-###### 4.3.4.3.6 Chunk Silver履歴
+###### 4.3.4.3.6 Parse／Prep隔離の調査・復旧Runbook
+
+本番では、`internal_docs_parse_errors`／`internal_docs_prep_errors`へ入った時点でそのVersionを**技術的に公開不可**として扱い、`document_version_registry.parse_status`／`prep_status`を`failed`へ同期する。隔離行を削除したり、公開バージョン参照を失敗Versionへ切り替えたりしない。
+
+Primary OwnerはData Engineering担当者とする。原文書自体の修正が必要な場合だけ文書管理者／ドメイン担当者へ戻し、同じ時刻・同じProcessor Versionで多数発生する場合はPlatform／Databricks Service側の障害またはProcessor RegressionとしてService OwnerへEscalationする。
+
+**1. 最初に対象と影響範囲を確定する**
+
+```sql
+WITH quarantine AS (
+  SELECT
+    'PARSE' AS stage,
+    document_id,
+    document_version_id,
+    source_uri,
+    error_code,
+    error_message,
+    error_class,
+    ai_parse_document_version AS processor_version,
+    occurred_at
+  FROM main.llmops.internal_docs_parse_errors
+
+  UNION ALL
+
+  SELECT
+    'PREP' AS stage,
+    document_id,
+    document_version_id,
+    source_uri,
+    'PREP_ERROR' AS error_code,
+    error_message,
+    error_class,
+    ai_prep_search_version AS processor_version,
+    occurred_at
+  FROM main.llmops.internal_docs_prep_errors
+)
+SELECT
+  q.*,
+  r.parse_status,
+  r.prep_status,
+  r.review_status
+FROM quarantine AS q
+LEFT JOIN main.llmops.document_version_registry AS r
+  USING (document_id, document_version_id)
+ORDER BY q.occurred_at DESC;
+```
+
+同じ障害が広がっていないかを次の集約で確認する。
+
+```sql
+WITH quarantine AS (
+  SELECT
+    'PARSE' AS stage,
+    source_uri,
+    error_code,
+    error_class,
+    ai_parse_document_version AS processor_version,
+    occurred_at
+  FROM main.llmops.internal_docs_parse_errors
+
+  UNION ALL
+
+  SELECT
+    'PREP' AS stage,
+    source_uri,
+    'PREP_ERROR' AS error_code,
+    error_class,
+    ai_prep_search_version AS processor_version,
+    occurred_at
+  FROM main.llmops.internal_docs_prep_errors
+)
+SELECT
+  stage,
+  lower(regexp_extract(source_uri, '\\.([^.?#/]+)(?:[?#].*)?$', 1)) AS source_extension,
+  error_code,
+  error_class,
+  processor_version,
+  count(*) AS error_count,
+  count(DISTINCT source_uri) AS affected_sources,
+  min(occurred_at) AS first_seen_at,
+  max(occurred_at) AS last_seen_at
+FROM quarantine
+GROUP BY
+  stage,
+  lower(regexp_extract(source_uri, '\\.([^.?#/]+)(?:[?#].*)?$', 1)),
+  error_code,
+  error_class,
+  processor_version
+ORDER BY error_count DESC, last_seen_at DESC;
+```
+
+**2. 原因を次の4系統へ分類する**
+
+| 原因区分 | 典型例 | 確認内容 | 次Action |
+| --- | --- | --- | --- |
+| `SOURCE_PERMANENT` | 空File、非対応形式、破損、暗号化、500ページ超過等 | Staging／Bronzeの原文、Preflight、Scanner結果、ページ数 | 同じVersionを自動再試行しない。原文書を修正・変換・分割し、必要な審査後に新Versionとして再登録 |
+| `PROCESSOR_TRANSIENT` | `PARSE_NULL_RESULT`、単発の`PARSE_ERROR_STATUS`、Prep NULL／Error | 同形式の他文書、同時間帯、Model／Service状態、同Processor Version | 原文が正常で単発なら、専用再試行Jobまたは計画した再処理で限定再試行 |
+| `PROCESSOR_REGRESSION` | Processor Version変更後に同種エラーが急増 | 変更前後Version、形式別エラー率、Staging再現 | 個別再試行を止める。新Processor Versionの利用停止／修正、新Pipeline Releaseで影響範囲を再処理 |
+| `PIPELINE_RULE` | 生Attemptは利用可能だが隔離条件・Schema解釈が誤り | Attempt出力、`is_quarantined`条件、Schema Version | 判定ロジックを修正し、保存済みAttemptから再分類。AI Functionを再呼出ししない |
+
+ParseとPrepでは見る場所を分ける。
+
+| Stage | 最低限確認するもの | 判断ポイント |
+| --- | --- | --- |
+| Parse | 原文Binary、Preflight、`error_code`、`error_message`、`ai_parse_document_version`、ページ数 | 原文書を人が読めるのに失敗しているか。同形式の他文書でも同じ失敗が出るか |
+| Prep | 対応するParse成功状態、Parseページ数、`error_message`、`ai_prep_search_version` | Parse出力自体が不十分なのか、正常なParse出力をPrepだけ処理できないのか |
+| 共通 | `content_hash`、`source_uri`、`occurred_at`、同Versionの件数 | 同じ入力を何度も処理しているのか、特定Release／時間帯に集中しているのか |
+
+**3. 再分類、再試行、原文書修正を混同しない**
+
+```mermaid
+flowchart TD
+    Q["隔離Version"] --> T["Data EngineeringがTriage"]
+    T --> R{"Attempt結果自体は正常?"}
+    R -->|はい| RULE["PIPELINE_RULE<br/>隔離条件・Schemaを修正"]
+    RULE --> RECLASS["保存済みAttemptから再分類"]
+    R -->|いいえ| S{"原文書に恒久問題?"}
+    S -->|はい| DOC["SOURCE_PERMANENT"]
+    DOC --> NEW["原文書を修正<br/>新Versionとして再登録"]
+    S -->|いいえ| W{"複数文書で同時発生?"}
+    W -->|はい| REG["PROCESSOR_REGRESSION／Platform障害"]
+    REG --> FIX["Processor／Pipelineを修正<br/>新Releaseで再処理"]
+    W -->|いいえ| TR["PROCESSOR_TRANSIENT"]
+    TR --> RETRY["上限付き専用再試行"]
+```
+
+- **再分類**は、保存済みAttemptの内容が正常なのに判定式だけが誤っていた場合に使う。AI Functionの再課金を発生させない。
+- **上限付き再試行**は、AI Function自体が一時的に失敗した場合だけに使う。同じ本番Streaming Pipelineへ行を戻してAuto LoaderやCheckpointの偶然の再検知を期待しない。
+- **原文書修正**は、新しい内容Hashを持つ文書Versionとして通常のStaging→Scanner→文書審査→Volume→Pipeline経路へ戻す。失敗した旧Versionを上書きしない。
+- **Processor Regression**では、失敗文書を1件ずつ再試行しない。影響範囲を固定してProcessor／Pipelineを修正し、Staging検証後に計画した新Pipeline ReleaseまたはFull Refreshで再処理する。
+
+本資料のBaselineでは、Parse／Prepの**専用自動Retry Jobを必須機能にはしていない**。隔離件数が少ない間は人がTriageし、原文書修正またはProcessor修正で解消する。専用Retry Jobを追加する場合も、対象を`document_id`＋`document_version_id`で固定し、最大試行回数、対象Processor Version、Job Run ID、前回エラー、結果をRun Logへ残し、無制限再試行を禁止する。
+
+`internal_docs_parse_errors.retry_count`／`internal_docs_prep_errors.retry_count`は現行Baseline SQLでは初回隔離時に`0`で作成される。Streaming隔離行を後から更新して履歴正本にする設計ではないため、**Baselineでは実際の再試行履歴の正本をLakeflow Job Run／Run Logとする**。将来専用Retry Jobを常設化する場合は、Retry Attempt専用の追記ログを追加するか、Registryへ集約値を同期し、隔離Tableの初回エラー履歴を上書きしない。
+
+**4. 調査結果として最低限残す情報**
+
+| 項目 | 保存先 | 例 |
+| --- | --- | --- |
+| 対象 | Run Log／Issue | `document_id`、`document_version_id`、Stage |
+| 再現条件 | Run Log | Source Hash、Processor Version、Pipeline Release、発生時刻 |
+| 原因分類 | Run Log／必要時Quality Case | `SOURCE_PERMANENT`、`PROCESSOR_TRANSIENT`、`PROCESSOR_REGRESSION`、`PIPELINE_RULE` |
+| 処置 | Run Log／Workflow | 原文書修正、新Version登録、再分類、限定再試行、Processor修正 |
+| 再試行証跡 | Lakeflow Job Run／Run Log | Retry Job Run ID、試行番号、結果 |
+| 終了判断 | Registry／Workflow／Issue | 技術成功、Version却下、修正版待ち、Processor修正版待ち |
+
+**やってはいけないこと**は、隔離Tableから行を削除して成功扱いにすること、同じ失敗Versionを公開バージョン参照へ設定すること、原因が分からないまま同一入力を無制限に再試行すること、原文書を同じPathへ上書きしてAuto Loaderの再検知に依存することである。
+
+###### 4.3.4.3.7 Chunk Silver履歴
 
 `bundles/ingestion/src/04_chunks_silver.sql`
 
@@ -8703,7 +8963,7 @@ FROM identified_chunks AS identified;
 
 `variant_explode`が返す配列位置だけに依存せず、`ai_prep_search`の`chunk_position`を優先し、欠損時だけ`variant_explode.pos`へFallbackする。`chunk_logical_id`は文書内位置、`chunk_version_id`は`document_id`、`document_version_id`、`chunk_logical_id`から決定論的に生成する。
 
-###### 4.3.4.3.7 文書マニフェスト公開条件とGold Current
+###### 4.3.4.3.8 文書マニフェスト公開条件とGold Current
 
 `bundles/ingestion/src/05_gold_current.sql`
 
@@ -8860,7 +9120,7 @@ INNER JOIN active_manifest AS manifest
 
 Search Syncが読む`internal_docs_current_mv`の列と`SEARCH_COLUMNS`は変更していないため、後続の物理Delta Table、AI Search Index、Realtime AgentへのSchema影響はない。
 
-###### 4.3.4.3.8 Dataset依存関係と公開条件の検証
+###### 4.3.4.3.9 Dataset依存関係と公開条件の検証
 
 依存関係はソースイベントから登録済みBronzeと未登録隔離へ分岐し、登録済み側だけが文書バージョン一意化、Parse試行結果、Parse品質判定、Parse成功、Prep試行結果、Prep品質判定、Prep成功、Silver Chunk、Gold Currentへ進む一方向Graphである。各品質判定Datasetから隔離テーブルも分岐するため、Lakeflow Pipeline Expectationの合否件数とエラー詳細を対応付けられる。文書マニフェストのStatic Joinは過去Eventを自動再評価しないため、未登録側は明示的な再投入で新しいPathへ戻す。次の検証QueryはPipeline更新後にQuality Jobから実行し、1行でも返ればリリースを停止する。
 
@@ -14421,7 +14681,7 @@ ReconciliationやTriageが作るのは候補とSignalであり、マニフェス
 | 監視領域 | 定常確認 | 頻度 | Primary Owner | 判断・記録 |
 | --- | --- | --- | --- | --- |
 | 文書Lifecycle | RAG投入審査、公開Version選択、停止、削除、切戻し、必要時のReconciliation候補 | 日次、変更ごと | 文書管理担当者 | UIのWorkflow Request、現在Pointer、Audit Logを確認する |
-| Pipeline／エラー | Run、Event Log、Attempt、エラー、隔離 | Runごと、日次 | Data Engineering担当者 | 形式別エラー率と再試行可否をRun Logへ残す |
+| Pipeline／エラー | Run、Event Log、Attempt、Parse／Prep隔離、Processor Version別エラー率 | Runごと、日次 | Data Engineering担当者 | 4.3.4.3.6のRunbookで原因を4分類し、再分類／原文修正／限定再試行／Processor修正のどれに進むかをRun Logへ残す |
 | Gold／Search Sync | Gold差分、旧版残存、Index同期、Snapshot | Syncごと | Search担当者 | リリース構成台帳と実体の一致を照合する |
 | Agent／Model | Availability、429、5xx、Loop、Model Route | 継続集計、日次 | Agent／LLMOps担当者 | SLOとRoute比率をDashboardで確認する |
 | Trace／Masking | 必須Span、バージョン、機密情報、Trace欠落 | 日次、Releaseごと | LLMOps／セキュリティ担当者 | 再現不能またはMasking違反をIncident化する |
@@ -14463,6 +14723,7 @@ Alertは通知で終わらせず、影響範囲、対象Release、暫定措置�
 | --- | --- | --- | --- | --- |
 | ACL越境／機密情報露出 | Trafficまたは対象Corpusを即時停止する | Identity、Filter、Trace、権限変更を調査する | Access遮断、影響調査、修正版セキュリティ判定 | セキュリティ責任者が影響と再発防止を承認する |
 | 根拠なし重大回答／誤引用 | 対象Releaseの利用範囲を制限する | Retrieval、Sufficiency、Answer、出典の最初の破綻点を調査する | 旧Releaseへロールバックまたは対象質問を安全拒否する | 固定Holdoutと重大Case回帰が合格する |
+| Parse／Prep隔離の増加 | 新規公開対象から失敗Versionを除外したまま影響範囲を集計する | 4.3.4.3.6に従い、Source、Processor、Pipeline Rule、Platformのどこで失敗したかを切り分ける | 原文書修正、新Version登録、限定Retry、Processor修正のいずれかを実施する | 隔離原因が確定し、再処理対象が成功またはVersion却下としてCloseされる |
 | Pipeline／Search同期失敗 | 新規公開を停止し既存Releaseを維持する | Event Log、エラー、Gold差分、Index状態を照合する | 冪等Replay、Reconciliation、必要ならIndex切戻し | Gold、Index、文書マニフェストが一致する |
 | Agent／Model／Search障害 | Timeout、再試行上限、安全エラーを適用する | 429、5xx、Capacity、Network、Dependencyを調査する | Capacity／Route調整または旧Releaseへ戻す | SLO回復と再発監視期間を満たす |
 | 品質Metric低下 | 影響Sliceと代表Traceを抽出する | DOCUMENTからPLATFORMまで原因分類する | 対象コンポーネントだけを変更して再評価する | Holdout合格後に段階Releaseする |
@@ -14721,6 +14982,9 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - Private 試行結果データセットで各AI Functionをバージョンごとに1回だけ実行している
 - 成功表とエラー表が相互排他的であることをInvariant Queryで確認している
 - 文書解析・検索準備エラーを別Tableへ隔離している
+- Parse／Prep隔離後に4.3.4.3.6のRunbookで対象、影響範囲、原文書、Processor Versionを確認し、原因を`SOURCE_PERMANENT`／`PROCESSOR_TRANSIENT`／`PROCESSOR_REGRESSION`／`PIPELINE_RULE`へ分類できる
+- 原文書問題は失敗Versionを上書きせず修正版を新Versionとして再登録し、Processor／Platform問題は個別文書の無制限再試行ではなく修正版Releaseまたは上限付き専用Retryへ送る
+- Parse／Prepの初回隔離行を削除・成功扱いにせず、再試行Run ID、処置、終了判断をRun Log／Registry／Workflowへ残している
 - Chunkへ論理文書ID、文書バージョン ID、Chunkバージョン ID、Opaque Source Ref、`allowed_principals`、ページがある
 - Delta Source TableでChange Data Feedが有効である
 - Current MVから物理CDF TableへMERGE／DELETEしている
@@ -14945,7 +15209,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 | 文書マニフェスト | 文書の管理属性と公開参照を持つ正本 | `main.llmops.document_source_manifest` | 4.3.4.3.1 |
 | 文書バージョン管理台帳 | 文書バージョンの処理・審査履歴を持つ正本 | `main.llmops.document_version_registry` | 4.3.4.3.1 |
 | 公開バージョン参照 | 現在公開する文書バージョンを指す値 | `approved_document_version_id`列 | 1.6 |
-| 隔離 | 失敗・未登録データを公開経路から隔離する領域 | エラー／隔離 Delta Table | 4.3.4.3 |
+| 隔離 | 失敗・未登録データを公開経路から分離し、原因調査と復旧判断を行う領域 | エラー／隔離 Delta Table。Parse／Prepの調査Runbookは4.3.4.3.6 | 4.3.4.3 |
 | Corpus Snapshot | 評価・Index時点の公開文書バージョン集合 | Snapshot RegistryとMember Table | 4.3.4.5 |
 | インデックスリリース | Index、Corpus、Embedding、Schemaを固定した版 | Index Registry RecordとAI Search Index | 4.3.4.5 |
 | リリース構成台帳 | RAG構成を一体で再現・ロールバックする正本 | `main.llmops.rag_release_manifest`の1行 | 4.3.4.6 |
