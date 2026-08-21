@@ -548,7 +548,7 @@ resources:
 
 PoCでは開発者Identityで実行してよいが、専用dev SchemaとVolumeだけへ権限を限定する。本番章ではPipelineとSearch Publishの`run_as`を標準のData Pipeline SPへ変更する。Reconciliationを後日追加する場合は、まず同じData Pipeline SPを使い、追加分割条件を満たした場合だけ専用SPへ分ける。
 
-#### 3.3.2.1 MLflow ExpectationとLakeflow Pipeline Expectationの区別
+##### 3.3.2.1 MLflow ExpectationとLakeflow Pipeline Expectationの区別
 
 本資料には同じ「Expectation」という語を持つ別機能があるため、次のように明確に区別する。
 
@@ -576,7 +576,7 @@ Databricks公式仕様上の対応関係は次のとおりである。Pythonデ�
 
 WarnとDropの合格・違反件数はPipeline UIとEvent Logの`flow_progress`イベントにあるExpectation品質指標で確認する。更新失敗時は通常のExpectation集計値が記録されないため、Fail Updateは失敗イベントと診断情報を確認する。入力更新がない場合、品質指標をサポートしないフロー、またはメトリクス設定の組合せでは品質指標が出ないこともあるため、「値がない」を合格として扱わない。
 
-#### 3.3.2.2 メダリオン各層のLakeflow Pipeline Expectation設計
+##### 3.3.2.2 メダリオン各層のLakeflow Pipeline Expectation設計
 
 Bronzeは原データと取込事実を失わない層、Silverは検証・整形済みデータと隔離経路を分ける層、Goldは公開可能なデータだけを提供する層として扱う。この区分はDatabricksの推奨設計に沿うが、固定規則ではない。本システムでは監査可能性と公開安全性から次の動作を選ぶ。
 
@@ -2801,6 +2801,19 @@ Reconciliation、レビュー待ちキュー自動配送、Prompt Optimization�
 
 本番開発では、PoC SourceをBaselineとして文書マニフェスト契約、Service Principal、登録・承認ワークフロー、必要な場合の外部Scanner、隔離、Search Sync、リリース構成台帳、ACL Filter、Training／Holdout Gateを追加する。PoCのTrace Schema、`inputs`／`expectations`契約、決定論的Scorer、RAG Judgeを捨てず、本番用Quality Bundleへ移してバージョン固定する。prod固有値をSourceへ埋め込まず、DAB Target、Terraform、Secret／Federationで環境差を注入する。
 
+#### 4.3の読み方（章内ナビゲーション）
+
+4.3は本資料で最も実装量が多い節である。初読ではコードを上から逐語的に読むのではなく、**「PoCとの差分 → 構築順序 → Project境界 → 個別Source」**の順で全体像を掴み、必要なSourceへ降りる。完全なコードは実装・レビュー時の参照用として扱う。
+
+| 読む順序 | 範囲 | ここで理解すること | 初読時の読み方 |
+| --- | --- | --- | --- |
+| 1 | 4.3.1 | PoCから本番へ何を追加・変更するか | 差分表を読む |
+| 2 | 4.3.2 | 何をどの順序で構築するか | 構築順序と依存関係を確認する |
+| 3 | 4.3.3 | Bundle、Workspace Resource、MLflow、Model Serviceの境界 | Project構成と初期セットアップを理解する |
+| 4 | 4.3.4 | 文書管理、Pipeline、Search、RAG、評価、Monitoringの完全実装 | 先に4.3.4冒頭の実装ブロック表を読み、必要な節だけ詳細コードへ進む |
+
+**初読の停止点**：アーキテクチャ理解が目的なら、各Source直前の「実装概要」「ロジック概要」「データフロー」を優先し、長いSQL／Python／YAML／Terraformコードブロックは読み飛ばしてよい。実装時に対象Sourceへ戻る。
+
 | 段階 | Prompt管理 | Identity構成 |
 | --- | --- | --- |
 | PoC | 短いTemplateのPython直書きを許容し、Prompt RegistryでVersion管理 | 個人／開発Identityをdev範囲に限定して許容 |
@@ -3622,6 +3635,20 @@ Inference Loggingを採用する場合も、MLflow UC Trace Tableと同じもの
 7. 429、Primary Destination障害、Fallback、コスト上限のDry Runを行う。
 
 #### 4.3.4 本番ソースファイル
+
+4.3.4は完全実装リファレンスである。個別Sourceを読む前に、次の実装ブロックで責務の境界を確認する。**本番導入時に必須のBaselineと、本番導入後の高度化用参照を混同しない**ことが重要である。
+
+| 実装ブロック | 範囲 | 主目的 | 本番導入時の扱い |
+| --- | --- | --- | --- |
+| 契約・Prompt | 4.3.4.1〜4.3.4.2 | RAG入出力契約、Git管理Prompt、Prompt Registry | 必須 |
+| 文書管理・Medallion | 4.3.4.3 | 文書申請、公開Version、Bronze／Parse／Prep／Silver／Gold | 必須 |
+| Reconciliation | 4.3.4.4 | Source／Manifest／Gold／Searchの差分候補検知 | **本番導入後の条件付き高度化。初回本番では参照のみ** |
+| Search公開 | 4.3.4.5 | Search Sync、Corpus Snapshot、AI Search Index | 必須 |
+| Release・RAG・評価 | 4.3.4.6〜4.3.4.9 | RAGリリース固定、LangGraph、EvaluationDataset、Identity Fixture | 必須 |
+| Runtime | 4.3.4.10〜4.3.4.13 | Agent Server、Build metadata、Streamlit、Databricks Apps | 必須 |
+| Monitoring・運用接続 | 4.3.4.14〜4.3.4.15 | Production Monitoring、Alert、Signal／Quality Case連携 | 本番開始前に構築し、Pilot／本番開始時に有効化 |
+
+**推奨読順**：`4.3.4.1 → 4.3.4.2 → 4.3.4.3 → 4.3.4.5 → 4.3.4.6〜4.3.4.15`。`4.3.4.4`はReconciliationの開始条件を満たすまで実装対象から外す。
 
 ##### 4.3.4.1 共通のRAG入出力契約
 
@@ -5097,7 +5124,7 @@ Realtime BundleはAppsが作成したIdentityを`${resources.apps.internal_rag_a
 | 9 | Manifest Executor SP | 承認者、自己承認禁止、Version存在、Parse／Prep／Chunk成功、Review状態、ACL、楽観Lockを検証して公開Pointerを更新する | 人が選んだVersionだけを反映。最新Versionを自動選定しない |
 | 10 | Data Pipeline SP | Gold Current、Search Sync、AI Searchを順に更新する | Manifest Pointerに一致するVersionの全Chunkだけが検索可能 |
 
-##### 4.3.4.3.1.2 本番導入時の最小文書管理UI
+**4.3.4.3.1.2 本番導入時の最小文書管理UI**
 
 文書管理UIは巨大なDocument Management Systemではなく、`Document List → Version List → Review → Publish Version → Confirm`の最小画面フローを持つDatabricks App／Streamlitでよい。
 
