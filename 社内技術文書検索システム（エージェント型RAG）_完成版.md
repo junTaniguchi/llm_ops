@@ -2740,6 +2740,65 @@ PoC Ownerは、処理成功だけではなく、次の成果物が揃い、業�
 | AI Search／RAG | Retrieval、出典、拒否 | ACL Filter、リリース構成台帳、回答検証を追加 |
 | Evaluation／Assessment | `mlflow.genai.evaluate()`、Trace Schema、決定論的Scorer、RAG Judge、最小Feedback／MLflow Expectation | UC Dataset、Identity Fixture、Training／Holdout、正式Reviewer、ACL／旧版Gate、Monitoringを追加 |
 
+#### 3.8.1 PoCでは持たず、本番で追加する管理資産と「なぜ必要か」
+
+PoCの目的は、限定したデータ・利用者・評価Caseで「RAGとして成立するか」「どこが品質を制約するか」を確認することである。この段階では、担当者が実行時のPrompt、Index、文書集合、Git Commitを把握し、MLflow Trace／Evaluation Runへ記録できれば比較は成立する。
+
+本番では前提が変わる。文書、Prompt、Index、Code、Model Routeが独立して更新され、複数利用者が継続利用し、障害・誤回答・監査時に「そのRequestは何を使って動いたか」を後から再現する必要がある。このため、PoCでは省略した**現在状態の正本、変更履歴、不変Snapshot、Release単位、継続監視**を追加する。
+
+| 本番で追加するもの | 物理的な実体 | PoCではどうするか | 本番で必要になる理由 | 防ぎたい問題 |
+| --- | --- | --- | --- | --- |
+| 文書マニフェスト | `main.llmops.document_source_manifest` Delta Table | 最新Parse／Prep成功VersionをPoC Goldへ出す | 「処理に成功した最新版」ではなく「人が現在公開すると決めたVersion」を正本化するため | File差替えだけで未承認Versionが検索公開される |
+| 文書バージョン管理台帳 | `main.llmops.document_version_registry` | Bronze／Attempt／Silver履歴で十分 | Parse／Prep／Review状態をVersion単位で追跡し、公開Pointerと技術状態を分離するため | 公開状態と処理状態が混在し、どのVersionが失敗・承認済みか分からなくなる |
+| 文書Workflow／監査履歴 | `document_workflow_requests`、`document_manifest_audit_events` | 開発者の手動操作とPoC実行記録 | 誰が申請・承認し、どのService Principalが何を変更したかを後から説明するため | 直接更新、承認者不明、変更理由不明 |
+| Search Sync Table | `main.llmops.internal_docs_search_sync` | PoC GoldをAI Searchへ直接同期してよい | Gold CurrentとAI Searchの間にCDF有効な公開境界を置き、Snapshot単位で同期内容を固定するため | Materialized Viewの変化とIndex同期状態が曖昧になる |
+| **Corpus Snapshot** | `main.llmops.corpus_snapshot_members` | 原則省略。PoC RunでCorpus VersionをTag記録 | **ある評価・Release時点で検索対象だった文書Version集合を不変IDで固定するため** | 文書更新後に過去の誤回答・評価を再現できない |
+| **Index Release** | Release ID付きAI Search Index＋Index設定 | PoC Indexを固定して比較 | Corpus、Embedding、Schema、Index設定を1つの検索Releaseとして固定するため | 同じ文書集合でもEmbedding／Index設定が変わり、検索差分の原因が分からない |
+| **RAGリリース構成台帳** | `main.llmops.rag_release_manifest`の1行 | Prompt／Index／Git等をTrace Tagへ個別記録 | **Code、Prompt、Model Route、Index、Corpus、Judge等の「評価済み組合せ」を1つのReleaseとして固定するため** | Promptだけ戻す等で、一度も評価していない新旧混在構成が本番で動く |
+| Release参照／Channel | `production`等が指す`rag_release_id` | PoCは対象候補を明示して実行 | 本番切替を個別Resourceの変更ではなくRelease IDの切替として扱うため | ロールバック時に複数Resourceを個別に戻して戻し忘れる |
+| Training／Holdout分離 | UC管理MLflow EvaluationDataset | 1つの固定PoC Datasetでもよい | 改善に使ったCaseと最終採否Caseを分け、過学習・評価リークを防ぐため | Optimizerが見たCaseでだけ高スコアになり本番品質を誤認する |
+| Realtime／Evaluation／Labeling Experiment分離 | 用途別MLflow Experiment | PoCは1 Experimentにまとめてよい | Trace保持期間、書込主体、Reviewer、UC Trace要否を用途ごとに分離するため | 本番Trace、評価Run、人手Labelが同じ権限・保持Policyに混在する |
+| Release Gate | `release_gate.py`＋Holdout／Security／SLO／Cost結果 | PoC OwnerがKPIとRiskからGo／No-Go | 本番昇格条件を機械判定可能なGuardrailにし、その上で責任者が最終承認するため | 回答品質だけを見てACL違反、Latency、コスト悪化を含むCandidateを昇格する |
+| Identity Fixture／ACL Gate | Git Fixture＋Evaluation入力 | 限定Testerと簡易ACL確認 | 権限条件を再現可能なTest入力として固定し、権限外0件をRelease条件にするため | ユーザーごとに検索可能文書が違うのに通常品質Caseだけで昇格する |
+| Service Principal職務分離 | Data Pipeline、Quality、Realtime等のSP | 開発者Identityで実行可能 | データ生成、品質判定、Release、Runtimeを同一権限にしないため | 1つのCredential侵害や誤操作で生成から承認・公開まで完結する |
+| Production Monitoring | MLflow Production Monitoring、SQL Alert、Monitoring Signal | PoC期間中にRunごと確認 | 本番では入力分布・文書・利用量・失敗が継続変化するため、Release後も異常を検知する必要がある | Release時に正常でも、その後のDrift・障害・品質低下を見逃す |
+
+**Corpus Snapshotは文書本文やChunk全体をSnapshotごとに複製するものではない。** `corpus_snapshot_id`に対して`document_id + document_version_id`のMember一覧を不変に保持し、「この時点の検索対象文書集合」を指せるようにする。
+
+```text
+corpus-2026-08-15
+  ├─ DOC-A / ver-3
+  ├─ DOC-B / ver-2
+  └─ DOC-C / ver-5
+```
+
+たとえば翌日にDOC-Bが`ver-3`へ更新されても、過去Traceの`rag.corpus_snapshot_id=corpus-2026-08-15`から、当時は`DOC-B/ver-2`を検索していたことを再現できる。MLflow Trace Tagは「そのRequestがどのSnapshotを使ったか」を記録する参照であり、Snapshot Member集合そのものの正本ではない。
+
+**RAG Releaseも同じ考え方をRAG全体へ広げたものである。** RAGはModel単体ではVersionが決まらず、Code、Prompt、Model Route、Index、Corpus、Parser／Prep、ACL Policy、Judgeの組合せで挙動が決まる。
+
+```text
+rag-release-17
+  ├─ Git Commit        = abc123
+  ├─ Answer Prompt     = prompts:/.../12
+  ├─ Model Route       = route-a
+  ├─ Index Release     = index-8
+  ├─ Corpus Snapshot   = corpus-21
+  ├─ Parse / Prep      = 2.0 / 2.0
+  ├─ ACL Policy        = acl-v4
+  └─ Judge             = judge-v7
+```
+
+このReleaseがHoldout、ACL、Latency、コスト等のGateに合格した単位である。問題が出た場合は「Promptをv12へ戻し、Indexをv8へ戻し、Corpusをv21へ戻す」のような個別復旧ではなく、**直前の`rag_release_id`へ戻す**。これにより、過去に評価していない組合せを誤って作らない。
+
+PoCでは、これらをすべて実装すると検証対象より運用基盤の構築が大きくなるため、Trace Tag、固定Dataset、固定Index、明示Prompt Versionで代替する。本番化時に、**人が覚えていなくても再現・承認・ロールバックできる状態**へ拡張するのが第4章の役割である。
+
+なお、次は本番導入時の必須Baselineではなく、運用実績から必要性が確認できた場合だけ追加する。
+
+- Reconciliation：Source移動・消失・Manifest不整合が人手で捌けなくなった場合に候補生成を自動化する。
+- Review Queue自動配送／SLA Alert：本番Traceのレビュー量が増え、手動選定では滞留する場合に導入する。
+- Prompt Optimization：Training Datasetと改善量が十分あり、手動改善の費用対効果を上回る場合に導入する。
+- Judge Alignment：同一基準の人間Feedbackが十分に蓄積し、JudgeをRelease Gate／Monitoringへ使う場合に導入する。
+
 ## 4. 本番導入時に実施するもの
 
 PoC版を捨てて作り直すのではなく、メダリオンのDataset責務を維持したまま、文書マニフェスト、文書バージョン管理台帳、Trust Boundary単位のService Principal、必要な場合の外部Scanner、公開参照、監査、Search Sync、リリース構成台帳を追加する。以下では本番用ソースファイルをPoC版とは別に掲載する。
@@ -9976,6 +10035,198 @@ Prompt エイリアス、Index名、Codeを別々に切り替えると新旧構�
 | `ai_parse_document_version`、`ai_prep_search_version`、`chunk_schema_version` | 解析・Chunk来歴 |
 | `acl_policy_version`、`judge_version` | セキュリティ／評価Policyバージョン |
 | `status`、`approved_at` | `candidate`、`production`、`retired`と承認時刻 |
+
+###### 4.3.4.6.1 RAGリリース構成台帳は「どこから」「誰が」作るか
+
+`rag_release_manifest`はMLflow Traceを後から集計して作るTableではない。**Release Pipelineが、上流で既に確定・検証された不変IDを集約して、本番実行前に1行を発行する。** 書込主体はQuality／Release JobのService Principalであり、Realtime Agentは読取専用とする。
+
+本資料では、`release_gate.py`が「この候補を採用可能か」の判定材料を作り、人の最終承認後に`publish_rag_release.py`が「承認した構成そのもの」を`main.llmops.rag_release_manifest`へInsertする。`rag_release.py`はその後のRuntime読取側であり、構成を生成しない。
+
+```mermaid
+flowchart TD
+    CI["CI/CD\nGit Commit・Build ID・Wheel"]
+    PR["Prompt Registry\n評価済み不変Prompt URI"]
+    MS["DAB / Model Service設定\nModel Service・期待Route"]
+    IDX["Search Index Job\nIndex Release・Embedding"]
+    SNAP["Search Publish Job\nCorpus Snapshot"]
+    ING["Ingestion Bundle\nParse・Prep・Chunk Schema"]
+    Q["Quality / Evaluation\nJudge・ACL Policy・Holdout結果"]
+    GATE["release_gate.py\n機械判定 + 人の最終承認"]
+    PUB["publish_rag_release.py\n検証済みIDを集約"]
+    MAN["rag_release_manifest\n1 Release = 1行"]
+    RT["rag_release.py / Realtime Agent\nRead only"]
+    TRACE["MLflow Trace\nrag.release_id等をTag記録"]
+
+    CI --> PUB
+    PR --> PUB
+    MS --> PUB
+    IDX --> PUB
+    SNAP --> PUB
+    ING --> PUB
+    Q --> GATE --> PUB
+    PUB --> MAN --> RT --> TRACE
+```
+
+各列の情報源は次のように固定する。重要なのは、`latest`、`production` Alias、現在のIndex名などを`publish_rag_release.py`がその場で推測して選ばないことである。**Evaluationで実際に使った不変値を上流Jobから受け取り、実Resourceと照合してから保存する。**
+
+| `rag_release_manifest`項目 | 正本／取得元 | 値を確定する処理 | `publish_rag_release.py`での確認 |
+| --- | --- | --- | --- |
+| `rag_release_id` | Release Pipeline | 新Candidate発行時に一意IDを生成 | 既存IDと重複しない |
+| `git_commit`、`repository_url`、`build_id` | CI/CD Build Metadata | Clean Git Build／DAB Deploy | 実行中Build metadataと一致する |
+| `common_wheel_version` | CI Build Artifact | Wheel build | Deploy済みArtifact Versionと一致する |
+| Prompt URI群 | MLflow Prompt Registry | `register_prompts.py`／Evaluationが使用した候補Version | `prompts:/<name>/<version>`形式でAliasを含まず、Resourceが存在する |
+| `model_service` | DAB変数／環境契約 | Realtime／EvaluationのModel Service設定 | Evaluation対象Serviceと一致する |
+| `expected_model_route` | Model Service Release設定 | Holdout／Smoke Test対象Route | 承認済みRouteである |
+| `multimodal_enabled` | Vision Smoke Test／Release設定 | PDF／PPTX画像入力の回帰試験 | Vision Smoke Test未合格なら`false` |
+| `search_endpoint_name`、`index_name`、`index_release_id` | `create_search_index.py`の検証済み出力 | Search Index Job | `describe()`したSource、Schema、Embedding、Snapshotと一致する |
+| `corpus_snapshot_id` | Search Publish Job | `publish_search_sync_table.py`がMember集合を固定 | `corpus_snapshot_members`に存在し、Index対象Snapshotと一致する |
+| `embedding_model`、`query_embedding_model` | AI Search Index設定 | Index Release作成時 | Index `describe()`の実設定と一致する |
+| `ai_parse_document_version`、`ai_prep_search_version`、`chunk_schema_version` | Ingestion Bundle configuration | Pipeline Deploy時 | Indexへ到達したChunkのVersion列と一致する |
+| `acl_policy_version` | Git／Security Policy設定 | ACL Regression Test | Holdout／Golden Testで使用したPolicyと一致する |
+| `judge_version` | Quality Bundle／MLflow評価 | Holdout評価・Judge Validation | Release Gateで使った承認済みJudgeと一致する |
+| `status` | Release Workflow | 発行時`candidate`、昇格後`production` | 許可された状態遷移だけを認める |
+| `approved_at` | Release承認記録 | 品質責任者／Release Manager承認時 | 未承認CandidateではNULL、本番昇格時だけ設定 |
+
+この収集は「各Systemから最新値を吸い上げるInventory処理」ではない。例えばPromptの`@production` Aliasを読んでManifestを作るのではなく、Holdout評価で実際に使用した`prompts:/.../12`をそのまま受け取る。同様に、`corpus_snapshot_id`はCurrent文書一覧から再計算せず、Search Publish Jobが固定したIDを受け取る。
+
+**Traceとの向きは逆である。**
+
+```text
+各Resourceの正本
+  ↓
+publish_rag_release.py
+  ↓
+rag_release_manifest
+  ↓
+Realtime Request
+  ↓
+MLflow Trace Tag
+  rag.release_id
+  rag.corpus_snapshot_id
+  rag.index_release_id
+```
+
+Traceは「実際にどのReleaseで動いたか」を残す監査証跡であり、RAG Release構成を後から復元して正本化するための入力ではない。
+
+`bundles/quality/src/publish_rag_release.py`
+
+**実装骨格**
+
+以下は、上流Jobが確定したCandidateを受け取り、Gate承認と不変性を確認して1行を発行する責務を示す。実運用ではJob Task Value、承認済みRelease Candidate JSON、または同等のCI/CD Artifactで値を受け渡してよいが、利用者入力から直接Release構成を作らない。
+
+```python
+from __future__ import annotations
+
+import re
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+
+import mlflow
+from pyspark.sql import SparkSession, functions as F
+
+
+MANIFEST_TABLE = "main.llmops.rag_release_manifest"
+SNAPSHOT_MEMBERS_TABLE = "main.llmops.corpus_snapshot_members"
+
+
+@dataclass(frozen=True)
+class ReleaseCandidate:
+    rag_release_id: str
+    git_commit: str
+    repository_url: str
+    build_id: str
+    common_wheel_version: str
+    sufficiency_prompt_uri: str
+    rewrite_prompt_uri: str
+    answer_prompt_uri: str
+    answer_validation_prompt_uri: str
+    model_service: str
+    expected_model_route: str
+    multimodal_enabled: bool
+    search_endpoint_name: str
+    index_name: str
+    index_release_id: str
+    corpus_snapshot_id: str
+    embedding_model: str
+    query_embedding_model: str
+    ai_parse_document_version: str
+    ai_prep_search_version: str
+    chunk_schema_version: str
+    acl_policy_version: str
+    judge_version: str
+
+
+@dataclass(frozen=True)
+class ReleaseDecision:
+    gate_passed: bool
+    approved: bool
+    approved_by: str
+    decision_id: str
+
+
+def assert_immutable_prompt(uri: str) -> None:
+    if not re.fullmatch(r"prompts:/[^/]+/[0-9]+", uri):
+        raise ValueError(f"Prompt URI must be immutable: {uri}")
+    # Aliasではなく、実在するVersionを解決できることを確認する。
+    mlflow.genai.load_prompt(uri)
+
+
+def assert_snapshot_exists(spark: SparkSession, snapshot_id: str) -> None:
+    exists = (
+        spark.table(SNAPSHOT_MEMBERS_TABLE)
+        .where(F.col("corpus_snapshot_id") == snapshot_id)
+        .limit(1)
+        .count()
+    )
+    if exists != 1:
+        raise ValueError(f"Unknown corpus_snapshot_id: {snapshot_id}")
+
+
+def publish_release(
+    spark: SparkSession,
+    candidate: ReleaseCandidate,
+    decision: ReleaseDecision,
+) -> None:
+    if not decision.gate_passed or not decision.approved:
+        raise ValueError("Release Gate and human approval are required")
+
+    prompt_uris = [
+        candidate.sufficiency_prompt_uri,
+        candidate.rewrite_prompt_uri,
+        candidate.answer_prompt_uri,
+        candidate.answer_validation_prompt_uri,
+    ]
+    for uri in prompt_uris:
+        assert_immutable_prompt(uri)
+
+    assert_snapshot_exists(spark, candidate.corpus_snapshot_id)
+
+    duplicate = (
+        spark.table(MANIFEST_TABLE)
+        .where(F.col("rag_release_id") == candidate.rag_release_id)
+        .limit(1)
+        .count()
+    )
+    if duplicate:
+        raise ValueError("rag_release_id already exists")
+
+    # Index describe、Build metadata、Judge／ACL Policyの一致は、
+    # 上流Gate結果だけを信用せず、公開直前にも再確認する。
+    # 詳細なSDK照合はcreate_search_index.py／release_gate.pyの検証関数を再利用する。
+
+    row = {
+        **asdict(candidate),
+        "status": "candidate",
+        "approved_at": datetime.now(timezone.utc),
+    }
+    spark.createDataFrame([row]).write.mode("append").saveAsTable(MANIFEST_TABLE)
+
+
+# 本番Channel切替は、この不変Recordの存在とRelease Gate証跡を確認した後に行う。
+# Realtime AgentはMANIFEST_TABLEへ書き込まず、rag_release.pyから読取るだけにする。
+```
+
+`approved_by`や`decision_id`を`rag_release_manifest`自体へ保持するか、別の意思決定記録を正本にするかは組織の監査設計で決める。本資料のRuntime契約は、実行に必要な不変構成だけを`RagRelease`へ読み込み、承認理由などの運用情報をAgent Stateへ流さない。
 
 `bundles/realtime/app/rag_release.py`
 
