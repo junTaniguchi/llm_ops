@@ -210,9 +210,500 @@ PoCの手運用は検査の省略を意味しない。実行者、対象バー�
 | Quality Case | － | 必要最低限。外部Issue Trackerを正本にしない場合は`internal_rag_quality_cases` | 高度化して継続利用 |
 | Review Case `internal_rag_review_cases` | － | － | 条件付き高度化。レビュー待ちキュー自動化時に導入 |
 | Reconciliation `document_reconciliation_candidates` | － | － | 条件付き高度化 |
-| Prompt Optimization／Judge Alignment | － | － | 条件付き高度化。MLflow Run／Prompt Resourceであり独立Tableではない |
+| Prompt Optimization／Judge Alignment | － | 原則は手動改善とJudge対Human誤差確認。Pilotで十分な同名Human／Judge Feedbackが集まり、JudgeをRelease Gateへ使う場合だけAlignment＋独立Validationを条件付き実施 | 運用実績から必要性を確認して継続高度化。Prompt OptimizationはTraining DatasetとScorer／Judgeが安定してから導入 |
 
 **読み方**：PoC図には本番用文書マニフェストを描かない。本番導入図には将来のReconciliationやReview Queue自動化を描かない。本番導入後の図で初めて、それらをBaselineへ接続する。
+
+
+
+### 2.4 LLM品質資産の成熟ライフサイクル
+
+通常の決定論的システムでは、主にCodeや設定をDevelopmentからStaging、本番へ昇格させる。一方、LLM／RAGでは、本番やPilotで得られるTraceやHuman Feedbackを使って、Evaluation Dataset、Scorer、Judge、Prompt、Retrievalを継続的に改善する必要がある。
+
+この節でいう「育てる」は、すべてを機械学習する意味ではない。
+
+- MLflow Evaluation Datasetは、評価CaseとExpectationを増やして品質基準を広げる。
+- Scorerは、新しく見つかった失敗を検出できる評価Ruleとして改善する。
+- Judgeは、Human Feedbackと比較しながら必要に応じて調整する。
+- PromptやRetrievalは、これらの評価基準を使って改善する。
+
+重要なのは、**PromptやRetrievalを先に最適化するのではなく、何を正しいとするかをEvaluation Dataset、Scorer、Judgeである程度固めてから改善する**ことである。
+
+#### 2.4.1 品質資産を育てる順序と依存関係
+
+品質資産は独立して改善するのではなく、概ね次の順序で成熟させる。
+
+```text
+1. 人が正しい評価Caseを作る
+        ↓
+2. MLflow Evaluation Datasetへ登録する
+        ↓
+3. ScorerとJudgeで品質を測れるようにする
+        ↓
+4. Human FeedbackとJudgeの判定差を確認する
+        ↓
+5. PromptやRetrievalを改善する
+        ↓
+6. 改善に使っていないCaseで最終確認する
+```
+
+実際の運用では、Prompt改善中に新しい失敗が見つかってEvaluation DatasetやScorerへ戻ることもあるため、完全なWaterfallではない。ただし、品質基準が不十分なままPrompt Optimizationを行うと、誤った評価基準へ最適化する可能性があるため、この依存順序を基本とする。
+
+| 品質資産 | 先に必要なもの | 何を改善するか | 次に使う場所 |
+| --- | --- | --- | --- |
+| MLflow Evaluation Dataset | 業務要件、Human Review | 評価CaseとExpectationのCoverage | Scorer／Judge評価、Prompt／Retrieval改善 |
+| Scorer | Evaluation Dataset、明示的な品質条件 | 検出できるFailure Mode | Evaluation、本番リリース判定 |
+| Judge | Human Feedbackと比較できるTrace | 人間の品質基準との一致度 | Evaluation、Monitoring、Prompt改善 |
+| Prompt | Evaluation Dataset＋Scorer＋必要に応じて検証済みJudge | 回答や判定の挙動 | RAG Candidate |
+| Retrieval | 期待する文書やChunk、本番に近い文書データ | 検索精度、関連性、Latency | RAG Candidate |
+
+フェーズごとの流れは次のとおりである。
+
+```mermaid
+flowchart TD
+    subgraph POC["PoC／開発初期"]
+        direction TB
+        P1["1. 業務担当者が評価Caseを作る<br/>代表質問・Edge・拒否・ACLを定義する"]
+        P2["2. MLflow Evaluation Datasetへ登録する<br/>Expectationを固定して評価基準にする"]
+        P3["3. Scorerと汎用Judgeを用意する<br/>機械判定と意味評価をできるようにする"]
+        P4["4. HumanとJudgeの判定を比較する<br/>Judgeをどこまで使えるか確認する"]
+        P5["5. 固定したCaseで候補を比較する<br/>Prompt／Retrievalを1要素ずつ改善する"]
+
+        P1 --> P2 --> P3 --> P4 --> P5
+    end
+
+    subgraph PILOT["本番導入／Pilot"]
+        direction TB
+        B1["1. PilotでMLflow Traceを集める<br/>実利用に近い質問とRAG結果を記録する"]
+        B2["2. Review Appで専門家が確認する<br/>正しい回答や問題の原因を記録する"]
+        B3["3. Review済みCaseを分ける<br/>改善用と最終評価用を分離する"]
+        B4["4. HumanとJudgeの判定を比較する<br/>Judgeが人間の基準と合うか確認する"]
+        B5["5. 必要ならJudge Alignmentを行う<br/>Human Feedbackに近いJudgeへ改善する"]
+        B6["6. 改善に使っていないCaseでJudgeを確認する"]
+        B7["7. 新しい失敗をScorerへ反映する<br/>同じ問題を検出できる評価を追加する"]
+        B8["8. Evaluation Datasetで候補を比較する<br/>PromptやRetrievalを改善する"]
+        B9["9. Stagingで本番に近いRAGを用意する<br/>文書とAI Searchを使って結合テストする"]
+        B10["10. 未使用Case等で最終確認する<br/>本番へリリースできるか判断する"]
+
+        B1 --> B2
+        B2 --> B3
+        B2 --> B4 --> B5 --> B6
+        B2 --> B7
+        B3 --> B8
+        B6 --> B8
+        B7 --> B8
+        B8 --> B9 --> B10
+        B3 --> B10
+    end
+
+    subgraph PROD["本番導入後"]
+        direction TB
+        O1["1. Production MonitoringでTraceを集める<br/>実質問・RAG結果・品質Signalを継続記録する"]
+        O2["2. Review Appで専門家が確認する<br/>正しい回答・問題の原因・優先度を記録する"]
+        O3["3. Review済みCaseをEvaluation Datasetへ追加する<br/>新しい失敗を回帰テストへ変える"]
+        O4["4. 必要ならJudge Alignmentを行う<br/>Human Feedbackとの差を使ってJudgeを改善する"]
+        O5["5. 本番で見つかった失敗をScorerへ反映する<br/>同じ問題を検出できる評価を追加する"]
+        O6["6. Evaluation Datasetで候補を比較する<br/>Prompt／Retrievalを改善し必要時に最適化する"]
+        O7["7. Stagingで本番に近いRAGを再現する<br/>文書とAI Searchを使って結合テストする"]
+        O8["8. 改善に使っていないCaseで最終確認する<br/>本番へリリースできるか判断する"]
+        O9["9. 合格した構成を本番へ反映する<br/>新しい構成で次のTraceを蓄積する"]
+
+        O1 --> O2
+        O2 --> O3
+        O2 --> O4
+        O2 --> O5
+        O3 --> O6
+        O4 --> O6
+        O5 --> O6
+        O6 --> O7 --> O8
+        O8 -->|合格| O9 --> O1
+        O8 -->|不合格| O6
+    end
+
+    POC --> PILOT --> PROD
+```
+
+#### 2.4.2 フェーズ別の成熟方針
+
+| 品質資産 | PoC／開発時 | 本番導入／Pilot時 | 本番導入後 |
+| --- | --- | --- | --- |
+| Evaluation Dataset | 人が代表Caseを作り、固定した評価基準を作る | Pilot TraceからReview済みCaseを追加し、改善用と最終評価用を分ける | Production Traceから新しい失敗Caseを継続追加する |
+| Judge | 汎用Judgeを使い、Humanとの判定差を確認する | Human Feedbackが十分に集まった場合だけJudge Alignmentを行い、別Caseで確認する | Production ReviewでHumanとの差を監視し、必要時に再調整する |
+| Scorer | 期待文書、出典、拒否、ACL等の基本的な評価を実装する | Pilotで見つかった失敗を検出できる評価を追加する | Productionで見つかった新しい失敗を回帰テストへ追加する |
+| Prompt | 固定Caseを使って手動で改善する | Evaluation Dataset、Scorer、Judgeが安定した後に必要ならPrompt Optimizationを試す | 成熟した評価基準を使って継続改善する |
+| Retrieval | 少量の文書で検索方式やChunk設定を比較する | Stagingで本番に近い文書とAI Searchを使って確認する | Production FailureをStagingで再現して改善する |
+| 本番リリース判定 | PoC KPIとRiskでGo／No-Goを決める | 改善に使っていないCaseとSecurity／Latency／Cost等で判断する | 同じ基準を継続利用し、必要に応じてカナリアテスト等を追加する |
+
+#### 2.4.3 PoC／開発時：人が品質Baselineを作る
+
+PoCではProduction Traceが存在しないため、品質資産の出発点は人が作る。業務代表質問、回答不能、略語、複数文書統合、旧版競合、ACL、Prompt Injection等を評価CaseとしてMLflow Evaluation Datasetへ登録し、期待回答、期待文書、期待Chunk、期待拒否等を可能な範囲で明示する。
+
+Judgeは最初から正解器として扱わず、汎用Judgeの判定をHuman Assessmentと比較する。決定論で判定できるExpected Document Recall、Citation、ACL、Schema、拒否条件等はScorerで評価する。
+
+Promptは固定したEvaluation Datasetを使って1要素ずつ手動で改善する。この段階ではEvaluation Dataset、Scorer、Judge自体がまだ成熟していないため、Prompt Optimizationを必須にしない。
+
+```mermaid
+flowchart TD
+    REQUIRE["業務担当者が評価Caseを作る<br/>代表質問と想定Failureを定義する"]
+    SEED["MLflow Evaluation Datasetへ登録する<br/>期待回答・期待文書・拒否条件を固定する"]
+    BASE_SCORER["Scorerで機械判定を実装する<br/>Retrieval・Citation・ACL・拒否を評価する"]
+    GENERIC_JUDGE["汎用Judgeで意味品質を評価する<br/>Correctness等を確認する"]
+    HUMAN["MLflow Assessmentで人が評価する<br/>Judge比較用の基準を作る"]
+    CAL["HumanとJudgeの判定差を確認する<br/>Judgeをどこまで使えるか判断する"]
+    PROMPT["Promptを手動で修正する<br/>1要素ずつCandidateを作る"]
+    EVAL["mlflow.genai.evaluate()で固定Caseを評価する<br/>Scorer／Judgeの結果を比較する"]
+    POC["PoCの品質Baselineを確定する<br/>Dataset・Scorer・Judge・Promptを記録する"]
+
+    REQUIRE --> SEED
+    REQUIRE --> BASE_SCORER
+    GENERIC_JUDGE --> CAL
+    HUMAN --> CAL
+    SEED --> EVAL
+    BASE_SCORER --> EVAL
+    CAL --> EVAL
+    PROMPT --> EVAL
+    EVAL -->|改善| PROMPT
+    EVAL -->|PoC完了| POC
+```
+
+PoC完了時の成果は「最適なPrompt」だけではない。Evaluation Dataset、Scorer、Judge、Trace、Promptを一組の品質Baselineとして残す。
+
+#### 2.4.4 本番導入／Pilot時：実利用に近いTraceで品質基準を校正する
+
+本番導入時は、PoCで作った品質Baselineを捨てず、Pilotで得た実利用に近いTraceを使って現実の質問分布とFailure Modeへ校正する。
+
+Pilot Traceはそのまま改善用データにはしない。Review Appで専門家が内容を確認し、Feedback、Expectation、問題の原因を付ける。そのうえで、**改善に使うCaseと最終評価に使うCaseを分ける**。
+
+JudgeはHuman Feedbackと判定差を確認し、十分なFeedbackがあり、業務上必要な場合だけJudge Alignmentを行う。Judgeを改善した場合は、Alignmentに使っていないCaseで確認する。
+
+```mermaid
+flowchart TD
+    BASE["PoCで作った品質Baselineを引き継ぐ"]
+    PILOT["本番に近い文書とAI SearchでPilot運用する"]
+    TRACE["MLflow Traceで検索結果・回答・Judge結果を記録する"]
+    REVIEW["Review Appで専門家が正解と問題の原因を付ける"]
+    SPLIT["Review済みCaseを<br/>改善用と最終評価用に分ける"]
+    JDIFF["HumanとJudgeの判定を比較する"]
+    JALIGN{"Judge Alignmentが必要か判断する"}
+    JCAND["必要ならJudge Alignmentを行う"]
+    JVALID["改善に使っていないCaseでJudgeを確認する"]
+    IMPROVE["Evaluation Datasetで<br/>Prompt・Retrieval・Scorerを改善する"]
+    STG["Stagingで本番に近い文書とAI Searchを使い<br/>RAG全体を結合テストする"]
+    FINAL["未使用Case等で最終確認する"]
+    DECIDE{"本番へリリースできるか判断する"}
+    PROD["合格した構成を本番へ反映する"]
+    BACK["不合格理由をDevelopmentへ戻す"]
+
+    BASE --> PILOT --> TRACE --> REVIEW
+    REVIEW --> SPLIT
+    REVIEW --> JDIFF --> JALIGN
+    JALIGN -->|必要| JCAND --> JVALID
+    JALIGN -->|不要| IMPROVE
+    SPLIT --> IMPROVE
+    JVALID --> IMPROVE
+    IMPROVE --> STG --> FINAL --> DECIDE
+    DECIDE -->|合格| PROD
+    DECIDE -->|不合格| BACK --> IMPROVE
+```
+
+このフェーズの目的は、**PoCで作った評価基準を実データに合わせて校正し、本番に出す前にRAG全体の評価方法を確立すること**である。
+
+#### 2.4.5 本番導入後：Production Traceを継続改善へ使う
+
+本番導入後は、Productionが次の改善に必要なTraceを生成する環境になる。ただし、Production TraceからJudge、Evaluation Dataset、Promptを自動的に本番更新するわけではない。
+
+本番で見つかった問題はReview Appで専門家が確認し、Evaluation Dataset、Scorer、Judgeの改善材料へ変える。DevelopmentでCandidateを作り、Stagingで本番に近いRAGを使って結合テストし、合格した構成だけを本番へ戻す。
+
+```mermaid
+flowchart TD
+    PROD["本番RAGで業務ユーザーの質問へ回答する"]
+    TRACE["Production MonitoringとMLflow Traceで<br/>実行結果と品質Signalを記録する"]
+    REVIEW["Review Appで専門家が確認し<br/>正しい回答・問題の原因・優先度を付ける"]
+    DATA["Review済みCaseをEvaluation Datasetへ追加する"]
+    JUDGE["必要ならJudge Alignmentを行い<br/>Human Feedbackとの一致を改善する"]
+    SCORER["新しい失敗を検出できるScorerを追加する"]
+    DEV["Evaluation Datasetを使って<br/>Prompt／Retrievalを改善する"]
+    STG["Stagingで本番に近い文書とAI Searchを使い<br/>Candidate RAGを結合テストする"]
+    FINAL["改善に使っていないCaseで最終確認する"]
+    RELEASE["合格した構成を本番へ反映する"]
+
+    PROD --> TRACE --> REVIEW
+    REVIEW --> DATA
+    REVIEW --> JUDGE
+    REVIEW --> SCORER
+    DATA --> DEV
+    JUDGE --> DEV
+    SCORER --> DEV
+    DEV --> STG --> FINAL
+    FINAL -->|合格| RELEASE --> PROD
+    FINAL -->|不合格| DEV
+```
+
+本番導入後は、**Production Trace → Human Review → Evaluation Dataset／Scorer／Judge改善 → Prompt／Retrieval改善 → Staging評価 → 本番**というCycleを継続する。
+
+#### 2.4.6 Judge AlignmentとPrompt Optimizationの関係
+
+Judge AlignmentとPrompt Optimizationは目的が異なる。
+
+Judge Alignmentは、Human FeedbackとJudgeの判定差を使って、Judgeを人間の品質基準へ近づけるために行う。
+
+```text
+Human FeedbackとJudgeの判定を比較する
+        ↓
+必要ならJudge Alignmentを行う
+        ↓
+改善に使っていないCaseでJudgeを確認する
+        ↓
+確認済みJudgeをEvaluationへ利用する
+```
+
+Prompt Optimizationは、Evaluation Dataset、Scorer、必要に応じて確認済みJudgeを使って、Prompt Candidateを改善する。
+
+```text
+MLflow Evaluation Dataset
++ Scorer
++ 必要に応じて確認済みJudge
+        ↓
+Prompt OptimizationでPrompt Candidateを比較・改善する
+        ↓
+StagingでRAG全体を結合テストする
+        ↓
+改善に使っていないCaseで最終確認する
+        ↓
+本番へリリースできるか判断する
+```
+
+GEPA等のOptimizerを使う場合も、**Evaluation Dataset、Scorer、Judgeの品質がPrompt Optimizationの前提になる**。評価基準が不安定な段階で自動最適化を強く回さない。
+
+後続章では、第3章でPoCの評価Baseline、第4章で本番導入時の評価とStaging検証、第5章でProduction Traceを使った継続改善を具体的なTable、Job、権限、コードへ展開する。
+
+
+
+### 2.5 開発・Staging・本番間のデータ還流
+
+LLM／RAGでは、Source CodeだけをDevelopmentからStaging、本番へ昇格させても継続改善できない。本番で初めて見つかる実質問、取得文書、誤回答、Judgeの誤判定、文書の公開状態、ACL条件等を、次の開発へ戻す必要がある。
+
+ただし、すべての本番データをDevelopmentへコピーする必要はない。
+
+- **Development**では、本番Traceから作った評価用Caseを使って、Scorer、Judge、Prompt、Codeを改善する。
+- **Staging**では、本番に近い文書データとAI Searchを用意し、RAG全体を結合テストする。
+- **Production**では、実利用Traceを収集し、専門家レビューを通じて次の改善材料を作る。
+
+したがって、全体は **Production → Development → Staging → 本番リリース判定 → Production** の順に回す。
+
+#### 2.5.1 環境間データ還流の全体手順
+
+```mermaid
+flowchart TD
+    subgraph PROD1["① 本番環境：改善材料を作る"]
+        direction TB
+        P1["本番RAGで業務ユーザーの質問へ回答する"]
+        P2["MLflow Traceで質問・取得文書・回答・Judge結果を記録する"]
+        P3["Review Appで専門家が結果を確認し<br/>Feedback・Expectation・原因を付ける"]
+        P4["開発へ戻す評価用Caseと<br/>Stagingで再現する本番データを決める"]
+        P1 --> P2 --> P3 --> P4
+    end
+
+    subgraph DEV["② 開発環境：Scorer・Judge・Promptを改善する"]
+        direction TB
+        D1["Review済みCaseを<br/>MLflow Evaluation Datasetへ登録する"]
+        D2["固定したTraceとExpectationで<br/>Scorerを単体テストする"]
+        D3["Human Feedbackと比較しながら<br/>Judgeを検証・必要時に調整する"]
+        D4["評価結果を見ながら<br/>Prompt・Code・Retrieval設定を改善する"]
+        D1 --> D2 --> D3 --> D4
+    end
+
+    subgraph STG["③ ステージング環境：RAG全体を結合テストする"]
+        direction TB
+        S1["本番Delta Tableから必要な文書を<br/>Staging用Delta Tableへコピーする"]
+        S2["Staging用Delta Tableから<br/>AI SearchのDelta Sync Indexを新規作成する"]
+        S3["本番の公開状態やACL条件も<br/>Staging用データとして再現する"]
+        S4["Developmentで作ったCandidateを配備し<br/>実検索→回答→Scorer／Judgeまで実行する"]
+        S5["未使用CaseとSecurity・Latency・Costで<br/>本番へ出せるか確認する"]
+
+        S1 --> S2
+        S2 --> S4
+        S3 --> S4
+        S4 --> S5
+    end
+
+    subgraph PROD2["④ 本番環境：合格した構成だけを反映する"]
+        direction TB
+        R1["Stagingで評価したCode・Prompt・検索設定を<br/>同じ組合せのまま本番へ配備する"]
+        R2["新しい構成で本番運用し<br/>次のMLflow Traceを蓄積する"]
+        R1 --> R2
+    end
+
+    P4 -->|"評価用Caseを連携"| D1
+    P4 -->|"本番文書・公開状態を連携"| S1
+    P4 -->|"公開状態・ACL条件を連携"| S3
+    D4 -->|"Candidateを配備"| S4
+    S5 -->|"合格"| R1
+    S5 -->|"不合格"| D4
+    R2 --> P2
+```
+
+この図のポイントは、**DevelopmentとStagingで役割が違う**ことである。
+
+- Developmentでは「このTraceをScorerが正しく評価できるか」「このPromptの方が良いか」を確認する。
+- Stagingでは「新しいRAGを本番に近い文書とAI Searchで実際に動かしても良くなるか」を確認する。
+
+#### 2.5.2 Scorer開発で実際のRAGデータが必要な場合と不要な場合
+
+Scorerそのものの単体テストでは、必ずしも実際のAI Searchを動かす必要はない。
+
+本番のMLflow Traceに質問、取得文書、回答が保存され、Review App等でExpectationが付いていれば、それらを固定入力としてScorerへ渡せる。
+
+例えば、
+
+```text
+質問
+取得された文書
+RAGの回答
+期待する回答
+期待する文書
+```
+
+があれば、
+
+```text
+期待する文書が取得できているか
+回答に出典があるか
+回答内容が期待値と合っているか
+```
+
+といったScorerの判定ロジックはDevelopmentでテストできる。
+
+一方、Retrieval設定を変更して、
+
+> 「新しい設定なら、本当に期待する文書が上位に取得されるか」
+
+を確認する場合は、固定された取得結果では確認できない。Stagingで実際の文書データとAI Searchを使って検索を実行する必要がある。
+
+| 確認内容 | 実際のCorpus／AI Search | 主な環境 |
+| --- | --- | --- |
+| Scorerの判定ロジックが正しいか | 原則不要 | Development |
+| JudgeがHuman Feedbackと合うか | 原則不要 | Development |
+| Prompt変更で固定Caseの回答が改善するか | Retrieval結果を固定するなら不要 | Development |
+| Retrieval設定変更で取得文書が改善するか | 必要 | Staging |
+| RAG全体が本番に近い条件で正しく動くか | 必要 | Staging |
+
+したがって、
+
+> **Development = 固定した本番事例を使って品質ロジックを作る**  
+> **Staging = 本番に近いデータでRAGを実際に動かして確認する**
+
+と整理する。
+
+#### 2.5.3 本番からDevelopmentへ何を連携するか
+
+本番のRaw DataをそのままDevelopmentへ複製するのではなく、専門家が確認した評価用Caseを連携する。
+
+主に次を使う。
+
+| Databricks／MLflowの機能 | 何に使うか |
+| --- | --- |
+| MLflow Trace | 実質問、取得結果、回答等の実行履歴を残す |
+| Assessment | Human FeedbackやExpectationをTraceへ付ける |
+| Review App／Labeling Session | 専門家が本番Traceをレビューする |
+| MLflow Evaluation Dataset | Review済みCaseをDevelopmentで再利用できる評価データとして保存する |
+
+流れは次のとおりである。
+
+```mermaid
+flowchart TD
+    T["MLflow Traceに本番の質問・検索・回答を記録する"]
+    R["Review Appで専門家が結果を確認し<br/>FeedbackとExpectationを付ける"]
+    E["Review済みCaseを<br/>MLflow Evaluation Datasetへ登録する"]
+    D["DevelopmentでScorer・Judge・Prompt改善に使う"]
+
+    T --> R --> E --> D
+```
+
+機密情報が含まれる場合は、Developmentへ渡す前に不要な本文や個人情報を除外・Maskingする。
+
+#### 2.5.4 本番からStagingへDelta TableとAI Searchをどう連携するか
+
+RAG全体をテストする場合、Stagingには本番に近い文書と検索状態が必要になる。
+
+基本的な流れは次のとおりである。
+
+```mermaid
+flowchart TD
+    P["本番で検索対象になっている文書を確認する"]
+    D["必要な行を本番Delta Tableから取得し<br/>Staging用Delta Tableへコピーする"]
+    A["Staging用Delta TableをSourceにして<br/>AI SearchのDelta Sync Indexを新規作成する"]
+    S["Delta Sync Indexを同期し<br/>Stagingで検索できる状態にする"]
+    T["Candidate RAGを実際に動かして<br/>結合テストする"]
+
+    P --> D --> A --> S --> T
+```
+
+**AI Search Indexそのものを本番からStagingへコピーするのではない。**
+
+Databricks AI SearchのDelta Sync IndexはDelta TableをSourceとして作成するため、次のように考える。
+
+```text
+本番Delta Table
+        ↓
+必要な文書をStaging用Delta Tableへコピー
+        ↓
+Staging用Delta TableからAI Search Indexを新規作成
+        ↓
+Sync
+        ↓
+StagingでRAGを実行
+```
+
+同じUnity Catalog Metastore内で環境を分けている場合は、SQLやJobで本番Delta Tableから必要な行をStaging用Delta Tableへコピーできる。
+
+別のUnity Catalog Metastoreへ連携する場合は、Delta Sharing等を使って本番側のDelta Tableを共有し、Staging側で必要なデータをDelta Tableとして保持する。
+
+StagingではAI Search Indexを作成するときに、本番と同じEmbedding Model、同期対象列、Primary Key等の設定を使う。本番AI Searchそのものを移すのではなく、**同じ条件でStaging用AI Searchを作り直す**。
+
+また、検索結果は文書本文だけでなく公開状態やACLにも影響される。そのため、本番で公開されていた文書Versionや有効／無効状態、ACL条件も、Stagingで同じ検索結果になる範囲で再現する。
+
+2章ではこの原則だけを押さえ、具体的なTable名、列名、コピー用SQL、管理用IDは本番実装を説明する後続章で扱う。
+
+#### 2.5.5 StagingからProductionへ戻すもの
+
+Stagingで確認したCode、Prompt、Judge、Scorer、Retrieval設定を、別々のタイミングで本番へ変更しない。
+
+Stagingでテストした**同じ組合せ**を本番へ配備する。
+
+```mermaid
+flowchart TD
+    S["StagingでRAG全体を評価する"]
+    J{"品質・Security・Latency・Costが<br/>本番基準を満たすか確認する"}
+    P["合格したCode・Prompt・検索設定を<br/>同じ組合せでProductionへ配備する"]
+    B["不合格ならDevelopmentへ戻して修正する"]
+
+    S --> J
+    J -->|"合格"| P
+    J -->|"不合格"| B
+```
+
+これにより、Stagingでは評価していないPromptとAI Search設定の組合せが、本番で初めて作られることを防ぐ。
+
+#### 2.5.6 本番データをStagingへ出せない場合
+
+機密性や規制上の理由で、本番文書をStagingへコピーできない場合もある。
+
+その場合はデータを移動せず、Developmentで作ったCandidateを本番側の隔離された評価環境で実行する。
+
+```mermaid
+flowchart TD
+    D["DevelopmentでCandidateを作る"]
+    P["本番データを利用できる<br/>隔離された評価環境へCandidateを配備する"]
+    E["Realtime利用者には出さず<br/>本番データでOffline評価する"]
+    R["評価結果だけを本番リリース判定へ使う"]
+
+    D --> P --> E --> R
+```
+
+この方式でも、未評価のCandidateをRealtime利用者へ直接出すことはしない。
+
+第3章以降では、ここで示した流れを各フェーズの具体的なTable、Job、権限、コードへ展開する。
 
 
 ## 3. PoC時に実施するもの
@@ -2504,28 +2995,34 @@ PoCでは「一連の処理が動いたか」だけでなく、どのコンポ�
 | `PLATFORM` | 429、Timeout、同期遅延、Service障害 | 再試行、Capacity、Runbook |
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph MF["MLflow"]
+        direction TB
         TRACE["Trace・Scorer・Feedback"]
         EXPECT["MLflow Expectation"]
         DATASET["EvaluationDataset"]
     end
     subgraph QJ["Quality Job／Databricks SQL"]
+        direction TB
         SIGNAL["監視検知イベント"]
         TRIAGE["識別子・重複排除・暫定分類"]
         GROUP["失敗原因グループ候補"]
     end
     subgraph HUMAN["人によるレビュー"]
+        direction TB
         REVIEW["正解・根本原因・業務影響を確定"]
         PRIORITY["優先順位・改善対象・採否を決定"]
     end
     subgraph ISSUE["Quality Case／外部Issue Tracker"]
+        direction TB
         CASE["担当・状態・期限を追跡"]
     end
     subgraph GIT["Git管理の修正"]
+        direction TB
         EDIT["Python／SQL／Prompt／文書を変更"]
     end
     subgraph EVALUATION["評価・リリース"]
+        direction TB
         REEVAL["Evaluation Run"]
         HOLDOUT["未使用Holdout・リリース判定"]
         DEPLOY["デプロイ・カナリア検証"]
@@ -4912,7 +5409,7 @@ flowchart TD
 本番導入時の基本方針は、**異なるTrust Boundaryを持つ処理だけService Principalを分離する**ことである。Service Principalは多ければ多いほどよいわけではない。分割は最小権限、Credential侵害時の影響範囲縮小、職務分離、所有組織の分離、監査、規制対応に効く一方で、Identity管理、Workspace Assignment、UC Grant、DAB変数、Terraform Output、Federation、退役、障害調査のコストを増やす。
 
 ```mermaid
-flowchart LR
+flowchart TD
     PD["Platform / Deploy<br/>IaC・Deploy・Migration"]
     DW["Document Workflow SP<br/>文書UI・単一Workflow Request"]
     ME["Manifest Executor SP<br/>検証済み人間操作の反映"]
@@ -13920,6 +14417,8 @@ RAGでは、低品質の原因を「文書不足」「文書解析・Chunk不良
 
 
 #### 5.2 本番証跡をDev／Stagingへ安全に還流する
+
+第2.5節ではProduction → Development → Staging → Release Gate → Productionという順序で、品質Case、RAGデータ、統制データ、Candidate Artifactの環境間還流を整理した。本節では、その設計を本番導入後のQuality Job、Review Case、EvaluationDataset、Replay Assetとして具体化する。
 
 本番で初めて判明した誤回答、検索失敗、ACL疑義、Judge不一致は、開発環境やStagingで再現・改善できなければ継続改善へつながらない。一方で、本番Trace、実利用者Identity、業務文書、顧客識別子等をそのままDevへ複製すると、環境分離・最小権限・機密データ管理を崩す。
 
