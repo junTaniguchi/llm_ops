@@ -3241,7 +3241,95 @@ PoC Ownerは、処理成功だけではなく、次の成果物が揃い、業�
 
 PoCの目的は、限定したデータ・利用者・評価Caseで「RAGとして成立するか」「どこが品質を制約するか」を確認することである。この段階では、担当者が実行時のPrompt、Index、文書集合、Git Commitを把握し、MLflow Trace／Evaluation Runへ記録できれば比較は成立する。
 
-本番では前提が変わる。文書、Prompt、Index、Code、Model Routeが独立して更新され、複数利用者が継続利用し、障害・誤回答・監査時に「そのRequestは何を使って動いたか」を後から再現する必要がある。このため、PoCでは省略した**現在状態の正本、変更履歴、不変Snapshot、Release単位、継続監視**を追加する。
+本番では前提が変わる。文書、Prompt、Index、Code、Model Routeが独立して更新され、複数利用者が継続利用し、障害・誤回答・監査時に「そのRequestは何を使って動いたか」を後から再現する必要がある。このため、まずMLflow Trace Tagへ実行条件を特定できる参照情報を残し、その参照先としてPoCでは省略した**現在状態の正本、変更履歴、不変Snapshot、Release単位、継続監視**を追加する。
+
+
+##### まず理解する：本番Trace Tagは「そのRequestが何を使ったか」を指す
+
+本番導入時に最初に理解するべきことは、**MLflow Trace Tagへすべての設定内容を直接保存するわけではない**という点である。
+
+Trace Tagには、そのRequestで実際に使ったCode、検索状態、Model等を後から特定できる**参照情報**を残す。Promptの本文、検索対象文書の全一覧、AI Searchの全設定等の詳細は、それぞれの管理資産側で保持する。
+
+```mermaid
+flowchart TD
+    REQ["RAGの1回のRequestを実行する"]
+
+    TRACE["MLflow Trace Tagへ<br/>そのRequestで使った構成の参照情報を残す"]
+
+    CODE["Git Commit／Build Versionを残す<br/>どのCodeで動いたかを特定する"]
+    SEARCH["AI Searchを特定する情報を残す<br/>どの検索構成で動いたかを特定する"]
+    CORPUS["検索対象の文書集合を特定する情報を残す<br/>どの時点のCorpusを使ったかを特定する"]
+    MODEL["Model Service／Routeを残す<br/>どのModel経路で推論したかを特定する"]
+    ACL["ACL Policy Versionを残す<br/>どの権限制御条件で検索したかを特定する"]
+    RELEASE["RAG Releaseを特定する情報を残す<br/>評価済みのCode・Prompt・Search等の組合せへ辿る"]
+
+    PROMPT["Prompt Registry<br/>Prompt Versionと本文を管理する"]
+    CORPUS_M["Corpus Snapshot<br/>その時点の文書Version集合を管理する"]
+    INDEX_M["AI SearchのRelease情報<br/>Embedding・Schema・Index設定を管理する"]
+    RELEASE_M["RAGリリース構成台帳<br/>評価済みの構成の組合せを管理する"]
+
+    REQ --> TRACE
+    TRACE --> CODE
+    TRACE --> SEARCH
+    TRACE --> CORPUS
+    TRACE --> MODEL
+    TRACE --> ACL
+    TRACE --> RELEASE
+
+    RELEASE --> RELEASE_M
+    RELEASE_M --> PROMPT
+    RELEASE_M --> INDEX_M
+    RELEASE_M --> CORPUS_M
+```
+
+この関係は、次のように整理すると分かりやすい。
+
+> **MLflow Trace Tag = 「このRequestで何を使ったか」を特定するための目次**  
+> **管理資産 = 「そのVersionの中身は何か」を保持する正本**
+
+そのため、Trace Tagへ残す情報は「後から実行条件を再現するために必要な最小限の識別情報」とする。
+
+| 分類 | Trace Tagで直接残す情報 | 何を特定するためか | 詳細情報の正本 |
+| --- | --- | --- | --- |
+| Release | RAG Releaseを特定するID | 評価済みのCode・Prompt・Search・Corpus等の組合せ | RAGリリース構成台帳 |
+| Code | Git Commit、Build ID／Version | どのSource Code／Buildで動いたか | Git／Build Artifact |
+| Corpus | Corpus Snapshotを特定するID | どの文書Version集合を検索対象にしたか | Corpus Snapshot |
+| Search | AI Search Index／検索Releaseを特定するID | どのIndex、Embedding、Schema、検索設定だったか | AI Search設定、Index Release |
+| Model | Model Service、Route | どの生成Model経路で推論したか | Model Service設定 |
+| ACL | ACL Policy Version | どの権限制御条件で検索したか | ACL Policy／権限管理 |
+| Prompt | 原則はRAG ReleaseからPrompt Versionへ辿る | どのPromptで回答したか | MLflow Prompt Registry |
+
+Promptについては、PoCでは比較を単純にするためPrompt VersionをTraceへ直接記録する。本番ではRAG ReleaseからPrompt Versionへ辿れるため、Release参照を正本とする。ただし、障害調査でPrompt Versionを頻繁に確認する場合は、**検索性を高めるためPrompt VersionをTrace Tagへ冗長保持してもよい**。この場合もPrompt本文の正本はMLflow Prompt Registryであり、Trace Tagを正本にはしない。
+
+現在の本番Runtime実装では、Root Traceへ主に次のような再現性情報を保存する。
+
+```text
+RAG Release
+Git Commit / Build ID
+Corpus Snapshot
+AI Search Index / Index Release
+Embedding Model
+Model Service / Model Route
+Parse / Prep / Chunk Schema Version
+ACL Policy Version
+```
+
+ここで重要なのは、**文書マニフェスト、文書バージョン管理台帳、Search Sync Table等の全内容をTrace Tagへ入れる必要はない**ことである。これらは「現在どの文書を公開するか」「各文書Versionがどの状態か」を管理する正本であり、TraceからCorpus／Search／Releaseを特定できれば必要な情報へ辿れる。
+
+逆に、Trace TagへReleaseやCorpus、Searchを特定する情報が残っていないと、後から「同じPromptだったが文書が変わったのか」「同じ文書だったがEmbedding／Index設定が変わったのか」「Code自体が変わったのか」を切り分けにくくなる。
+
+##### Trace Tagと本番管理資産の役割分担
+
+以降に説明する本番管理資産は、すべてTrace Tagへ保存するためのものではない。役割は大きく3種類に分かれる。
+
+| 役割 | 主な管理資産 | Traceとの関係 |
+| --- | --- | --- |
+| Requestの実行条件を再現する | Corpus Snapshot、Index Release、RAGリリース構成台帳 | Trace Tagから参照して「何を使ったか」を復元する |
+| 現在の公開状態を統制する | 文書マニフェスト、文書バージョン管理台帳、Search Sync Table | Traceへ全内容は保存せず、Corpus／Searchの正しい状態を作るために使う |
+| 品質・運用を統制する | Evaluation Dataset、Release Gate、Identity Fixture、Production Monitoring | Release前後の品質確認や継続監視に使い、必要な結果だけTrace／Evaluationへ残す |
+
+この全体像を理解したうえで、以下では各管理資産について「なぜ本番で必要になるか」を個別に説明する。
+
 
 ここで重要なのは、各資産の説明を「何を管理するか」だけで終わらせず、**実装しない場合に本番で何が困るか**まで理解することである。次表では、PoCでの代替方法、本番で必要になる理由、未実装時の具体的な問題、導入上の位置づけをまとめる。
 
