@@ -548,50 +548,111 @@ flowchart TD
 - Developmentでは「このTraceをScorerが正しく評価できるか」「このPromptの方が良いか」を確認する。
 - Stagingでは「新しいRAGを本番に近い文書とAI Searchで実際に動かしても良くなるか」を確認する。
 
-#### 2.5.2 Scorer開発で実際のRAGデータが必要な場合と不要な場合
+#### 2.5.2 Trace、Evaluation Dataset、Corpusの役割を分けて理解する
 
-Scorerそのものの単体テストでは、必ずしも実際のAI Searchを動かす必要はない。
+DevelopmentでCorpusなしにScorerをテストできる理由は、Evaluation DatasetがCorpusの代わりになるからではない。
 
-本番のMLflow Traceに質問、取得文書、回答が保存され、Review App等でExpectationが付いていれば、それらを固定入力としてScorerへ渡せる。
+**Productionで一度RAGを実行したときの結果がMLflow Traceへ保存されており、DevelopmentではRAGを再実行せず、その保存済みTraceに対してScorerだけを再実行できるからである。**
 
-例えば、
+通常のRAG実行では、次の処理が必要になる。
 
 ```text
 質問
-取得された文書
-RAGの回答
-期待する回答
-期待する文書
+  ↓
+Corpus／AI Search
+  ↓
+取得文書
+  ↓
+LLM
+  ↓
+回答
 ```
 
-があれば、
+Productionでこの処理を一度実行すると、MLflow Traceには質問、最終回答だけでなく、Tracingしている範囲ではRetriever Span、取得文書、Tool Call等の中間実行結果も残る。
 
-```text
-期待する文書が取得できているか
-回答に出典があるか
-回答内容が期待値と合っているか
+そのためDevelopmentでは、次のように**過去の実行結果をTest Fixtureとして再利用**できる。
+
+```mermaid
+flowchart TD
+    PROD["ProductionでRAGを一度実行する"]
+    TRACE["MLflow Traceへ<br/>質問・取得文書・回答・中間Spanを保存する"]
+    REVIEW["Review Appで専門家が確認し<br/>Feedback／Expectationを付ける"]
+
+    DEV["Developmentで保存済みTraceを取得する"]
+    SCORER["新しいScorer／Judgeだけを実行する"]
+    RESULT["期待どおりに採点できるか確認する"]
+
+    PROD --> TRACE --> REVIEW
+    REVIEW --> DEV --> SCORER --> RESULT
 ```
 
-といったScorerの判定ロジックはDevelopmentでテストできる。
+この経路ではAI Searchを再実行しないため、DevelopmentへCorpusを持ってくる必要がない。
 
-一方、Retrieval設定を変更して、
+これは、外部APIを呼ぶロジックのUnit Testで、毎回本番APIへ接続せず、過去に取得したResponseをFixtureとして使う考え方と同じである。
 
-> 「新しい設定なら、本当に期待する文書が上位に取得されるか」
+##### Evaluation Datasetは「正式な回帰テストCase」を管理する
 
-を確認する場合は、固定された取得結果では確認できない。Stagingで実際の文書データとAI Searchを使って検索を実行する必要がある。
+MLflow Evaluation Datasetは、Production Traceそのものを置き換えるものではない。
 
-| 確認内容 | 実際のCorpus／AI Search | 主な環境 |
+大量のProduction Traceを闇雲にEvaluation Datasetへ追加するのではない。まずMLflow Evaluation／Monitoringの結果から品質低下しているSliceやFailure Familyを特定し、その条件に対応するTraceをTagやAssessment等で絞り込む。さらに同じ問題の大量重複を避けるため代表CaseをSamplingし、Review AppでHuman Reviewして正解条件を確定したCaseだけを、`inputs`、`expectations`、必要に応じて既存`outputs`、Source、Tagを持つ**再利用可能なテストSuite**として管理する。
+
+```mermaid
+flowchart TD
+    T["大量のProduction Traceを蓄積する"]
+
+    EVAL["MLflow Evaluation／Monitoringで<br/>Scorer・Judge・品質指標を集計する"]
+    GROUP["問題になっているSlice／Failure Familyを特定する<br/>Retrieval失敗・拒否失敗・ACL疑義等をまとめる"]
+    FILTER["Tag・Assessment等で対象Traceを絞り込む<br/>Release・Corpus・Prompt・Model・質問カテゴリ等を使う"]
+    SAMPLE["同じ問題のTraceから代表CaseをSamplingする<br/>大量の重複CaseをそのままDatasetへ入れない"]
+
+    R["Review Appで代表Traceを確認する<br/>正しい回答・期待文書・Expectationを確定する"]
+    APPROVE{"今後も回帰テストへ残すCaseか判断する"}
+    E["MLflow Evaluation Datasetへ登録する<br/>正式な回帰テストCaseとして固定する"]
+
+    D1["Development<br/>元Traceを再評価してScorer／Judgeを確認する"]
+    D2["Development<br/>固定Evidence／既存Outputを使って<br/>Promptや出力Scorerを確認する"]
+    S["Staging<br/>DatasetのinputsをCandidate RAGへ再投入する"]
+
+    T --> EVAL --> GROUP --> FILTER --> SAMPLE --> R --> APPROVE
+    APPROVE -->|採用| E
+    APPROVE -->|不採用| T
+
+    E --> D1
+    E --> D2
+    E --> S
+```
+
+このフローでTagが担うのは、**問題が見つかった後に対象Traceの母集団を切り分けること**である。Tagだけを手掛かりに闇雲にTraceを探すのではなく、Evaluation／Monitoringで問題領域を特定してから、Release、Corpus、Prompt、Model、質問カテゴリ等の条件で代表Trace候補を抽出する。
+
+役割を整理すると次のようになる。
+
+| 資産 | 役割 | Corpusが必要か |
 | --- | --- | --- |
-| Scorerの判定ロジックが正しいか | 原則不要 | Development |
-| JudgeがHuman Feedbackと合うか | 原則不要 | Development |
-| Prompt変更で固定Caseの回答が改善するか | Retrieval結果を固定するなら不要 | Development |
-| Retrieval設定変更で取得文書が改善するか | 必要 | Staging |
-| RAG全体が本番に近い条件で正しく動くか | 必要 | Staging |
+| MLflow Trace | 過去にRAGを実行した結果。Retriever Span等を含む実行証跡 | Traceを再評価するだけなら不要 |
+| MLflow Evaluation Dataset | 今後も繰り返し評価する入力・Expectation・必要時Outputを固定するTest Suite | Dataset自体には不要 |
+| Corpus／AI Search | 新しいRetrieval結果を生成するための検索対象 | RAGやRetrievalを再実行するときに必要 |
 
-したがって、
+ここで重要なのは、**Trace依存ScorerとDatasetだけで評価できるScorerを区別すること**である。
 
-> **Development = 固定した本番事例を使って品質ロジックを作る**  
-> **Staging = 本番に近いデータでRAGを実際に動かして確認する**
+- `RetrievalRelevance`等、Retriever Spanの中間情報を利用するScorerは、保存済みTraceを直接再評価するか、Candidate RAGを再実行して新しいTraceを生成して評価する。
+- `inputs`、既存`outputs`、`expectations`だけで判定できるScorerは、Evaluation Dataset Recordだけでも回帰評価できる。
+- Evaluation DatasetへProduction Traceを追加しても、「Corpus全体がDatasetへ入る」わけではない。元Traceの来歴と、評価に必要な入力・正解条件をテスト資産として固定する。
+
+したがって、DevelopmentとStagingは次のように分ける。
+
+| 確認内容 | 主な入力 | RAGを再実行するか | Corpus／AI Search | 主な環境 |
+| --- | --- | --- | --- | --- |
+| Scorerの試作 | 保存済みMLflow Trace | しない | 不要 | Development |
+| Trace依存Scorer／Judgeの回帰確認 | 保存済みMLflow Trace | しない | 不要 | Development |
+| OutputベースScorerの回帰確認 | Evaluation Datasetの既存Output＋Expectation | しない | 不要 | Development |
+| Prompt単体の比較 | Evaluation Datasetの質問＋固定Evidence | LLM部分だけ実行 | 不要 | Development |
+| Retrieval設定の比較 | Evaluation Datasetの質問＋Expectation | Retrievalを再実行 | 必要 | Staging |
+| RAG End-to-End結合テスト | Evaluation Datasetの質問＋Expectation | RAG全体を再実行 | 必要 | Staging |
+
+つまり、
+
+> **Development = 保存済みの実行結果や固定Evidenceを使って、品質ロジックや局所的な変更を確認する**  
+> **Staging = Evaluation Datasetの同じ質問を本番に近いRAGへ再投入し、新しい検索・回答結果を確認する**
 
 と整理する。
 
@@ -13762,7 +13823,66 @@ exec streamlit run streamlit_app.py \
 
 Production Monitoringは、Realtime Experimentへ登録したScorerを本番Traceの一部に非同期適用し、品質Feedbackを継続追加するMLflow機能である。物理的にはRegistered Scorer、Sampling設定、Serverless Monitoring Job、生成されたAssessmentから構成され、2026年8月時点ではBetaである。定期評価を開始する前に、Preview有効化、Experiment権限、UC Trace、SQL Warehouse、Budget Policy、Judge Model権限をPreflightで確認する。
 
-Production MonitoringはBeta機能である。本番導入／Pilot時に、PoCとリリース判定で検証したJudgeを本番Experimentへ登録し、Stagingの本番相当TraceでDry Runしてから開始する。全件集計するLatency、Token、検索件数、拒否率などは決定論的集計へ残し、意味評価だけをSamplingしたJudgeへ任せる。Code-based Scorerはオフライン`mlflow.genai.evaluate()`で使い、Production Monitoringへそのまま自動登録できる前提にしない。
+Production MonitoringはBeta機能である。本番導入／Pilot時に、PoCとリリース判定で検証したJudgeを本番Experimentへ登録し、Stagingの本番相当TraceでDry Runしてから開始する。全件集計するLatency、Token、検索件数、拒否率などは決定論的集計へ残し、意味評価だけをSamplingしたJudgeへ任せる。
+
+**`mlflow.genai.evaluate()`を実行してもProduction Monitoringは自動では作成・開始されない。** `evaluate()`は指定したDataset／Traceに対してScorerやJudgeを実行し、その時点のEvaluation Runを作る処理である。継続監視へ移すには、検証済みScorer／Judgeを対象Experimentへ明示的に`register()`し、さらにSampling条件を指定して`start()`する必要がある。
+
+##### EvaluationとProduction Monitoringの役割を分ける
+
+本システムでは、品質評価を次の3段階に分ける。
+
+```mermaid
+flowchart TD
+    DEV["1. Development／Stagingで評価する<br/>mlflow.genai.evaluate()でDataset／Traceを評価する"]
+    RUN["Evaluation Runを確認する<br/>Scorer／Judgeの妥当性とCandidate品質を確認する"]
+    APPROVE{"本番監視へ使えるScorer／Judgeか判断する"}
+
+    REGISTER["2. Production Monitoringへ登録する<br/>register()でRealtime Experimentへ登録する"]
+    START["start()でSampling Rate／Filterを設定する<br/>どのProduction Traceを評価するか決める"]
+
+    TRACE["3. Production Traceが継続して蓄積される"]
+    MONITOR["登録済みScorer／Judgeを<br/>Sampling対象Traceへ非同期実行する"]
+    ASSESS["Feedback AssessmentをTraceへ追加する"]
+    VIEW["Monitoring UI／AI/BI Dashboardで<br/>品質傾向と問題Sliceを確認する"]
+
+    DEV --> RUN --> APPROVE
+    APPROVE -->|承認| REGISTER --> START --> TRACE
+    APPROVE -->|未承認| DEV
+    TRACE --> MONITOR --> ASSESS --> VIEW
+    VIEW --> TRACE
+```
+
+この3段階を混同しない。
+
+| 処理 | 何をするか | 自動でProduction Monitoringになるか |
+| --- | --- | --- |
+| `mlflow.genai.evaluate()` | 固定Dataset／TraceへScorer・Judgeを実行しEvaluation Runを作る | **ならない** |
+| `Scorer.register()` | 検証済みScorer／Judgeを対象MLflow Experimentへ登録する | 登録だけ。まだ継続評価は開始しない |
+| `Registered Scorer.start()` | Sample Rateと必要なFilterを設定し、継続評価を開始する | **ここからProduction Monitoringが動く** |
+| Production Trace受信後 | Sampling対象Traceへ登録済みScorer／Judgeを非同期実行する | Databricks／MLflow側が継続実行する |
+| Assessment保存 | Scorer／Judge結果を対象TraceへFeedback Assessmentとして残す | Databricks／MLflow側が保存する |
+| AI/BI Dashboard／SQL Alert | Monitoring結果、運用Metric、問題Sliceを可視化・通知する | 本システム側で必要なView／Dashboard／Alertを定義する |
+
+したがって、`evaluate_rag.py`と`register_monitoring.py`の責務は異なる。
+
+```text
+evaluate_rag.py
+  └─ Scorer／JudgeとRAG Candidateを事前評価する
+        ↓
+    Evaluation Runを人が確認・承認する
+        ↓
+register_monitoring.py
+  └─ 承認済みScorer／JudgeをRealtime Experimentへregister()する
+        ↓
+    Sampling Rate／Filterを指定してstart()する
+        ↓
+Production Monitoring
+  └─ 以後のProduction Traceを継続評価する
+```
+
+`register_monitoring.py`はProduction Monitoring機能そのものを実装するApplication Codeではなく、**検証済みScorer／JudgeをManaged MLflowのProduction Monitoringへ配備するBootstrap／Registration処理**である。登録後のSampling、Scorer実行、Assessment付与はManaged MLflow側が行う。
+
+Code-based ScorerをProduction Monitoringへ登録する場合は制約に注意する。独自`@scorer`関数はDatabricks Notebookで定義・登録し、関数内Importだけを使うSelf-contained実装にする。Standalone Python Fileで定義したCustom Code Scorerを、そのままProduction MonitoringへSerializationできる前提にしない。一方、オフライン`mlflow.genai.evaluate()`では同じ品質ロジックを通常のPython実装として利用できるため、Production Monitoringへ登録するScorerとRelease Gateで全件評価する決定論的検査を必ずしも同一の実行方式にする必要はない。
 
 | Prerequisite | 実体／確認方法 | 不足時の動作 |
 | --- | --- | --- |
@@ -13787,14 +13907,14 @@ Production Monitoringへ登録する独自`@scorer`関数はDatabricks Notebook�
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 検証済みScorerを登録し、承認時だけProduction Monitoringを開始する。 |
-| 入力 | Realtime Experiment、Judge Model、Warehouse、Budget、承認値。Pilot前に読む。 |
-| 処理 | Prerequisiteを検査してバージョン付きScorerをregister／startする。権限、Budget、Judge承認が不足すれば開始しない。 |
-| 出力 | Registered ScorerとMonitoring設定を作り、Operational ViewとAlertが参照する。 |
-| 失敗・再実行 | 既存Monitoringを無断変更しない。Scorer名とバージョンで重複登録を避ける。 |
+| 目的 | **Production Monitoring自体を実装するのではなく**、検証済みScorer／JudgeをManaged MLflowへ登録し、承認時だけ継続監視を開始するBootstrap処理。 |
+| 入力 | Realtime Experiment、Judge Model、Warehouse、Budget、承認済みScorer／Judgeバージョン、Sampling Rate、Filter。Pilot前に読む。 |
+| 処理 | PrerequisiteとEvaluation／Validation承認を検査し、`register()`で対象Experimentへ登録する。開始承認済みの場合だけ`start()`でSampling Rate／Filterを設定する。 |
+| 出力 | Registered Scorerと有効なSampling設定。以後のSampling、非同期Scoring、Feedback Assessment付与はManaged MLflowが実行する。 |
+| 失敗・再実行 | 既存Monitoringを無断変更しない。Scorer名とバージョンで重複登録を避け、未承認Scorerを自動Startしない。 |
 
 ```python
-"""検証済みJudgeを登録し、承認時だけProduction Monitoringを開始する。"""
+"""検証済みJudgeをManaged MLflowへ登録し、承認時だけ継続Monitoringを開始するBootstrap。"""
 
 import os
 from typing import Literal
@@ -13871,6 +13991,9 @@ if __name__ == "__main__":
 ```
 
 Judgeをリリース判定へ使う場合、同名のJudge Feedbackと人間Feedbackを用意し、Alignmentを行ったか否かにかかわらず、Alignmentへ使っていないValidation Setで一致率、False Positive、False Negativeを確認する。未検証Judgeだけで金融機関向けReleaseを可決しない。Aligned Judge候補を登録しても自動開始せず、Judgeバージョン、Validation結果、承認者をリリース構成台帳へ固定してから`start()`する。
+
+
+Production Monitoringの標準UIはScorer／Judge結果とTraceを確認する入口として利用する。一方、本資料のAI/BI Dashboardは、Production Monitoring結果だけでなくLatency、Token、検索0件、429、Quality Case、SLA等も同じRelease単位で横断して見る運用Dashboardであり、Production Monitoringが自動生成するものではない。SQL Alertも同様に、本システムの運用閾値に合わせて別途定義する。
 
 ##### 4.3.4.15 Operational Monitoring・AlertとQuality Case連携を構築する
 
@@ -15382,9 +15505,159 @@ Dataset実装バージョンによりUC Tableの `inputs` 表現がStructまた�
 
 Trainingには正常回答、検索失敗、拒否正解、略語、複数文書統合、旧版競合、ACL、削除、解析エラー、Prompt Injectionを含める。失敗ケースだけへ偏らせず、カテゴリ、ACL区分、拒否、文書種別の分布をSplitごとにGateする。
 
-##### 5.2.2.3 Retrieval設定を改善する
 
-この実装では、Promptより先に検索設定を同じTraining Datasetで比較する。Chunk生成バージョン、`query_type`、`num_results`、Filter、Rerankingを候補として評価し、期待文書Recall、Retrieval Relevance、Latencyを比較する。Embedding ModelやChunk Schemaを変える場合は既存Indexを上書きせず、新しいIndex名で構築して並行評価する。
+###### DevelopmentでTraceとEvaluation Datasetをどう使い分けるか
+
+`sync_evaluation_dataset.py`で作るEvaluation Datasetは、Production Traceから選別したCaseを継続的に再利用するためのTest Suiteである。一方、Retriever Span等の中間実行結果まで使うScorerの開発では、元のMLflow Traceを直接評価する。
+
+Developmentでは、目的に応じて次の3パターンを使い分ける。
+
+**パターン1：保存済みProduction Traceを直接再評価する**
+
+Retriever Span等を利用するScorer／Judgeを開発する場合は、Production Traceを検索して`mlflow.genai.evaluate()`へ直接渡す。このとき`predict_fn`を指定しないためRAGは再実行されず、Corpus／AI Searchは不要である。
+
+```python
+import mlflow
+from mlflow.genai.scorers import RetrievalRelevance, RetrievalGroundedness
+
+# Productionで取得済みのTraceから、開発対象のCaseを選ぶ。
+# 実際のfilter_stringは本番で付与しているTag契約へ合わせる。
+traces = mlflow.search_traces(
+    filter_string="tags.environment = 'production'",
+    max_results=100,
+)
+
+# predict_fnを指定しない。
+# 保存済みTraceのinputs / outputs / Retriever Span等を使ってScorerだけを実行する。
+result = mlflow.genai.evaluate(
+    data=traces,
+    scorers=[
+        RetrievalRelevance(),
+        RetrievalGroundedness(),
+    ],
+)
+```
+
+この処理は次を行っている。
+
+```text
+保存済みProduction Trace
+        ↓
+Retriever Span／回答等を読む
+        ↓
+Scorer／Judgeだけを再実行
+```
+
+次は行っていない。
+
+```text
+Evaluation Datasetの質問
+        ↓
+AI Search
+        ↓
+Corpus検索
+        ↓
+回答生成
+```
+
+したがって、**「CorpusがなくてもScorerをテストできる」のは、過去の検索結果までTraceへ保存済みだから**である。
+
+**パターン2：Evaluation Datasetの既存Outputを使って回帰評価する**
+
+Production TraceからEvaluation Datasetへ昇格したRecordが`outputs`と`expectations`を保持している場合、Trace中間情報を必要としないScorerは、Evaluation Datasetだけで再評価できる。
+
+```python
+import mlflow
+from mlflow.genai.datasets import get_dataset
+from mlflow.genai.scorers import Correctness
+
+dataset = get_dataset(
+    name="main.llmops.internal_rag_train",
+)
+
+# predict_fnを指定しない。
+# Datasetに保存済みのinputs / outputs / expectationsを評価する。
+result = mlflow.genai.evaluate(
+    data=dataset,
+    scorers=[
+        Correctness(),
+    ],
+)
+```
+
+この使い方は、Dataset Recordに既存`outputs`があるCaseに限る。Retriever Span等を必要とするScorerでは、Evaluation Datasetだけで過去Traceの全中間情報を代替できるとは考えず、元Traceを直接評価する。
+
+**パターン3：Evaluation DatasetのinputsをCandidateへ再投入する**
+
+新しいApplication挙動を確認するときは`predict_fn`を指定する。この場合はDatasetの`inputs`がCandidateへ渡され、新しいOutput／Traceが生成される。
+
+```python
+import mlflow
+from mlflow.genai.datasets import get_dataset
+from mlflow.genai.scorers import Correctness
+
+dataset = get_dataset(
+    name="main.llmops.internal_rag_train",
+)
+
+def candidate_rag(question: str, **kwargs):
+    # Stagingに配備したCandidate RAGを呼ぶ。
+    # 実装ではDatabricks App／Serving Endpoint等の呼出しへ置き換える。
+    return call_candidate_rag(question=question, **kwargs)
+
+result = mlflow.genai.evaluate(
+    data=dataset,
+    predict_fn=candidate_rag,
+    scorers=[
+        Correctness(),
+    ],
+)
+```
+
+`candidate_rag()`の内部でAI Searchを呼ぶ場合は、本番に近いCorpus／AI Searchが必要になるため、このEnd-to-End評価はStagingで実施する。
+
+まとめると、同じEvaluation資産でも実行方法が異なる。
+
+```text
+元Traceを直接evaluate
+    → 過去結果を再評価
+    → Corpus不要
+
+Evaluation Dataset + predict_fnなし
+    → 保存済みOutputを回帰評価
+    → Corpus不要
+
+Evaluation Dataset + predict_fnあり
+    → Candidateを再実行
+    → Retrieval／RAGを動かすならCorpus必要
+```
+
+Evaluation Datasetの役割は、**Production Traceから選んだ重要Caseを、Candidateが変わっても同じ入力・Expectationで繰り返し評価できるよう固定すること**である。
+
+
+##### 5.2.2.3 StagingでRetrieval設定を比較・改善する
+
+ここで行うのは、RAG全体の回答品質を見るEnd-to-End結合テストとは別に、**検索コンポーネントだけを比較するテスト**である。Evaluation Datasetの同じ質問をStagingのAI Searchへ投入し、検索設定を変えたときに「期待する文書をより適切に取得できるか」を比較する。
+
+この評価では回答生成まで行わなくてもよい。Chunk生成バージョン、`query_type`、`num_results`、Filter、Rerankingを候補として、期待文書Recall、Retrieval Relevance、Latencyを比較する。Embedding ModelやChunk Schemaを変える場合は既存Indexを上書きせず、Stagingに別Indexを構築して並行評価する。
+
+DevelopmentではCorpusを基本的に持たないため、この検索コンポーネント評価は**本番に近いCorpus／AI Searchを再現したStagingで実施する**。検索設定を選んだ後、別途RAG End-to-End結合テストでRetrieval→回答→Scorer／Judgeまで通して確認する。
+
+
+```mermaid
+flowchart TD
+    D["MLflow Evaluation Datasetから<br/>同じ質問とExpectationを読む"]
+    A["Staging AI Searchへ<br/>検索設定Aで問い合わせる"]
+    B["Staging AI Searchへ<br/>検索設定Bで問い合わせる"]
+    EA["取得文書Aを<br/>期待文書・Relevance・Latencyで評価する"]
+    EB["取得文書Bを<br/>期待文書・Relevance・Latencyで評価する"]
+    C["検索品質が良い設定を選ぶ"]
+    E2E["選んだ設定をCandidate RAGへ組み込み<br/>End-to-End結合テストへ進む"]
+
+    D --> A --> EA --> C
+    D --> B --> EB --> C
+    C --> E2E
+```
 
 | 変更対象 | 例 | 主な評価 |
 | --- | --- | --- |
