@@ -2,6 +2,8 @@
 
 本章では、Unity Catalogで管理された社内技術文書をDatabricks AI Searchへ公開し、承認済みの根拠だけに基づいて回答するエージェント型RAGを扱う。最初に完成形を示し、その後、**PoC、本番導入、本番導入後**の順で、各段階に必要な設計と完全なコードを説明する。用語を後から検索する場合は第8章の索引を参照する。
 
+**表記方針**：Databricks／MLflow／LangGraphの正式なResource名、API名、Decorator名、物理Table／Dataset／列名、環境変数、コード識別子は原語を維持する。ただし、本文・表・箇条書きでこれらを使う場合は、原則として直後に括弧でその意味を併記し、コードを読まなくてもその場で役割を理解できるようにする。たとえば、`@stream`（Agent Serverで逐次応答を有効にするDecorator）、`rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID）のように表記する。SQLキーワード、単なる例示ID／Version値、実行例のコード断片、利用者向け固定文言は注釈対象外とし、コードブロック内も実装の可読性を保つため変更しない。
+
 ## 1. システム全体像
 
 ### 1.1 解決する課題
@@ -24,9 +26,9 @@
 
 | 資産 | 役割 | 公開との関係 |
 | --- | --- | --- |
-| `document_source_manifest` | 人が決定した論理文書の有効状態、ACL、公開範囲、現在の公開バージョン参照の正本 | 公開参照と必須条件を満たすバージョンだけをGoldへ強制する。最新Versionを自動選定しない。 |
+| `document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable） | 人が決定した論理文書の有効状態、ACL、公開範囲、現在の公開バージョン参照の正本 | 公開参照と必須条件を満たすバージョンだけをGoldへ強制する。最新Versionを自動選定しない。 |
 | Bronze／Silver | 取込、Parse、Prep、Chunkの追記型技術履歴 | 保存されたこと自体は公開を意味しない。 |
-| `document_version_registry` | **文書バージョン管理台帳（Version Registry）**。バージョン単位の技術状態と審査履歴を保持する | 審査済みバージョンだけが公開バージョン参照の切替候補になる。 |
+| `document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table） | **文書バージョン管理台帳（Version Registry）**。バージョン単位の技術状態と審査履歴を保持する | 審査済みバージョンだけが公開バージョン参照の切替候補になる。 |
 | Gold Current／Search Sync／AI Search | 現在公開してよいChunk | 文書マニフェストの現在値に追随し、旧版・削除・失効を除外する。 |
 | RAG Agent | 検索、再検索、根拠検証、回答拒否 | 承認済みIndex Releaseだけを参照する。 |
 
@@ -66,7 +68,7 @@ flowchart TD
     RELEASE --> AGENT
 ```
 
-この図の`Trace`、`Assessment`、`EvaluationDataset`、`Scorer`はMLflow公式機能である。一方、**リリース判定（本資料独自用語）**は、固定評価結果、セキュリティ、性能、コストを組み合わせてリリース可否を決める本システム独自のJob（以降、品質管理ジョブ）／承認手順であり、Databricks／MLflowの独立した標準Resource名ではない。外部のJira、GitHub Issues、ServiceNow、Slack／Teams等は、チケット管理や通知を担う別システムである。本文では、必要になる箇所で次の境界を明示する。
+この図の`Trace`（1回のRAG Requestの入出力と各SpanをまとめるMLflow実行証跡）、`Assessment`（Traceへ付与するFeedback／Expectation等の評価Record）、`EvaluationDataset`（繰り返し評価する入力・期待値等を管理するMLflow Dataset）、`Scorer`（TraceやEvaluation Caseを採点するMLflow評価ロジック）はMLflow公式機能である。一方、**リリース判定（本資料独自用語）**は、固定評価結果、セキュリティ、性能、コストを組み合わせてリリース可否を決める本システム独自のJob（以降、品質管理ジョブ）／承認手順であり、Databricks／MLflowの独立した標準Resource名ではない。外部のJira、GitHub Issues、ServiceNow、Slack／Teams等は、チケット管理や通知を担う別システムである。本文では、必要になる箇所で次の境界を明示する。
 
 **意思決定記録（本資料独自用語）**は、リリース採用・却下、Go／No-Go、Risk受容、ロールバック、利用範囲拡大、品質問題Closeなど、人間が行った重要な意思決定を、Evaluation Run ID、Trace ID、Release ID、承認者、理由等の証跡とともに保存する追記型記録である。システムが自動生成する実行ログではなく、Databricks／MLflowの独立した標準Resourceでもない。物理実体にはDelta Table、外部承認記録、必要に応じて外部Issue／Change Management Systemを用いる。
 
@@ -91,10 +93,10 @@ flowchart LR
 
 | 用語 | この章で押さえる意味 |
 | --- | --- |
-| 論理文書 | 改訂をまたいで同じ文書として扱う単位。不変の`document_id`で識別する。 |
-| 文書バージョン | 原文内容ごとの版。内容から決まる`document_version_id`で識別する。 |
+| 論理文書 | 改訂をまたいで同じ文書として扱う単位。不変の`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）で識別する。 |
+| 文書バージョン | 原文内容ごとの版。内容から決まる`document_version_id`（文書内容ごとの不変バージョンID）で識別する。 |
 | 文書マニフェスト | 人が決定した論理文書の現在公開状態と公開バージョン参照を保持し、Goldへ強制するUnity Catalog上の薄い管理用Delta Table。 |
-| 公開バージョン参照 | 現在公開すると人が選んだ文書バージョンを指す値。本資料では互換性のため列名`approved_document_version_id`を維持するが、意味は`published_document_version_id`と同じ「現在公開Versionへの参照」である。個々のVersionの審査合格状態とは分ける。 |
+| 公開バージョン参照 | 現在公開すると人が選んだ文書バージョンを指す値。本資料では互換性のため列名`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）を維持するが、意味は`published_document_version_id`（現在公開中の文書Versionを指す参照）と同じ「現在公開Versionへの参照」である。個々のVersionの審査合格状態とは分ける。 |
 | Bronze／Silver／Gold | 取込履歴、処理済み履歴、現在公開してよいデータを分離する三層構成。 |
 | 隔離 | **隔離（Quarantine）**。無効な行を正常処理経路から分離し、原因調査、原因分類、復旧方法の決定、必要な場合の計画再試行のために保持するパターン。隔離は「削除」でも「自動再試行待ち」でもない。テーブル名や`TBLPROPERTIES ('quality' = 'quarantine')`は変更しない。 |
 | 試行結果データセット | **試行結果データセット（Attempt Dataset）**。AI Functionの結果とエラーをPrivate Streaming Tableへ一度だけ物理保持し、成功表と失敗表へAI Functionの再呼出しなしで分岐する中間Dataset。単なる論理Viewではなく、重い処理結果を再利用する物理キャッシュとして機能する。 |
@@ -170,7 +172,7 @@ flowchart LR
 | 公開判断 | 開発者が簡易なPoC実行記録で確認 | 登録者とは別の承認者がUIで現在公開Versionを選択。システムはManifest Pointerへ反映 | 規制・監査要件に応じてBackend Credentialまで追加分割 |
 | Pipeline | 開発者が手動起動可能 | Data Pipeline SPで自動実行・監視 | コスト・処理時間・エラー傾向を最適化し、必要時だけ処理別SPへ分割 |
 | Prompt／Model | Prompt RegistryとModel Serviceを使用し、短いPromptはPythonに直書き | Git Markdown→Prompt Registry→Evaluation／Holdout／Releaseとし、リリース構成台帳で不変Versionを固定 | Optimization、Git Baseline同期、カナリアリリース、A/Bで比較 |
-| 品質確認 | `mlflow.genai.evaluate()`、Code Scorer、RAG Judge、手動Assessment | Training／Holdout、ACL等Golden Test、Judge対人間誤差、リリース判定、Monitoring Dry Run | 本番AssessmentでDatasetを育成し、必要時だけJudgeを再Alignment |
+| 品質確認 | `mlflow.genai.evaluate()`（Evaluation DatasetとScorer／Judgeで評価Runを作成するMLflow API）、Code Scorer、RAG Judge、手動Assessment | Training／Holdout、ACL等Golden Test、Judge対人間誤差、リリース判定、Monitoring Dry Run | 本番AssessmentでDatasetを育成し、必要時だけJudgeを再Alignment |
 | 人が残す判断 | PoC合否と本番化Gap | 文書承認、Release、障害対応 | MLflow Expectation、根本原因、改善Release承認 |
 | MLflow運用 | Trace UIへ少数担当者がFeedback／MLflow Expectationを直接入力 | Assessment SchemaとReviewerを正式化し、MonitoringをPilot開始時に有効化 | レビュー待ちキューを定期配送し、滞留・コスト・品質を継続監視 |
 
@@ -179,8 +181,8 @@ flowchart LR
 | PoC版 | 本番版での変更 | 変更理由 |
 | --- | --- | --- |
 | 開発者がSample Volumeへ配置 | Staging、自動事前検査、人のRAG投入審査、承認後Move | 自動検査と業務上の掲載判断を分けるため |
-| Path Hashによる暫定`document_id` | 文書マニフェストが採番・保持する不変`document_id` | 改名・移動・版更新を同じ論理文書として扱うため |
-| 全成功バージョンから最新をPoC Goldへ選択 | `approved_document_version_id`一致バージョンだけをGoldへ公開 | 未審査バージョンの自動公開を防ぐため |
+| Path Hashによる暫定`document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | 文書マニフェストが採番・保持する不変`document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | 改名・移動・版更新を同じ論理文書として扱うため |
+| 全成功バージョンから最新をPoC Goldへ選択 | `approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）一致バージョンだけをGoldへ公開 | 未審査バージョンの自動公開を防ぐため |
 | 開発者が起動・承認 | Document Workflow／Manifest Executor／Data Pipeline SPへTrust Boundary単位で分離 | 人間の自己承認とauthoritative stateの直接更新を防ぎつつ、初期のCredential運用を過度に増やさないため |
 | PoCのエラーテーブルとRun Log | 隔離、単一Workflow Request、Manifest Audit Event。高度な整合性差分確認は必要時に追加 | 本番初期のTableとJobを細分化しすぎず、人の判断と反映履歴だけを監査可能にするため |
 | 1つのdev Index | SnapshotとRelease単位Index | ロールバックと評価再現性を確保するため |
@@ -196,20 +198,20 @@ PoCの手運用は検査の省略を意味しない。実行者、対象バー�
 
 | 要素 | PoC時 | 本番導入時 | 本番導入後 |
 | --- | --- | --- | --- |
-| Bronze／Silver／Gold | ○。PoC専用`poc_*` Dataset | ○。本番用`internal_docs_*` Dataset | ○。Baselineを継続利用 |
-| 文書マニフェスト `document_source_manifest` | － | ○ | ○ |
-| 文書バージョン管理台帳 `document_version_registry` | － | ○ | ○ |
-| 文書変更申請 | － | ○。物理名は`document_workflow_requests` | ○ |
-| 文書変更履歴 | － | ○。物理名は`document_manifest_audit_events` | ○ |
+| Bronze／Silver／Gold | ○。PoC専用`poc_*` Dataset | ○。本番用`internal_docs_*`（本番文書Pipelineで利用するTable／Dataset物理名の総称） Dataset | ○。Baselineを継続利用 |
+| 文書マニフェスト `document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable） | － | ○ | ○ |
+| 文書バージョン管理台帳 `document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table） | － | ○ | ○ |
+| 文書変更申請 | － | ○。物理名は`document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table） | ○ |
+| 文書変更履歴 | － | ○。物理名は`document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable） | ○ |
 | Search Sync／文書集合スナップショット | － | ○ | ○ |
-| PoC固定EvaluationDataset | ○。`main.llmops_poc.internal_rag_poc_evaluation` | － | － |
-| Training／Holdout EvaluationDataset | － | ○。`main.llmops.internal_rag_train`／`main.llmops.internal_rag_holdout` | ○。本番レビュー結果を継続反映 |
-| RAGリリース構成台帳 `main.llmops.rag_release_manifest` | － | ○ | ○ |
+| PoC固定EvaluationDataset | ○。`main.llmops_poc.internal_rag_poc_evaluation`（PoCの固定評価Caseを保持するMLflow Evaluation Dataset） | － | － |
+| Training／Holdout EvaluationDataset | － | ○。`main.llmops.internal_rag_train`（候補改善に利用するTraining Evaluation Dataset）／`main.llmops.internal_rag_holdout`（候補探索に使わない最終判定用Holdout Evaluation Dataset） | ○。本番レビュー結果を継続反映 |
+| RAGリリース構成台帳 `main.llmops.rag_release_manifest`（承認済みRAGリリース構成の正本となるDelta Table） | － | ○ | ○ |
 | Production Monitoring | － | ○。本番開始前に設定しPilot／本番開始時に有効化 | ○。Sampling／Thresholdを運用実績で調整 |
-| 監視検知イベント `internal_rag_monitoring_signals` | － | ○ | ○ |
-| 品質改善課題 | － | 必要最低限。外部Issue Trackerを正本にしない場合は`internal_rag_quality_cases` | 高度化して継続利用 |
-| レビュー記録 `internal_rag_review_cases` | － | － | 条件付き高度化。レビュー待ちキュー自動化時に導入 |
-| 整合性差分確認 `document_reconciliation_candidates` | － | － | 条件付き高度化 |
+| 監視検知イベント `internal_rag_monitoring_signals`（品質・運用監視で検知したイベントを集約するTable） | － | ○ | ○ |
+| 品質改善課題 | － | 必要最低限。外部Issue Trackerを正本にしない場合は`internal_rag_quality_cases`（同じ原因の問題を改善単位で管理する品質改善課題Table） | 高度化して継続利用 |
+| レビュー記録 `internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable） | － | － | 条件付き高度化。レビュー待ちキュー自動化時に導入 |
+| 整合性差分確認 `document_reconciliation_candidates`（文書状態の差分確認候補を保持するTable） | － | － | 条件付き高度化 |
 | Prompt Optimization／Judge Alignment | － | 原則は手動改善とJudge対Human誤差確認。Pilotで十分な同名Human／Judge Feedbackが集まり、JudgeをRelease Gateへ使う場合だけAlignment＋独立Validationを条件付き実施 | 運用実績から必要性を確認して継続高度化。Prompt OptimizationはTraining DatasetとScorer／Judgeが安定してから導入 |
 
 **読み方**：PoC図には本番用文書マニフェストを描かない。本番導入図には将来の整合性差分確認やレビュー待ちキュー自動化を描かない。本番導入後の図で初めて、それらをBaselineへ接続する。
@@ -594,7 +596,7 @@ flowchart TD
 
 MLflow Evaluation Datasetは、Production Traceそのものを置き換えるものではない。
 
-大量のProduction Traceを闇雲にEvaluation Datasetへ追加するのではない。まずMLflow Evaluation／Monitoringの結果から品質低下しているSliceや失敗原因グループを特定し、その条件に対応するTraceをTagやAssessment等で絞り込む。さらに同じ問題の大量重複を避けるため代表CaseをSamplingし、Review AppでHuman Reviewして正解条件を確定したCaseだけを、`inputs`、`expectations`、必要に応じて既存`outputs`、Source、Tagを持つ**再利用可能なテストSuite**として管理する。
+大量のProduction Traceを闇雲にEvaluation Datasetへ追加するのではない。まずMLflow Evaluation／Monitoringの結果から品質低下しているSliceや失敗原因グループを特定し、その条件に対応するTraceをTagやAssessment等で絞り込む。さらに同じ問題の大量重複を避けるため代表CaseをSamplingし、Review AppでHuman Reviewして正解条件を確定したCaseだけを、`inputs`（Evaluation Datasetへ保存する評価対象の入力）、`expectations`（Evaluation Datasetへ保存する期待値）、必要に応じて既存`outputs`（既存実行結果として保存する評価対象の出力）、Source、Tagを持つ**再利用可能なテストSuite**として管理する。
 
 ```mermaid
 flowchart TD
@@ -634,8 +636,8 @@ flowchart TD
 
 ここで重要なのは、**Trace依存ScorerとDatasetだけで評価できるScorerを区別すること**である。
 
-- `RetrievalRelevance`等、Retriever Spanの中間情報を利用するScorerは、保存済みTraceを直接再評価するか、Candidate RAGを再実行して新しいTraceを生成して評価する。
-- `inputs`、既存`outputs`、`expectations`だけで判定できるScorerは、Evaluation Dataset Recordだけでも回帰評価できる。
+- `RetrievalRelevance`（取得文書が質問に関連するか評価するMLflow Scorer）等、Retriever Spanの中間情報を利用するScorerは、保存済みTraceを直接再評価するか、Candidate RAGを再実行して新しいTraceを生成して評価する。
+- `inputs`（Evaluation Datasetへ保存する評価対象の入力）、既存`outputs`（既存実行結果として保存する評価対象の出力）、`expectations`（Evaluation Datasetへ保存する期待値）だけで判定できるScorerは、Evaluation Dataset Recordだけでも回帰評価できる。
 - Evaluation DatasetへProduction Traceを追加しても、「Corpus全体がDatasetへ入る」わけではない。元Traceの来歴と、評価に必要な入力・正解条件をテスト資産として固定する。
 
 したがって、DevelopmentとStagingは次のように分ける。
@@ -789,7 +791,7 @@ PoCでは、少数文書で「取込 → Parse → Prep → Chunk → 検索 →
 
 #### 3.2.1 まず理解する構成
 
-初読では、PoCを次の7要素だけで理解すればよい。`Attempt`、`Quality`、成功表、隔離表などは、下図の「Parse／Prep」を安全かつ再実行可能にするための**内部実装の展開形**であり、最初から個別Table名を覚える必要はない。
+初読では、PoCを次の7要素だけで理解すればよい。`Attempt`（Parse／Prep等の1回の試行結果を表す概念）、`Quality`（Lakeflow Tableの品質用途を示すProperty値）、成功表、隔離表などは、下図の「Parse／Prep」を安全かつ再実行可能にするための**内部実装の展開形**であり、最初から個別Table名を覚える必要はない。
 
 ```mermaid
 flowchart TD
@@ -823,28 +825,28 @@ flowchart TD
 
 | 分類 | 物理名 | 物理種別 | 1行の意味 | 主なKey | 主な役割 | 書込元 | 読取元 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Pipeline | `poc_documents_bronze` | Streaming Table | Volumeから検知した1 File Version | `document_id`, `document_version_id` | 原文Binary、内容Hash、Preflight結果を追記保持 | `poc/src/01_bronze.sql` | `poc_unique_versions` |
-| Pipeline | `poc_unique_versions` | Private Streaming Table | AI Functionへ渡す一意な1文書Version | `document_version_id` | 同一内容の再配置によるParse重複実行を防止 | `poc/src/01b_unique_versions.py` | `poc_parse_attempts` |
-| Pipeline | `poc_parse_attempts` | Private Streaming Table | 1文書Versionに対する1回のParse試行結果 | `document_version_id` | `ai_parse_document`の生結果を一度だけ物理保持 | `poc/src/02_parse.sql` | `poc_parse_quality` |
-| Pipeline | `poc_parse_quality` | Private Streaming Table | Parse Attemptへ品質判定を付けた1行 | `document_version_id` | `is_quarantined`を一元判定し成功／隔離を同一条件で分岐 | `poc/src/02_parse.sql` | `poc_parsed`, `poc_parse_errors` |
-| Pipeline | `poc_parsed` | Streaming Table | Parse成功した1文書Version | `document_version_id` | Prepへ渡せるParse成功履歴 | `poc/src/02_parse.sql` | `poc_prep_attempts` |
-| Pipeline | `poc_parse_errors` | Streaming Table（隔離） | Parse失敗した1文書Version | `document_version_id` | Parse失敗理由を保持し、原因分類と復旧方法を判断する | `poc/src/02_parse.sql` | PoC隔離調査、件数・傾向確認 |
-| Pipeline | `poc_prep_attempts` | Private Streaming Table | 1文書Versionに対する1回のPrep試行結果 | `document_version_id` | `ai_prep_search`の生結果を一度だけ物理保持 | `poc/src/03_prep.sql` | `poc_prep_quality` |
-| Pipeline | `poc_prep_quality` | Private Streaming Table | Prep Attemptへ品質判定を付けた1行 | `document_version_id` | NULL／エラー／空Chunkを成功経路から隔離 | `poc/src/03_prep.sql` | `poc_prepared`, `poc_prep_errors` |
-| Pipeline | `poc_prepared` | Streaming Table | Prep成功した1文書Version | `document_version_id` | Chunk展開へ渡せるPrep成功履歴 | `poc/src/03_prep.sql` | `poc_chunks_silver` |
-| Pipeline | `poc_prep_errors` | Streaming Table（隔離） | Prep失敗した1文書Version | `document_version_id` | Prep失敗理由を保持し、原因分類と復旧方法を判断する | `poc/src/03_prep.sql` | PoC隔離調査、件数・傾向確認 |
-| Pipeline | `poc_chunks_silver` | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id` | バージョン付き検索Chunk履歴と代表ページ画像参照を追記保持 | `poc/src/04_chunks_silver.sql` | `poc_chunks_gold` |
-| Pipeline | `poc_chunks_gold` | Materialized View | PoCで現在検索対象とする1 Chunk | `chunk_version_id` | 各`document_id`の最新Parse／Prep成功VersionをPoC限定で公開 | `poc/src/05_gold_poc.sql` | PoC AI Search Delta Sync Index |
-| 監視 | `poc_pipeline_event_log` | Lakeflow Event Log Table | Pipelineの1 Event | `event_id`等 | Update、Flow、Lakeflow Pipeline Expectationの実行証跡 | Lakeflow Pipeline | Pipelines UI、Ad-hoc監視Query |
-| 評価 | `main.llmops_poc.internal_rag_poc_evaluation` | MLflow EvaluationDataset（Unity Catalog Table） | 1評価Case | `case_id` | 固定質問、入力、MLflow Expectationを評価正本として保持 | `seed_poc_evaluation_dataset.py` | `evaluate_poc.py` |
+| Pipeline | `poc_documents_bronze`（PoC原文Binaryと取込Metadataを追記保持するBronze Table） | Streaming Table | Volumeから検知した1 File Version | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | 原文Binary、内容Hash、Preflight結果を追記保持 | `poc/src/01_bronze.sql`（PoC Bronze取込を定義するSQLファイル） | `poc_unique_versions`（PoCでAI Functionへ渡す一意な文書Versionを保持する中間Table） |
+| Pipeline | `poc_unique_versions`（PoCでAI Functionへ渡す一意な文書Versionを保持する中間Table） | Private Streaming Table | AI Functionへ渡す一意な1文書Version | `document_version_id`（文書内容ごとの不変バージョンID） | 同一内容の再配置によるParse重複実行を防止 | `poc/src/01b_unique_versions.py`（PoCで文書Version重複を除外するPythonファイル） | `poc_parse_attempts`（PoCの文書解析結果とエラーを一度だけ保持する試行結果Table） |
+| Pipeline | `poc_parse_attempts`（PoCの文書解析結果とエラーを一度だけ保持する試行結果Table） | Private Streaming Table | 1文書Versionに対する1回のParse試行結果 | `document_version_id`（文書内容ごとの不変バージョンID） | `ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）の生結果を一度だけ物理保持 | `poc/src/02_parse.sql`（PoCの文書Parse処理を定義するSQLファイル） | `poc_parse_quality`（PoCのParse結果に品質判定を付ける中間Table） |
+| Pipeline | `poc_parse_quality`（PoCのParse結果に品質判定を付ける中間Table） | Private Streaming Table | Parse Attemptへ品質判定を付けた1行 | `document_version_id`（文書内容ごとの不変バージョンID） | `is_quarantined`（正常処理経路から隔離するかを示す項目）を一元判定し成功／隔離を同一条件で分岐 | `poc/src/02_parse.sql`（PoCの文書Parse処理を定義するSQLファイル） | `poc_parsed`（PoCのParse成功結果を保持するTable）, `poc_parse_errors`（PoCのParse失敗結果を隔離して保持するTable） |
+| Pipeline | `poc_parsed`（PoCのParse成功結果を保持するTable） | Streaming Table | Parse成功した1文書Version | `document_version_id`（文書内容ごとの不変バージョンID） | Prepへ渡せるParse成功履歴 | `poc/src/02_parse.sql`（PoCの文書Parse処理を定義するSQLファイル） | `poc_prep_attempts`（PoCの検索用整形結果とエラーを一度だけ保持する試行結果Table） |
+| Pipeline | `poc_parse_errors`（PoCのParse失敗結果を隔離して保持するTable） | Streaming Table（隔離） | Parse失敗した1文書Version | `document_version_id`（文書内容ごとの不変バージョンID） | Parse失敗理由を保持し、原因分類と復旧方法を判断する | `poc/src/02_parse.sql`（PoCの文書Parse処理を定義するSQLファイル） | PoC隔離調査、件数・傾向確認 |
+| Pipeline | `poc_prep_attempts`（PoCの検索用整形結果とエラーを一度だけ保持する試行結果Table） | Private Streaming Table | 1文書Versionに対する1回のPrep試行結果 | `document_version_id`（文書内容ごとの不変バージョンID） | `ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）の生結果を一度だけ物理保持 | `poc/src/03_prep.sql`（PoCの検索用Prep処理を定義するSQLファイル） | `poc_prep_quality`（PoCのPrep結果に品質判定を付ける中間Table） |
+| Pipeline | `poc_prep_quality`（PoCのPrep結果に品質判定を付ける中間Table） | Private Streaming Table | Prep Attemptへ品質判定を付けた1行 | `document_version_id`（文書内容ごとの不変バージョンID） | NULL／エラー／空Chunkを成功経路から隔離 | `poc/src/03_prep.sql`（PoCの検索用Prep処理を定義するSQLファイル） | `poc_prepared`（PoCのPrep成功結果を保持するTable）, `poc_prep_errors`（PoCのPrep失敗結果を隔離して保持するTable） |
+| Pipeline | `poc_prepared`（PoCのPrep成功結果を保持するTable） | Streaming Table | Prep成功した1文書Version | `document_version_id`（文書内容ごとの不変バージョンID） | Chunk展開へ渡せるPrep成功履歴 | `poc/src/03_prep.sql`（PoCの検索用Prep処理を定義するSQLファイル） | `poc_chunks_silver`（PoCのVersion付き検索Chunk履歴を保持するSilver Table） |
+| Pipeline | `poc_prep_errors`（PoCのPrep失敗結果を隔離して保持するTable） | Streaming Table（隔離） | Prep失敗した1文書Version | `document_version_id`（文書内容ごとの不変バージョンID） | Prep失敗理由を保持し、原因分類と復旧方法を判断する | `poc/src/03_prep.sql`（PoCの検索用Prep処理を定義するSQLファイル） | PoC隔離調査、件数・傾向確認 |
+| Pipeline | `poc_chunks_silver`（PoCのVersion付き検索Chunk履歴を保持するSilver Table） | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id`（検索Chunkの内容・版を一意に識別するID） | バージョン付き検索Chunk履歴と代表ページ画像参照を追記保持 | `poc/src/04_chunks_silver.sql`（PoCのChunk生成を定義するSQLファイル） | `poc_chunks_gold`（PoCで検索対象にする現在Chunkを保持するGold Table） |
+| Pipeline | `poc_chunks_gold`（PoCで検索対象にする現在Chunkを保持するGold Table） | Materialized View | PoCで現在検索対象とする1 Chunk | `chunk_version_id`（検索Chunkの内容・版を一意に識別するID） | 各`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）の最新Parse／Prep成功VersionをPoC限定で公開 | `poc/src/05_gold_poc.sql`（PoCの検索公開用Goldを定義するSQLファイル） | PoC AI Search Delta Sync Index |
+| 監視 | `poc_pipeline_event_log`（PoC PipelineのUpdate・Flow・品質指標を記録するEvent Log） | Lakeflow Event Log Table | Pipelineの1 Event | `event_id`（イベント・IDを表す識別子）等 | Update、Flow、Lakeflow Pipeline Expectationの実行証跡 | Lakeflow Pipeline | Pipelines UI、Ad-hoc監視Query |
+| 評価 | `main.llmops_poc.internal_rag_poc_evaluation`（PoCの固定評価Caseを保持するMLflow Evaluation Dataset） | MLflow EvaluationDataset（Unity Catalog Table） | 1評価Case | `case_id`（評価Caseを識別するID） | 固定質問、入力、MLflow Expectationを評価正本として保持 | `seed_poc_evaluation_dataset.py`（PoCのSeed CaseをEvaluation Datasetへ登録するPythonファイル） | `evaluate_poc.py`（PoC Evaluationを実行するPythonファイル） |
 
 **関連Resource（Tableではないもの）**
 
 | Resource | 物理的な実体 | PoCでの役割 |
 | --- | --- | --- |
-| PoC文書入力 | Unity Catalog Volume `${poc.source_path}` | `poc_documents_bronze`の入力 |
-| PoC AI Search | AI Search Endpoint＋Delta Sync Index `${var.poc_index_name}` | `poc_chunks_gold`を検索可能にする |
-| PoC MLflow Experiment | Workspace Experiment `/Shared/llmops/${bundle.target}/internal-rag-poc` | Trace、Evaluation Run、Assessmentをまとめる |
+| PoC文書入力 | Unity Catalog Volume `${poc.source_path}` | `poc_documents_bronze`（PoC原文Binaryと取込Metadataを追記保持するBronze Table）の入力 |
+| PoC AI Search | AI Search Endpoint＋Delta Sync Index `${var.poc_index_name}`（DAB変数から設定値を解決する参照式） | `poc_chunks_gold`（PoCで検索対象にする現在Chunkを保持するGold Table）を検索可能にする |
+| PoC MLflow Experiment | Workspace Experiment `/Shared/llmops/${bundle.target}/internal-rag-poc`（Deploy Targetごとに分離するWorkspace上の物理Path） | Trace、Evaluation Run、Assessmentをまとめる |
 | Prompt Registry | UC-backed MLflow Prompt Resource | PoC PromptのVersion／Alias管理 |
 | Answer／Judge Model Service | Unity AI Gateway Model Service | RAG回答生成と意味評価 |
 
@@ -852,13 +854,13 @@ flowchart TD
 
 **該当なし。**
 
-PoCでは、`document_source_manifest`、`document_version_registry`、`document_workflow_requests`、`document_manifest_audit_events`のような永続的な文書管理マスタ／ワークフローTableを持たない。したがって、本番と同型の管理系ER図を作ると、PoCに存在しない統制機能が実装済みであるように見えるため作成しない。
+PoCでは、`document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable）、`document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）、`document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）、`document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable）のような永続的な文書管理マスタ／ワークフローTableを持たない。したがって、本番と同型の管理系ER図を作ると、PoCに存在しない統制機能が実装済みであるように見えるため作成しない。
 
-`main.llmops_poc.internal_rag_poc_evaluation`には評価Case間の参照関係を管理するERを必要とするほどの複数管理Tableがない。MLflow Trace／Assessmentとの関係は評価実行時のResource参照であり、文書管理ERとは別物である。
+`main.llmops_poc.internal_rag_poc_evaluation`（PoCの固定評価Caseを保持するMLflow Evaluation Dataset）には評価Case間の参照関係を管理するERを必要とするほどの複数管理Tableがない。MLflow Trace／Assessmentとの関係は評価実行時のResource参照であり、文書管理ERとは別物である。
 
 #### 3.2.4 PoC時のデータフロー図
 
-PoCの中心はLakeflow Pipelineである。**文書マニフェストとのJOINは存在しない。** `poc_chunks_gold`が選ぶ「最新成功Version」はPoC限定の簡易公開条件であり、人が承認した公開Versionを意味しない。
+PoCの中心はLakeflow Pipelineである。**文書マニフェストとのJOINは存在しない。** `poc_chunks_gold`（PoCで検索対象にする現在Chunkを保持するGold Table）が選ぶ「最新成功Version」はPoC限定の簡易公開条件であり、人が承認した公開Versionを意味しない。
 
 ```mermaid
 flowchart TD
@@ -891,7 +893,7 @@ flowchart TD
 
 PoC開発でも、PromptをSourceコードへ埋め込むだけでは比較できないため、Prompt Registryへ判定・回答Promptを登録し、解決したPromptバージョンをTraceへ残す。生成ModelはUnity AI Gateway Model Service経由で呼び、Service FQN、実Route、Request IDをTraceへ記録する。Lakeflow SDP、AI Search、RAG、Streamlitはdev環境へ再現可能に配備する。
 
-カナリアリリース／A/BのTraffic Splitやオンライン最適化はPoC必須ではない。PoCでは候補Promptやモデル経路を**評価Runごとに固定してオフライン比較**すればよい。ただし、本番でカナリアリリースを予定する場合は、Requestへ`candidate_id`、Promptバージョン、モデル経路を記録できる契約だけ先に用意する。
+カナリアリリース／A/BのTraffic Splitやオンライン最適化はPoC必須ではない。PoCでは候補Promptやモデル経路を**評価Runごとに固定してオフライン比較**すればよい。ただし、本番でカナリアリリースを予定する場合は、Requestへ`candidate_id`（評価対象Candidateを識別するID）、Promptバージョン、モデル経路を記録できる契約だけ先に用意する。
 
 以下の実装はすべてPoC開始前に完成させる。PoC期間中は未完成機能を追加しながら評価するのではなく、固定した入力、Prompt、モデル経路、Retrieval設定で証跡を収集し、変更時は新しいEvaluation Runとして比較する。
 
@@ -936,7 +938,7 @@ flowchart TD
     SETUP --> READY["RAG／Evaluationを利用開始可能"]
 ```
 
-Databricks Asset Bundles（DAB）は、Source、Workspace Resource、環境別変数をGit上の一つのDeploy単位として扱う仕組みである。このPoCでは`poc/databricks.yml`がBundleの入口となり、Pipeline、初期セットアップ／Evaluation Job、Experimentの各YAMLを読み込む。`bundle deploy`はResource定義をWorkspaceへ反映し、`bundle run`は作成済みJobやPipelineを実行するため、Deploy成功だけを処理成功とはみなさない。
+Databricks Asset Bundles（DAB）は、Source、Workspace Resource、環境別変数をGit上の一つのDeploy単位として扱う仕組みである。このPoCでは`poc/databricks.yml`（PoCで使うPipeline・Evaluation・Bootstrap Jobと環境別変数を束ねるDAB Bundle設定）がBundleの入口となり、Pipeline、初期セットアップ／Evaluation Job、Experimentの各YAMLを読み込む。`bundle deploy`（DAB ResourceをWorkspaceへ配備するCLIコマンド）はResource定義をWorkspaceへ反映し、`bundle run`（DABで配備済みJob／Pipelineを実行するCLIコマンド）は作成済みJobやPipelineを実行するため、Deploy成功だけを処理成功とはみなさない。
 
 文書の増分処理にはLakeflow Spark Declarative Pipelinesを使う。これは、SQLとPythonで定義したDataset間の依存関係を解決し、StreamingのCheckpoint、再実行、Event Logを管理するDatabricks Serviceである。本システムでは、VolumeからBronze、Parse／Prep Attempt、Silver、PoC Goldまでを一つのPipeline Resourceとして作成し、結果はPipelines UI、公開Event Log、Catalog Explorerで確認する。
 
@@ -958,13 +960,13 @@ flowchart TD
     PIPE --> EVENT["Pipeline UI・Event Log"]
 ```
 
-`poc/databricks.yml`
+`poc/databricks.yml`（PoCで使うPipeline・Evaluation・Bootstrap Jobと環境別変数を束ねるDAB Bundle設定）
 
 | ロジック概要 | 内容 |
 | --- | --- |
-| 責務／実行契機 | `bundle validate/deploy`時にPoC Resource、Target、環境差分の入口を定義する |
+| 責務／実行契機 | `bundle validate/deploy`（対象Resource／ソースを指す物理パス）時にPoC Resource、Target、環境差分の入口を定義する |
 | 読取／更新 | CI／開発者が渡すBundle変数を読み、Included YAMLのResourceへ値を展開する |
-| 処理順序 | Target決定→変数解決→`resources/*.yml`読込→Resource Graph検証→Deploy |
+| 処理順序 | Target決定→変数解決→`resources/*.yml`（DAB Resource定義YAML群を表すPath Pattern）読込→Resource Graph検証→Deploy |
 | 重要判定 | Model Service、Index、Dataset、Git Commit等の空値はPreflightで拒否し、個人DefaultへFallbackしない |
 | 正常／失敗／再試行 | Deploy成功時は同TargetのResourceへ収束。Validate失敗時はWorkspace Resourceを変更しない |
 
@@ -1043,7 +1045,7 @@ targets:
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}
 ```
 
-`poc/resources/poc_pipeline.yml`
+`poc/resources/poc_pipeline.yml`（PoCのBronze→Parse→整形→Chunk→Gold処理を実行するPipeline Resource定義）
 
 | ロジック概要 | 内容 |
 | --- | --- |
@@ -1098,7 +1100,7 @@ resources:
         poc.chunk_schema_version: "poc-v1"
 ```
 
-PoCでは開発者Identityで実行してよいが、専用dev SchemaとVolumeだけへ権限を限定する。本番章ではPipelineとSearch Publishの`run_as`を標準のData Pipeline SPへ変更する。整合性差分確認を後日追加する場合は、まず同じData Pipeline SPを使い、追加分割条件を満たした場合だけ専用SPへ分ける。
+PoCでは開発者Identityで実行してよいが、専用dev SchemaとVolumeだけへ権限を限定する。本番章ではPipelineとSearch Publishの`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）を標準のData Pipeline SPへ変更する。整合性差分確認を後日追加する場合は、まず同じData Pipeline SPを使い、追加分割条件を満たした場合だけ専用SPへ分ける。
 
 ##### 3.3.2.1 MLflow ExpectationとLakeflow Pipeline Expectationの区別
 
@@ -1109,24 +1111,24 @@ PoCでは開発者Identityで実行してよいが、専用dev SchemaとVolume�
 | **MLflow Expectation** | RAG評価 | Trace／EvaluationDatasetに保持する期待回答、期待文書、回答拒否などの正解情報。Scorerが実際の出力と比較する。 |
 | **Lakeflow Pipeline Expectation** | メダリオン処理のデータ品質 | Streaming Table、Materialized Viewなどの各行へ適用するSQL真偽条件。違反時の処理をWarn、Drop、Fail Updateから選ぶ。 |
 
-両者は目的も保存先も異なる。以降、評価の正解情報は「MLflow Expectation」、Lakeflowの行品質制約は「Lakeflow Pipeline Expectation」と表記する。コード上の`EXPECT`句や`expectations`などの識別子は変更しない。
+両者は目的も保存先も異なる。以降、評価の正解情報は「MLflow Expectation」、Lakeflowの行品質制約は「Lakeflow Pipeline Expectation」と表記する。コード上の`EXPECT`（expectを指定する設定値／環境変数）句や`expectations`（Evaluation Datasetへ保存する期待値）などの識別子は変更しない。
 
 Databricks公式仕様上の対応関係は次のとおりである。PythonデコレーターはStreaming Table、Materialized View、Temporary Viewへ適用でき、SQLではDataset定義内へ名前付き制約を記述する。条件はSQL真偽式であり、Python UDF、外部サービス呼出し、別テーブルへの副問い合わせは使用できない。
 
 | Python API | SQL | 違反時の動作 | 本資料での判断 |
 | --- | --- | --- | --- |
-| `@dp.expect` | `CONSTRAINT name EXPECT (condition)` | Warn。違反行を保持し、品質指標を記録 | BronzeとSilver品質判定Datasetで採用 |
-| `@dp.expect_or_drop` | `... ON VIOLATION DROP ROW` | 違反行を対象Datasetから除外し、品質指標を記録 | 隔離情報を失わない要件から不採用 |
-| `@dp.expect_or_fail` | `... ON VIOLATION FAIL UPDATE` | 最初の違反で対象フローの更新を失敗させ、更新を原子的にロールバック | 公開Goldの重大な行単位不変条件で採用 |
-| `@dp.expect_all` | SQLでは複数の名前付き`CONSTRAINT`を列挙 | 複数条件をまとめてWarn | Python実装時の候補。本資料のSQLでは個別名で記録 |
-| `@dp.expect_all_or_drop` | SQLでは各制約へDrop指定 | 複数条件をまとめてDrop | 条件の二重定義と隔離情報消失を避けるため不採用 |
-| `@dp.expect_all_or_fail` | SQLでは各制約へFail指定 | 複数条件をまとめてFail | Python実装時の候補。本資料のGold SQLでは原因を識別できる個別名を使用 |
+| `@dp.expect`（Lakeflow SDPで品質条件を記録するExpectation Decorator） | `CONSTRAINT name EXPECT (condition)`（Lakeflow SDPで1つの品質条件を定義するSQL構文） | Warn。違反行を保持し、品質指標を記録 | BronzeとSilver品質判定Datasetで採用 |
+| `@dp.expect_or_drop`（品質条件違反行を除外するLakeflow SDP Decorator） | `... ON VIOLATION DROP ROW` | 違反行を対象Datasetから除外し、品質指標を記録 | 隔離情報を失わない要件から不採用 |
+| `@dp.expect_or_fail`（品質条件違反時にPipeline更新を失敗させるLakeflow SDP Decorator） | `... ON VIOLATION FAIL UPDATE` | 最初の違反で対象フローの更新を失敗させ、更新を原子的にロールバック | 公開Goldの重大な行単位不変条件で採用 |
+| `@dp.expect_all`（複数品質条件をまとめて記録するLakeflow SDP Decorator） | SQLでは複数の名前付き`CONSTRAINT`（constraintを指定する設定値／環境変数）を列挙 | 複数条件をまとめてWarn | Python実装時の候補。本資料のSQLでは個別名で記録 |
+| `@dp.expect_all_or_drop`（複数品質条件の違反行を除外するLakeflow SDP Decorator） | SQLでは各制約へDrop指定 | 複数条件をまとめてDrop | 条件の二重定義と隔離情報消失を避けるため不採用 |
+| `@dp.expect_all_or_fail`（複数品質条件違反時にPipeline更新を失敗させるLakeflow SDP Decorator） | SQLでは各制約へFail指定 | 複数条件をまとめてFail | Python実装時の候補。本資料のGold SQLでは原因を識別できる個別名を使用 |
 
 複数条件へ同じ動作をまとめて適用する`expect_all*`系はPythonだけの集合APIである。SQLでは複数の名前付き制約を個別に宣言するため、Event Logと失敗診断でどの条件に違反したかを追跡しやすい。本資料は既存PipelineがSQL中心であることと、条件名を運用指標へ使うことからSQL構文を採用する。
 
 2026年8月時点のDatabricks公式資料では、Lakeflow Pipeline ExpectationのSQL構文とPythonデコレーター自体にPreview／Betaの注記はない。ただし、利用可能な構文とEvent Logの記録内容は実行環境やPipeline設定の影響を受けるため、導入先WorkspaceのStaging更新でコンパイルと品質指標を再確認する。
 
-WarnとDropの合格・違反件数はPipeline UIとEvent Logの`flow_progress`イベントにあるExpectation品質指標で確認する。更新失敗時は通常のExpectation集計値が記録されないため、Fail Updateは失敗イベントと診断情報を確認する。入力更新がない場合、品質指標をサポートしないフロー、またはメトリクス設定の組合せでは品質指標が出ないこともあるため、「値がない」を合格として扱わない。
+WarnとDropの合格・違反件数はPipeline UIとEvent Logの`flow_progress`（Lakeflow Event LogでFlow進捗と品質Metricを記録するEvent Type）イベントにあるExpectation品質指標で確認する。更新失敗時は通常のExpectation集計値が記録されないため、Fail Updateは失敗イベントと診断情報を確認する。入力更新がない場合、品質指標をサポートしないフロー、またはメトリクス設定の組合せでは品質指標が出ないこともあるため、「値がない」を合格として扱わない。
 
 ##### 3.3.2.2 メダリオン各層のLakeflow Pipeline Expectation設計
 
@@ -1134,34 +1136,34 @@ Bronzeは原データと取込事実を失わない層、Silverは検証・整�
 
 | 層 | Lakeflow Pipeline Expectation名 | 条件 | 適用Dataset | 違反時の動作 | 違反行の保存先 | Event Logでの確認 | 採用理由 | 再試行への影響 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Bronze | `valid_source_metadata`／`valid_registered_metadata` | 文書ID、文書バージョンID、参照元URIが非NULL | `poc_documents_bronze`／`internal_docs_bronze` | Warn | Bronze自身に保持 | 合格・違反件数を品質指標で確認 | 生データと取込事実を欠落させず、欠損傾向を計測するため | 下流の選別条件を直して再更新できる。原本の再配置は不要 |
-| Bronze | `valid_preflight` | `preflight_error IS NULL` | 同上 | Warn | Bronze自身に保持 | 合格・違反件数を品質指標で確認 | 不正形式や過大ファイルも監査履歴として残すため | 違反行は下流AI Functionへ渡さず、必要なら登録・検査から再実行 |
-| Silver前段 | `valid_parse_result` | `is_quarantined = false` | `poc_parse_quality`、`internal_docs_parse_quality` | Warn＋明示的な隔離分岐 | `*_parse_errors`へ保存し、品質判定Datasetにも保持 | 合格・違反件数を品質指標で確認 | AI Functionの生結果を一度だけ物理保持し、同じ条件で成功・失敗を相互排他的に分岐するため | 試行結果データセットから再分類でき、AI Functionの不要な再呼出しを避ける |
-| Silver前段 | `valid_prep_result` | `is_quarantined = false` | `poc_prep_quality`、`internal_docs_prep_quality` | Warn＋明示的な隔離分岐 | `*_prep_errors`へ保存し、品質判定Datasetにも保持 | 合格・違反件数を品質指標で確認 | Parseと同じ隔離パターンを使い、NULL、エラー状態、空のChunk配列を公開経路から外すため | 処理バージョンを固定した専用再試行へ渡せる |
-| Gold | `valid_gold_keys`、`valid_gold_content` | 公開用キーと検索・回答本文が非NULL | `poc_chunks_gold`、`internal_docs_current_mv` | Fail Update | 新しいGold更新には保存しない。Silver履歴と直前の正常なGoldを保持 | 失敗イベントと診断情報を確認。失敗更新では通常のLakeflow Pipeline Expectation集計値は記録されない | 不完全な行を一部だけ公開せず、Gold更新を原子的に停止するため | 原因修正後にPipeline更新を再実行する。公開済みの直前状態を維持 |
-| Gold | `valid_gold_acl`、`valid_gold_publication_state` | ACLが非空で、承認済み・非削除・Current | `internal_docs_current_mv` | Fail Update | 同上 | 同上 | 認可・公開状態の行単位不変条件を最終公開面で再確認するため | 文書マニフェストまたはSilverを修正後に再更新 |
+| Bronze | `valid_source_metadata`（Source Metadataの必須値が有効かを確認する品質条件）／`valid_registered_metadata`（文書マニフェスト登録済みMetadataかを確認する品質条件） | 文書ID、文書バージョンID、参照元URIが非NULL | `poc_documents_bronze`（PoC原文Binaryと取込Metadataを追記保持するBronze Table）／`internal_docs_bronze`（本番原文Binaryと取込Metadataを追記保持するBronze Table） | Warn | Bronze自身に保持 | 合格・違反件数を品質指標で確認 | 生データと取込事実を欠落させず、欠損傾向を計測するため | 下流の選別条件を直して再更新できる。原本の再配置は不要 |
+| Bronze | `valid_preflight`（事前検査結果が正常かを確認する品質条件） | `preflight_error IS NULL`（事前検査エラーがないことを確認するSQL条件） | 同上 | Warn | Bronze自身に保持 | 合格・違反件数を品質指標で確認 | 不正形式や過大ファイルも監査履歴として残すため | 違反行は下流AI Functionへ渡さず、必要なら登録・検査から再実行 |
+| Silver前段 | `valid_parse_result`（Parse結果が正常かを確認する品質条件） | `is_quarantined = false` | `poc_parse_quality`（PoCのParse結果に品質判定を付ける中間Table）、`internal_docs_parse_quality`（Parse結果に品質判定を付ける中間Table） | Warn＋明示的な隔離分岐 | `*_parse_errors`へ保存し、品質判定Datasetにも保持 | 合格・違反件数を品質指標で確認 | AI Functionの生結果を一度だけ物理保持し、同じ条件で成功・失敗を相互排他的に分岐するため | 試行結果データセットから再分類でき、AI Functionの不要な再呼出しを避ける |
+| Silver前段 | `valid_prep_result`（Prep結果が正常かを確認する品質条件） | `is_quarantined = false` | `poc_prep_quality`（PoCのPrep結果に品質判定を付ける中間Table）、`internal_docs_prep_quality`（Prep結果に品質判定を付ける中間Table） | Warn＋明示的な隔離分岐 | `*_prep_errors`へ保存し、品質判定Datasetにも保持 | 合格・違反件数を品質指標で確認 | Parseと同じ隔離パターンを使い、NULL、エラー状態、空のChunk配列を公開経路から外すため | 処理バージョンを固定した専用再試行へ渡せる |
+| Gold | `valid_gold_keys`（Gold公開に必要なKeyが有効かを確認する品質条件）、`valid_gold_content`（Gold公開するChunk本文が有効かを確認する品質条件） | 公開用キーと検索・回答本文が非NULL | `poc_chunks_gold`（PoCで検索対象にする現在Chunkを保持するGold Table）、`internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View） | Fail Update | 新しいGold更新には保存しない。Silver履歴と直前の正常なGoldを保持 | 失敗イベントと診断情報を確認。失敗更新では通常のLakeflow Pipeline Expectation集計値は記録されない | 不完全な行を一部だけ公開せず、Gold更新を原子的に停止するため | 原因修正後にPipeline更新を再実行する。公開済みの直前状態を維持 |
+| Gold | `valid_gold_acl`（Gold公開ChunkにACLが設定されているか確認する品質条件）、`valid_gold_publication_state`（Gold公開状態が正しいか確認する品質条件） | ACLが非空で、承認済み・非削除・Current | `internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View） | Fail Update | 同上 | 同上 | 認可・公開状態の行単位不変条件を最終公開面で再確認するため | 文書マニフェストまたはSilverを修正後に再更新 |
 
-Silverで`ON VIOLATION DROP ROW`を採用しないのは、違反行を捨てずにエラー詳細と処理バージョンを隔離テーブルへ残すためである。品質条件は`is_quarantined`へ一元化し、Warnで計測した同じ行を成功経路と隔離経路へ明示分岐する。これはDatabricks公式の隔離パターンと同じ考え方であり、Python UDF、外部サービス呼出し、別テーブルへの副問い合わせをLakeflow Pipeline Expectation条件へ埋め込まない。
+Silverで`ON VIOLATION DROP ROW`を採用しないのは、違反行を捨てずにエラー詳細と処理バージョンを隔離テーブルへ残すためである。品質条件は`is_quarantined`（正常処理経路から隔離するかを示す項目）へ一元化し、Warnで計測した同じ行を成功経路と隔離経路へ明示分岐する。これはDatabricks公式の隔離パターンと同じ考え方であり、Python UDF、外部サービス呼出し、別テーブルへの副問い合わせをLakeflow Pipeline Expectation条件へ埋め込まない。
 
-Goldの公開バージョン参照との一致は、別テーブルを参照する条件であるためLakeflow Pipeline Expectationには書けない。したがって、文書マニフェストとのJOINで公開候補を絞り、行単位の最終条件だけをFail Updateで保証し、複数テーブル間の不変条件は後続の`pipeline_invariants.sql`で検証する。
+Goldの公開バージョン参照との一致は、別テーブルを参照する条件であるためLakeflow Pipeline Expectationには書けない。したがって、文書マニフェストとのJOINで公開候補を絞り、行単位の最終条件だけをFail Updateで保証し、複数テーブル間の不変条件は後続の`pipeline_invariants.sql`（文書取込Pipeline全体の不変条件を検査し、重複・版不整合・公開状態の破綻を検知するSQL）で検証する。
 
 Fail Updateの影響範囲にも注意する。実行契機型Pipelineでは違反したフローが失敗しても並列フローが継続する場合があるため、Search Syncと公開切替はPipeline更新成功に依存する別のLakeflow Jobsタスクとして接続する。連続実行型では違反したフローと依存フローが停止する。どちらの実行方式でも、Pipeline UIとEvent Logの確認だけでなく、Job依存関係で不完全なGoldの公開を防ぐ。
 
 #### 3.3.3 Bronzeと文書バージョン重複排除
 
-Streaming Tableは、到着したデータをCheckpoint付きで増分処理し、追記型履歴として保持するLakeflow Datasetである。ここでは`poc_documents_bronze`へ原文書の内容バージョンとPreflight結果を保存し、処理済みFileを再実行のたびに全件読み直さない。後続のPython Datasetは`document_version_id`で重複を除き、同じ内容バージョンへAI Functionを複数回実行しないための入口になる。
+Streaming Tableは、到着したデータをCheckpoint付きで増分処理し、追記型履歴として保持するLakeflow Datasetである。ここでは`poc_documents_bronze`（PoC原文Binaryと取込Metadataを追記保持するBronze Table）へ原文書の内容バージョンとPreflight結果を保存し、処理済みFileを再実行のたびに全件読み直さない。後続のPython Datasetは`document_version_id`（文書内容ごとの不変バージョンID）で重複を除き、同じ内容バージョンへAI Functionを複数回実行しないための入口になる。
 
 以下の想定出力は処理のつながりを理解するための説明用データである。Hash、Timestamp、Binary、VARIANTは読みやすいよう省略・短縮しており、実環境の値や完全なSchema Dumpではない。
 
-`poc/src/01_bronze.sql`
+`poc/src/01_bronze.sql`（PoC Bronze取込を定義するSQLファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
-| 責務／Dataset | Volume Fileを`poc_documents_bronze`追記型Streaming Tableへ取り込むBronze入口 |
+| 責務／Dataset | Volume Fileを`poc_documents_bronze`（PoC原文Binaryと取込Metadataを追記保持するBronze Table）追記型Streaming Tableへ取り込むBronze入口 |
 | 変換順序 | Binary File読取→暫定論理ID／内容バージョン Hash→拡張子・Size Preflight→取込時刻付与 |
 | 重要判定 | Unsupported／Empty／Oversizeも履歴へ残すが、下流AI Functionへ渡さない |
-| Lakeflow Pipeline Expectation | `valid_source_metadata`、`valid_preflight`。必須属性と`preflight_error IS NULL`をWarnで計測し、違反行もBronzeへ保持する |
-| 再試行／後続 | Auto Loader Checkpointで既読Fileを管理し、`01b_unique_versions.py`が内容バージョンを重複排除する |
+| Lakeflow Pipeline Expectation | `valid_source_metadata`（Source Metadataの必須値が有効かを確認する品質条件）、`valid_preflight`（事前検査結果が正常かを確認する品質条件）。必須属性と`preflight_error IS NULL`（事前検査エラーがないことを確認するSQL条件）をWarnで計測し、違反行もBronzeへ保持する |
+| 再試行／後続 | Auto Loader Checkpointで既読Fileを管理し、`01b_unique_versions.py`（同一文書Versionの重複を検出し、後続処理へ一意なVersionだけを渡す前処理）が内容バージョンを重複排除する |
 
 ```sql
 -- PoC Bronze層。文書マニフェストは使わず、Sample Volumeだけを入力にする。
@@ -1201,23 +1203,23 @@ FROM STREAM read_files(
 );
 ```
 
-**想定出力サンプル（`poc_documents_bronze`）**
+**想定出力サンプル（`poc_documents_bronze`（PoC原文Binaryと取込Metadataを追記保持するBronze Table））**
 
-| `document_id` | `document_version_id` | `source_uri` | `source_title` | `length` | `preflight_error` | `ingested_at` |
+| `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID） | `source_uri`（原文または取得元を特定するURI） | `source_title`（取得元文書のTitleを保持する項目） | `length`（原文FileのSizeを保持する項目） | `preflight_error`（事前検査で検出したエラー内容） | `ingested_at`（文書を取り込んだ時刻） |
 | --- | --- | --- | --- | ---: | --- | --- |
-| `POC-7f1c9a2b3d4e5f60718293ab` | `ver-a81f...` | `/Volumes/poc/docs/rag-guide.pdf` | `rag-guide.pdf` | 248120 | `NULL` | `2026-08-15T09:00:03Z` |
-| `POC-2a3b4c5d6e7f8091a2b3c4d5` | `ver-991c...` | `/Volumes/poc/docs/archive.zip` | `archive.zip` | 98120 | `UNSUPPORTED_EXTENSION` | `2026-08-15T09:00:04Z` |
+| `POC-7f1c9a2b3d4e5f60718293ab` | `ver-a81f...` | `/Volumes/poc/docs/rag-guide.pdf`（対象Resource／ソースを指す物理パス） | `rag-guide.pdf`（PoC説明で使う原文File名の例） | 248120 | `NULL`（SQLで値がないことを表す値） | `2026-08-15T09:00:03Z` |
+| `POC-2a3b4c5d6e7f8091a2b3c4d5` | `ver-991c...` | `/Volumes/poc/docs/archive.zip`（対象Resource／ソースを指す物理パス） | `archive.zip`（PoC事前検査の説明で使う非対応File例） | 98120 | `UNSUPPORTED_EXTENSION`（unsupported・extensionを指定する設定値／環境変数） | `2026-08-15T09:00:04Z` |
 
-`content`はBinaryのため省略している。1行目はParse対象、2行目は履歴には残るがAI Functionへ渡らない。
+`content`（文書本文またはChunk本文を保持する項目）はBinaryのため省略している。1行目はParse対象、2行目は履歴には残るがAI Functionへ渡らない。
 
-`poc/src/01b_unique_versions.py`
+`poc/src/01b_unique_versions.py`（PoCで文書Version重複を除外するPythonファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
-| 責務／Dataset | Bronze Streamを`document_version_id`単位で一意化し、Private Streaming Tableへ物理保持する |
-| 処理順序 | Bronze Stream読取→Stateful `dropDuplicates`→`poc_unique_versions`へ出力 |
+| 責務／Dataset | Bronze Streamを`document_version_id`（文書内容ごとの不変バージョンID）単位で一意化し、Private Streaming Tableへ物理保持する |
+| 処理順序 | Bronze Stream読取→Stateful `dropDuplicates`（Spark DataFrameで重複を除外する処理）→`poc_unique_versions`（PoCでAI Functionへ渡す一意な文書Versionを保持する中間Table）へ出力 |
 | 重要判定 | Pathではなく内容HashをKeyにし、再配置で高コストのAI Functionを再実行しない |
-| 再試行／後続 | Checkpoint／Stateから再開し、`02_parse.sql`だけが一意バージョンを読む |
+| 再試行／後続 | Checkpoint／Stateから再開し、`02_parse.sql`（取込済み原文を解析し、本文・ページ・構造情報を検索前の解析結果へ変換する処理）だけが一意バージョンを読む |
 
 ```python
 """PoC Bronzeを文書バージョン単位でStreaming重複排除するLakeflow Source。
@@ -1249,27 +1251,27 @@ def poc_unique_versions() -> DataFrame:
     )
 ```
 
-**想定出力サンプル（`poc_unique_versions`）**
+**想定出力サンプル（`poc_unique_versions`（PoCでAI Functionへ渡す一意な文書Versionを保持する中間Table））**
 
-| 入力Event | `document_version_id` | 出力されるか | 理由 |
+| 入力Event | `document_version_id`（文書内容ごとの不変バージョンID） | 出力されるか | 理由 |
 | --- | --- | --- | --- |
 | 初回配置 | `ver-a81f...` | はい | 未処理の内容バージョンであるため |
-| 同一Fileの再配置 | `ver-a81f...` | いいえ | 同じ`document_version_id`として重複排除されるため |
+| 同一Fileの再配置 | `ver-a81f...` | いいえ | 同じ`document_version_id`（文書内容ごとの不変バージョンID）として重複排除されるため |
 | 内容を改訂したFile | `ver-b72e...` | はい | 新しい内容バージョンであるため |
 
 下流へ渡る代表行は、Bronzeの1行目と同じ文書属性を持ち、AI Functionの実行回数だけがバージョン単位で1回に抑えられる。
 
 #### 3.3.4 Parse／Prep Attemptとエラー分岐
 
-`poc/src/02_parse.sql`
+`poc/src/02_parse.sql`（PoCの文書Parse処理を定義するSQLファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | 責務／Dataset | Parseをバージョンごとに一度だけ実行するPrivate Attemptと、成功／エラーの相互排他的出力を作る |
-| 処理順序 | Preflight合格行→`ai_parse_document`→Attempt物理保持→`error_status`で`poc_parsed`／`poc_parse_errors`へ分岐 |
+| 処理順序 | Preflight合格行→`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）→Attempt物理保持→`error_status`（処理エラーの分類・状態）で`poc_parsed`（PoCのParse成功結果を保持するTable）／`poc_parse_errors`（PoCのParse失敗結果を隔離して保持するTable）へ分岐 |
 | 重要判定 | NULL、VARIANT NULL、エラー配列をすべて失敗とし、エラー バージョンをPrepへ渡さない。PDF／PPTXはページ画像をVolumeへ保存し、Figure descriptionを有効化して図表の意味を検索用テキストへ残す |
-| Lakeflow Pipeline Expectation | `valid_parse_result`。`is_quarantined = false`をWarnで計測し、違反行は`poc_parse_errors`へ明示的に保存する |
-| 再試行／後続 | Attemptから再分岐できるためAI Functionを再呼出しせず、成功だけ`03_prep.sql`へ渡す |
+| Lakeflow Pipeline Expectation | `valid_parse_result`（Parse結果が正常かを確認する品質条件）。`is_quarantined = false`をWarnで計測し、違反行は`poc_parse_errors`（PoCのParse失敗結果を隔離して保持するTable）へ明示的に保存する |
+| 再試行／後続 | Attemptから再分岐できるためAI Functionを再呼出しせず、成功だけ`03_prep.sql`（解析済み文書を検索しやすい形へ正規化し、Chunk生成前の検索用表現を作る処理）へ渡す |
 
 ```sql
 -- ai_parse_documentはこの試行結果データセットだけで呼ぶ。
@@ -1346,19 +1348,19 @@ WHERE is_quarantined = true;
 
 **想定出力サンプル（Parse分岐）**
 
-| 出力Dataset | `document_version_id` | `parsed_document`／`error_message` | 結果 |
+| 出力Dataset | `document_version_id`（文書内容ごとの不変バージョンID） | `parsed_document`（Parse成功・文書を保持する項目）／`error_message`（処理失敗の理由を保持する項目） | 結果 |
 | --- | --- | --- | --- |
-| `poc_parse_attempts` | `ver-a81f...` | `{"document":{"pages":[...]},"error_status":[]}` | AI Functionの生結果を1回だけ保持 |
-| `poc_parsed` | `ver-a81f...` | `document.pages=12` | 成功したためPrepへ進む |
-| `poc_parse_errors` | `ver-c33d...` | `[{"page_id":3,"error_message":"PAGE_PARSE_FAILED"}]` | 失敗したため隔離へ分岐 |
+| `poc_parse_attempts`（PoCの文書解析結果とエラーを一度だけ保持する試行結果Table） | `ver-a81f...` | `{"document":{"pages":[...]},"error_status":[]}` | AI Functionの生結果を1回だけ保持 |
+| `poc_parsed`（PoCのParse成功結果を保持するTable） | `ver-a81f...` | `document.pages=12` | 成功したためPrepへ進む |
+| `poc_parse_errors`（PoCのParse失敗結果を隔離して保持するTable） | `ver-c33d...` | `[{"page_id":3,"error_message":"PAGE_PARSE_FAILED"}]` | 失敗したため隔離へ分岐 |
 
-同じ`document_version_id`が`poc_parsed`と`poc_parse_errors`の両方へ入ることはない。
+同じ`document_version_id`（文書内容ごとの不変バージョンID）が`poc_parsed`（PoCのParse成功結果を保持するTable）と`poc_parse_errors`（PoCのParse失敗結果を隔離して保持するTable）の両方へ入ることはない。
 
 **PDF／PowerPointの画像・図表を扱う境界**
 
-`ai_parse_document`は単なる文字抽出ではなく、文書をページ、Text、Table、Figure、Title、Section Header等へ構造化する。本資料では`imageOutputPath`を指定してレンダリング済みページ画像をUnity Catalog Volumeへ保存し、`descriptionElementTypes='*'`でFigure descriptionを生成する。したがって、図やグラフの意味がFigure descriptionへ十分に落ちる場合は、そのテキストだけでも通常のRAG検索に利用できる。
+`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）は単なる文字抽出ではなく、文書をページ、Text、Table、Figure、Title、Section Header等へ構造化する。本資料では`imageOutputPath`（文書解析で生成するページ画像の保存先を指定するAI Function引数）を指定してレンダリング済みページ画像をUnity Catalog Volumeへ保存し、`descriptionElementTypes='*'`（Figure等の要素説明を生成対象に含めるAI Function設定）でFigure descriptionを生成する。したがって、図やグラフの意味がFigure descriptionへ十分に落ちる場合は、そのテキストだけでも通常のRAG検索に利用できる。
 
-一方、グラフの細かな数値、Block Diagram内の接続関係、画像主体のSlideなど、**元画像を見なければ正確に答えられない質問**もある。そのためParse後の画像を捨てず、`ai_prep_search`が返すChunkの`pages[].image_uri`から代表ページの`page_image_uri`をSilver、Gold、Search Sync、AI Searchまで伝播する。本番RAGは通常はTextだけで回答し、十分性判定が`requires_visual_context=true`を返した場合だけ、該当ページ画像をVision-capable Modelへ追加で渡す。
+一方、グラフの細かな数値、Block Diagram内の接続関係、画像主体のSlideなど、**元画像を見なければ正確に答えられない質問**もある。そのためParse後の画像を捨てず、`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）が返すChunkの`pages[].image_uri`（解析結果内のページ画像参照Field）から代表ページの`page_image_uri`（ページ画像の保存先を指すURI）をSilver、Gold、Search Sync、AI Searchまで伝播する。本番RAGは通常はTextだけで回答し、十分性判定が`requires_visual_context=true`（回答にページ画像が必要だと判定した状態）を返した場合だけ、該当ページ画像をVision-capable Modelへ追加で渡す。
 
 この設計では責務を次のように分ける。
 
@@ -1386,15 +1388,15 @@ Textだけで回答可能? ── Yes ──> Text回答
 Vision-capable Model
 ```
 
-`poc/src/03_prep.sql`
+`poc/src/03_prep.sql`（PoCの検索用Prep処理を定義するSQLファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
-| 責務／Dataset | Parse成功バージョンへ`ai_prep_search`を一度だけ実行し、成功と隔離を分離する |
-| 処理順序 | `poc_parsed`→Prep Attempt物理保持→NULL／エラー検査→`poc_prepared`／`poc_prep_errors` |
+| 責務／Dataset | Parse成功バージョンへ`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）を一度だけ実行し、成功と隔離を分離する |
+| 処理順序 | `poc_parsed`（PoCのParse成功結果を保持するTable）→Prep Attempt物理保持→NULL／エラー検査→`poc_prepared`（PoCのPrep成功結果を保持するTable）／`poc_prep_errors`（PoCのPrep失敗結果を隔離して保持するTable） |
 | 重要判定 | Prep失敗をChunk展開へ流さず、バージョン、Processorバージョン、エラーを再試行用に保持する |
-| Lakeflow Pipeline Expectation | `valid_prep_result`。`is_quarantined = false`をWarnで計測し、違反行は`poc_prep_errors`へ明示的に保存する |
-| 再試行／後続 | Attemptを再利用して重複課金を防ぎ、成功だけ`04_chunks_silver.sql`へ渡す |
+| Lakeflow Pipeline Expectation | `valid_prep_result`（Prep結果が正常かを確認する品質条件）。`is_quarantined = false`をWarnで計測し、違反行は`poc_prep_errors`（PoCのPrep失敗結果を隔離して保持するTable）へ明示的に保存する |
+| 再試行／後続 | Attemptを再利用して重複課金を防ぎ、成功だけ`04_chunks_silver.sql`（検索・回答に使うChunkを生成し、Chunk本文・出典・Version MetadataをSilver層へ整える処理）へ渡す |
 
 ```sql
 -- ai_prep_searchもこの試行結果データセットだけで呼ぶ。
@@ -1463,13 +1465,13 @@ WHERE is_quarantined = true;
 
 **想定出力サンプル（Prep分岐）**
 
-| 出力Dataset | `document_version_id` | `prepared_document`／`error_message` | 結果 |
+| 出力Dataset | `document_version_id`（文書内容ごとの不変バージョンID） | `prepared_document`（Prep成功・文書を保持する項目）／`error_message`（処理失敗の理由を保持する項目） | 結果 |
 | --- | --- | --- | --- |
-| `poc_prep_attempts` | `ver-a81f...` | `document.contents`に4 Chunk | AI Functionの生結果を1回だけ保持 |
-| `poc_prepared` | `ver-a81f...` | `error_status=[]` | Chunk展開へ進む |
-| `poc_prep_errors` | `ver-d44e...` | `{"error_code":"PREP_FAILED"}` | 隔離へ分岐 |
+| `poc_prep_attempts`（PoCの検索用整形結果とエラーを一度だけ保持する試行結果Table） | `ver-a81f...` | `document.contents`（ai_prep_search結果内の検索用Content配列）に4 Chunk | AI Functionの生結果を1回だけ保持 |
+| `poc_prepared`（PoCのPrep成功結果を保持するTable） | `ver-a81f...` | `error_status=[]` | Chunk展開へ進む |
+| `poc_prep_errors`（PoCのPrep失敗結果を隔離して保持するTable） | `ver-d44e...` | `{"error_code":"PREP_FAILED"}` | 隔離へ分岐 |
 
-成功表とエラー表は、試行結果データセットのNULL、`error_status`、Parseページ有無、Prep Chunk有無をまとめた同じ隔離条件から相互排他的に生成される。
+成功表とエラー表は、試行結果データセットのNULL、`error_status`（処理エラーの分類・状態）、Parseページ有無、Prep Chunk有無をまとめた同じ隔離条件から相互排他的に生成される。
 
 ##### 3.3.4.1 隔離後に何を調査するか
 
@@ -1542,8 +1544,8 @@ ORDER BY error_count DESC, last_seen_at DESC;
 
 | 順序 | 確認するもの | 何を判断するか |
 | --- | --- | --- |
-| 1 | `document_id`、`document_version_id`、`source_uri` | どの原文書・内容Versionが失敗したか |
-| 2 | `error_message`、`processor_version`、発生時刻 | 入力固有か、特定Processor Version／時間帯に集中した障害か |
+| 1 | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）、`document_version_id`（文書内容ごとの不変バージョンID）、`source_uri`（原文または取得元を特定するURI） | どの原文書・内容Versionが失敗したか |
+| 2 | `error_message`（処理失敗の理由を保持する項目）、`processor_version`（Parse／Prep等の処理ロジックVersion）、発生時刻 | 入力固有か、特定Processor Version／時間帯に集中した障害か |
 | 3 | 原文書を人が開けるか、ページや本文が存在するか、想定形式か | 原文書そのものの破損、空File、暗号化、想定外形式等が疑われるか |
 | 4 | Parse成功後にPrepだけ失敗しているか | Parse以前の問題か、検索用前処理だけの問題か |
 | 5 | 同形式の別文書が同じ処理Versionで成功しているか | 文書固有か、実装／Processor／Platform側の共通障害か |
@@ -1553,16 +1555,16 @@ ORDER BY error_count DESC, last_seen_at DESC;
 
 | 症状 | 主に確認すること | 原因候補 | PoCでの処置 |
 | --- | --- | --- | --- |
-| Parseの`PARSE_NULL_RESULT`／`PARSE_EMPTY_PAGES` | 原文書が開けるか、実ページがあるか、同形式の別文書は成功するか | 文書固有、Parse一時障害、Processor不具合 | 原文書が正常なら同条件で1回だけ再現確認。複数文書で同時発生ならProcessor／Platform側を先に調査 |
-| Parseのページ単位`error_status` | 失敗ページ、画像・表・レイアウト等の共通点 | 特定ページ構造、Parse仕様、入力破損 | 失敗ページを確認し、必要なら元文書の修正版を新Versionとして投入 |
-| Prepの`PREP_NULL_RESULT`／`PREP_EMPTY_CONTENTS` | Parse結果にページ・本文が存在するか | Prep一時障害、Parse結果品質、Prep仕様 | Parse結果が正常ならPrep側を調査。Parse結果自体が不正ならParse／原文書側へ戻す |
-| 同じ`processor_version`で多数文書が同時失敗 | 直前のVersion変更、同時間帯のPipeline／Service状態 | Processor Regression、Platform障害 | 個別文書を何度も再試行せず、共通原因を直してからまとめて再評価 |
-| 1文書だけ繰り返し失敗 | 同形式の他文書との違い | 文書固有 | 原文書修正・変換・分割等を行い、内容が変わる場合は新しい`document_version_id`として扱う |
+| Parseの`PARSE_NULL_RESULT`（Parse・null・結果を指定する設定値／環境変数）／`PARSE_EMPTY_PAGES`（Parse・empty・pagesを指定する設定値／環境変数） | 原文書が開けるか、実ページがあるか、同形式の別文書は成功するか | 文書固有、Parse一時障害、Processor不具合 | 原文書が正常なら同条件で1回だけ再現確認。複数文書で同時発生ならProcessor／Platform側を先に調査 |
+| Parseのページ単位`error_status`（処理エラーの分類・状態） | 失敗ページ、画像・表・レイアウト等の共通点 | 特定ページ構造、Parse仕様、入力破損 | 失敗ページを確認し、必要なら元文書の修正版を新Versionとして投入 |
+| Prepの`PREP_NULL_RESULT`（Prep・null・結果を指定する設定値／環境変数）／`PREP_EMPTY_CONTENTS`（Prep・empty・contentsを指定する設定値／環境変数） | Parse結果にページ・本文が存在するか | Prep一時障害、Parse結果品質、Prep仕様 | Parse結果が正常ならPrep側を調査。Parse結果自体が不正ならParse／原文書側へ戻す |
+| 同じ`processor_version`（Parse／Prep等の処理ロジックVersion）で多数文書が同時失敗 | 直前のVersion変更、同時間帯のPipeline／Service状態 | Processor Regression、Platform障害 | 個別文書を何度も再試行せず、共通原因を直してからまとめて再評価 |
+| 1文書だけ繰り返し失敗 | 同形式の他文書との違い | 文書固有 | 原文書修正・変換・分割等を行い、内容が変わる場合は新しい`document_version_id`（文書内容ごとの不変バージョンID）として扱う |
 
 ここで、**再分類と再試行は別物**である。
 
-- **再分類**：AI Functionの生結果は正常だが、`is_quarantined`の判定条件が誤っていた場合。保存済みAttemptを同じ条件で再評価し、AI Functionを不要に再呼出ししない。
-- **真の再試行**：`ai_parse_document`／`ai_prep_search`自体がNULLやエラーを返した場合。AI Functionの再呼出しが必要であり、同じPipelineを原因確認なしに何度もRunすることではない。
+- **再分類**：AI Functionの生結果は正常だが、`is_quarantined`（正常処理経路から隔離するかを示す項目）の判定条件が誤っていた場合。保存済みAttemptを同じ条件で再評価し、AI Functionを不要に再呼出ししない。
+- **真の再試行**：`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）／`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）自体がNULLやエラーを返した場合。AI Functionの再呼出しが必要であり、同じPipelineを原因確認なしに何度もRunすることではない。
 - **原文書修正**：破損、暗号化、空File、ページ構造等を直した場合。内容Hashが変わるため、新しい文書Versionとして通常経路から処理する。
 - **Processor修正**：複数文書で同じ失敗が出る場合。文書を個別に直すのではなく、Parse／Prep Versionまたは処理ロジックを修正し、新しいEvaluation Runで比較する。
 
@@ -1587,14 +1589,14 @@ flowchart TD
 
 Materialized Viewは、上流Tableから導出した現在値をLakeflowがRefreshするDatasetである。追記履歴を保持するStreaming Tableと異なり、PoC Goldでは各論理文書の最新成功バージョンだけを現在の検索対象として見せるために使う。ただし、この「最新」はPoC限定であり、本番では文書マニフェストの承認参照一致へ置き換える。
 
-`poc/src/04_chunks_silver.sql`
+`poc/src/04_chunks_silver.sql`（PoCのChunk生成を定義するSQLファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | 責務／Dataset | Prepared VARIANTをChunk単位へ展開し、バージョン付きSilver履歴を追記する |
-| 処理順序 | `variant_explode`→Position補完→Chunkバージョン Hash→Embed／Retrieve本文→Page／Page Image参照抽出 |
-| 重要判定 | `chunk_to_embed`と`chunk_to_retrieve`を別列で維持し、`pages[].image_uri`の代表値を`page_image_uri`へ残す。画像Pathは回答本文や長期Traceへ出さない |
-| 再試行／後続 | Streaming履歴として再開し、`05_gold_poc.sql`が論理文書ごとの最新成功バージョンを選ぶ |
+| 処理順序 | `variant_explode`（ai_parse_documentのVariant結果を行へ展開する処理）→Position補完→Chunkバージョン Hash→Embed／Retrieve本文→Page／Page Image参照抽出 |
+| 重要判定 | `chunk_to_embed`（Embedding生成へ渡すChunk本文）と`chunk_to_retrieve`（検索後にLLMへ返すChunk本文）を別列で維持し、`pages[].image_uri`（解析結果内のページ画像参照Field）の代表値を`page_image_uri`（ページ画像の保存先を指すURI）へ残す。画像Pathは回答本文や長期Traceへ出さない |
+| 再試行／後続 | Streaming履歴として再開し、`05_gold_poc.sql`（PoCで検索対象にする承認済みCurrent ChunkをGold層へ絞り込む処理）が論理文書ごとの最新成功バージョンを選ぶ |
 
 ```sql
 -- PoC Silver層。chunk_to_embedは検索用、chunk_to_retrieveは回答Context用である。
@@ -1628,23 +1630,23 @@ SELECT
 FROM exploded;
 ```
 
-**想定出力サンプル（`poc_chunks_silver`）**
+**想定出力サンプル（`poc_chunks_silver`（PoCのVersion付き検索Chunk履歴を保持するSilver Table））**
 
-| `chunk_version_id` | `document_id` | `document_version_id` | `chunk_position` | `chunk_to_embed` | `chunk_to_retrieve` | `page_number` | `page_image_uri` | `chunk_schema_version` |
+| `chunk_version_id`（検索Chunkの内容・版を一意に識別するID） | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID） | `chunk_position`（文書内でのChunk位置を示す項目） | `chunk_to_embed`（Embedding生成へ渡すChunk本文） | `chunk_to_retrieve`（検索後にLLMへ返すChunk本文） | `page_number`（根拠情報が存在するページ番号） | `page_image_uri`（ページ画像の保存先を指すURI） | `chunk_schema_version`（Chunk生成Schema／規則のVersion） |
 | --- | --- | --- | ---: | --- | --- | ---: | --- | --- |
 | `chunk-01a9...` | `POC-7f1c...` | `ver-a81f...` | 0 | `RAG基盤 Databricks AI Search...` | `当社RAG基盤ではDatabricks AI Searchを利用する。` | 2 | `/Volumes/.../parsed_images/.../page-2.png` | `poc-v1` |
 | `chunk-02b8...` | `POC-7f1c...` | `ver-a81f...` | 1 | `検索方式 HYBRID ANN...` | `検索方式はHYBRIDを既定とする。` | 3 | `/Volumes/.../parsed_images/.../page-3.png` | `poc-v1` |
 
-`chunk_to_embed`は検索照合用、`chunk_to_retrieve`は回答Context用であり、同じ用途として扱わない。`page_image_uri`は内部参照であり、利用者表示、Trace本文、SSEへそのまま出さない。
+`chunk_to_embed`（Embedding生成へ渡すChunk本文）は検索照合用、`chunk_to_retrieve`（検索後にLLMへ返すChunk本文）は回答Context用であり、同じ用途として扱わない。`page_image_uri`（ページ画像の保存先を指すURI）は内部参照であり、利用者表示、Trace本文、SSEへそのまま出さない。
 
-`poc/src/05_gold_poc.sql`
+`poc/src/05_gold_poc.sql`（PoCの検索公開用Goldを定義するSQLファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | 責務／Dataset | PoC限定で各論理文書の最新Parse／Prep成功バージョンだけを検索公開するMaterialized View |
-| 処理順序 | バージョン別最終時刻集計→`QUALIFY ROW_NUMBER()`で文書ごとの最新版を1件へ絞り込み→Silver Chunkへバージョン Join |
+| 処理順序 | バージョン別最終時刻集計→`QUALIFY ROW_NUMBER()`（Window関数の順位で行を絞り込むSQLパターン）で文書ごとの最新版を1件へ絞り込み→Silver Chunkへバージョン Join |
 | 重要判定 | Parse／Prep失敗を除外するが承認を表さないため一般公開しない。本番では文書マニフェストの公開バージョン参照一致へ置換 |
-| Lakeflow Pipeline Expectation | `valid_gold_keys`、`valid_gold_content`。必須キーまたは本文の違反時はFail UpdateでGold更新を停止する |
+| Lakeflow Pipeline Expectation | `valid_gold_keys`（Gold公開に必要なKeyが有効かを確認する品質条件）、`valid_gold_content`（Gold公開するChunk本文が有効かを確認する品質条件）。必須キーまたは本文の違反時はFail UpdateでGold更新を停止する |
 | 再試行／後続 | Source変更時に再計算され、PoC AI Search IndexのSourceとなる |
 
 ```sql
@@ -1690,18 +1692,18 @@ INNER JOIN latest_versions AS versions
  AND chunks.document_version_id = versions.document_version_id;
 ```
 
-**想定出力サンプル（`poc_chunks_gold`）**
+**想定出力サンプル（`poc_chunks_gold`（PoCで検索対象にする現在Chunkを保持するGold Table））**
 
-| `document_id` | Silverにあるバージョン | Goldへ出るバージョン | `chunk_version_id` | 理由 |
+| `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | Silverにあるバージョン | Goldへ出るバージョン | `chunk_version_id`（検索Chunkの内容・版を一意に識別するID） | 理由 |
 | --- | --- | --- | --- | --- |
 | `POC-7f1c...` | `ver-a81f...`、`ver-b72e...` | `ver-b72e...` | `chunk-11c7...` | PoCでは最新のParse／Prep成功バージョンを採用するため |
 | `POC-9d8e...` | `ver-c33d...`のみ | なし | なし | ParseエラーでSilver Chunkへ到達していないため |
 
-このPoC Goldは承認を表さない。`versions` CTEでSilver ChunkをDocument Version粒度へ集約し、`latest_versions` CTE内の`QUALIFY ROW_NUMBER()`でDocument単位の最新成功Versionを1件へ絞り、そのVersionの全Chunkを後続Joinで取得する。これらのCTEはデータ粒度と処理段階を分けるために残す。本番では「最新」ではなく文書マニフェストの承認参照と一致するバージョンだけを公開する。
+このPoC Goldは承認を表さない。`versions`（文書Version単位へ集約するSQL CTE名） CTEでSilver ChunkをDocument Version粒度へ集約し、`latest_versions`（論理文書ごとの最新Version候補を保持する中間Dataset） CTE内の`QUALIFY ROW_NUMBER()`（Window関数の順位で行を絞り込むSQLパターン）でDocument単位の最新成功Versionを1件へ絞り、そのVersionの全Chunkを後続Joinで取得する。これらのCTEはデータ粒度と処理段階を分けるために残す。本番では「最新」ではなく文書マニフェストの承認参照と一致するバージョンだけを公開する。
 
 #### 3.3.6 PoC AI Search、RAG、評価
 
-Databricks AI Searchは、Delta TableをVector／Hybrid検索用Indexへ同期し、Metadata Filter付きでChunkを取得するServiceである。PoCでは`poc_chunks_gold`から開発用Delta Sync Indexを1つ作り、Vector Search Endpoint上で実行する。Endpointは検索Compute、Indexは`chunk_version_id`をPrimary Keyとする検索資産であり、作成状態、同期結果、最小検索はVector Search UIとSmoke Testで確認する。
+Databricks AI Searchは、Delta TableをVector／Hybrid検索用Indexへ同期し、Metadata Filter付きでChunkを取得するServiceである。PoCでは`poc_chunks_gold`（PoCで検索対象にする現在Chunkを保持するGold Table）から開発用Delta Sync Indexを1つ作り、Vector Search Endpoint上で実行する。Endpointは検索Compute、Indexは`chunk_version_id`（検索Chunkの内容・版を一意に識別するID）をPrimary Keyとする検索資産であり、作成状態、同期結果、最小検索はVector Search UIとSmoke Testで確認する。
 
 Index作成は手動Jobでもよいが、設定はGitへ保存する。RAGはACLやリリース構成台帳をまだ持たず、取得Chunkだけから回答し、出典が不足する場合は拒否する。
 
@@ -1709,32 +1711,32 @@ Index作成は手動Jobでもよいが、設定はGitへ保存する。RAGはACL
 
 PoCでもApplication Codeの前に、Model、Experiment、Prompt Schema、EvaluationDataset Schema、AI Search Endpointを準備する。ただし、UC Trace Storage、Production Monitoring、複雑なLabeling Session、本番と同じSP職務分離はPoC必須としない。
 
-MLflow Experimentは評価処理そのものではなく、Run、Trace、Assessment、Datasetを同じ管理単位として閲覧するWorkspace Resourceである。PoCでは`/Shared/llmops/${bundle.target}/internal-rag-poc`をDABで作成し、そのExperiment IDをRAG、Evaluation Job、Smoke Testへ明示的に渡す。Default Experimentへ誤保存しないことをSmoke TestとMLflow Experiment UIで確認する。
+MLflow Experimentは評価処理そのものではなく、Run、Trace、Assessment、Datasetを同じ管理単位として閲覧するWorkspace Resourceである。PoCでは`/Shared/llmops/${bundle.target}/internal-rag-poc`（Deploy Targetごとに分離するWorkspace上の物理Path）をDABで作成し、そのExperiment IDをRAG、Evaluation Job、Smoke Testへ明示的に渡す。Default Experimentへ誤保存しないことをSmoke TestとMLflow Experiment UIで確認する。
 
 **Model呼出しの標準方式**
 
-本資料の新規標準は、Platform管理者が作成した**Unity AI Gateway Model Service（Unity Catalog上の`catalog.schema.service`というSecurable）**をApplicationが参照する方式とする。PoC BundleはModelを提供するResourceを作成せず、完全修飾名を変数で受け取る。System-provided Model APIは即時利用できるが、金融機関向けでは用途別の権限、Rate Limit、Fallback、コスト配賦を管理できる組織共通Model Serviceを推奨する。
+本資料の新規標準は、Platform管理者が作成した**Unity AI Gateway Model Service（Unity Catalog上の`catalog.schema.service`（Unity Catalog上のModel Service FQN形式）というSecurable）**をApplicationが参照する方式とする。PoC BundleはModelを提供するResourceを作成せず、完全修飾名を変数で受け取る。System-provided Model APIは即時利用できるが、金融機関向けでは用途別の権限、Rate Limit、Fallback、コスト配賦を管理できる組織共通Model Serviceを推奨する。
 
 | 用途 | Bundle変数／互換Environment Variable | 物理的な実体 | 利用理由 | PoC時の制御 |
 | --- | --- | --- | --- | --- |
-| Answer Model | `answer_model_service`／`POC_MODEL_ENDPOINT` | 組織共通Answer Model Service。値はFQN | RAG回答を生成する | `temperature=0`、QPM／TPM上限、Fallbackなしまたは1系統 |
-| Judge Model | `judge_model_service`／`POC_JUDGE_MODEL` | 組織共通Judge Model Service。値は`databricks:/<service-or-endpoint>`としてScorerへ渡す | 回答Modelと独立した意味評価 | 評価時のみ呼び、コスト上限を別管理 |
+| Answer Model | `answer_model_service`（回答生成に利用するModel Service）／`POC_MODEL_ENDPOINT`（PoC回答Model Service名を指定する環境変数） | 組織共通Answer Model Service。値はFQN | RAG回答を生成する | `temperature=0`（生成ModelのSamplingを決定論寄りに固定する推論設定）、QPM／TPM上限、Fallbackなしまたは1系統 |
+| Judge Model | `judge_model_service`（品質判定に利用するJudge Model Service）／`POC_JUDGE_MODEL`（PoC Judge Model Service名を指定する環境変数） | 組織共通Judge Model Service。値は`databricks:/<service-or-endpoint>`としてScorerへ渡す | 回答Modelと独立した意味評価 | 評価時のみ呼び、コスト上限を別管理 |
 | Prompt Optimization Reflection | PoCでは未設定 | 本番後のReflection専用Model Service | PoC範囲にOptimizationを入れない | 未使用 |
 | Judge Alignment Reflection | PoCでは未設定 | 本番後のAlignment専用Model Service | Human Label不足のPoCで過剰設計しない | 未使用 |
 
-`POC_MODEL_ENDPOINT`という既存名は互換性のため維持するが、値はLegacy Serving Endpoint名ではなくModel Service FQNである。新規Codeでは`answer_model_service`を正式名とし、互換Environment VariableへはJob LauncherまたはApp設定が明示的に同じ値を渡す。
+`POC_MODEL_ENDPOINT`（PoC回答Model Service名を指定する環境変数）という既存名は互換性のため維持するが、値はLegacy Serving Endpoint名ではなくModel Service FQNである。新規Codeでは`answer_model_service`（回答生成に利用するModel Service）を正式名とし、互換Environment VariableへはJob LauncherまたはApp設定が明示的に同じ値を渡す。
 
 | Resource／設定 | 機能概要 | 物理的な実体 | 初めて必要 | 作成・設定主体 | 作成方法 | 利用主体／必要権限 | 設定値の受渡し／確認方法 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Answer Model Service | 統一APIで回答Modelを提供 | UC Model Service | PoC前 | Platform管理者 | AI Gateway UIまたはUC REST API | PoC実行主体に`USE CATALOG`、`USE SCHEMA`、`EXECUTE` | FQNを`answer_model_service`→`POC_MODEL_ENDPOINT`へ渡し、最小推論と200 Responseを確認 |
-| Judge Model Service | 意味評価用Modelを提供 | UC Model Service | PoC評価前 | Platform管理者、Quality Owner | AI Gateway UIまたはUC REST API | PoC Quality実行主体に`EXECUTE` | FQN／Endpoint URIを`POC_JUDGE_MODEL`へ渡しJudge最小呼出しを確認 |
-| PoC MLflow Experiment | Trace、Evaluation Run、Assessment、Datasetの管理単位 | Workspace Experiment `/Shared/llmops/${bundle.target}/internal-rag-poc` | PoC前 | PoC DAB | DAB `experiments` Resource | Developerに`CAN_EDIT`、Reviewerに`CAN_READ` | `${resources.experiments.poc_experiment.id}`をJob Parameter／Local Envに渡し、Trace UIでIDを確認 |
-| PoC Trace保存 | 小規模TraceをExperiment内で保存 | Experiment既定Storage | PoC前 | MLflow | Experiment作成時の既定 | `CAN_EDIT`で書込、`CAN_READ`で閲覧 | Smoke Test TraceのExperiment IDを確認。UC Traceへの移行は本番化Gap |
-| Prompt Registry Schema | Promptバージョン・エイリアスをUCで管理 | `main.llmops_poc` SchemaのPrompt Resource | PoC前 | UC管理者 | SQL Grant／Catalog Explorer | 登録者に`CREATE FUNCTION`、`EXECUTE`、`MANAGE`、実行環境に`EXECUTE` | `MLFLOW_REGISTRY_URI=databricks-uc`、Prompt FQN、Prompts UIでバージョン／エイリアスを確認 |
-| PoC EvaluationDataset | 固定PoC Caseの評価正本 | UC Table `main.llmops_poc.internal_rag_poc_evaluation` | PoC評価前 | PoC初期セットアップJob | MLflow SDK `create_dataset()`／`merge_records()` | 初期セットアップに`CREATE TABLE`、Evaluationに`SELECT` | Dataset FQNをJob Parameterに渡し、Dataset UIで`case_id`と件数を確認 |
-| AI Search Endpoint／Index | Gold ChunkをHybrid Search | Endpoint／Delta Sync Index | PoC RAG前 | PoC開発者 | SDK、UI | PoC実行主体にQuery権限 | `poc_index_name`→`POC_INDEX_NAME`、Index `ONLINE`とGolden Queryを確認 |
+| Answer Model Service | 統一APIで回答Modelを提供 | UC Model Service | PoC前 | Platform管理者 | AI Gateway UIまたはUC REST API | PoC実行主体に`USE CATALOG`（Catalogを利用するSQL権限）、`USE SCHEMA`（Schemaを利用するSQL権限）、`EXECUTE`（対象Function／Model等を実行するSQL権限） | FQNを`answer_model_service`（回答生成に利用するModel Service）→`POC_MODEL_ENDPOINT`（PoC回答Model Service名を指定する環境変数）へ渡し、最小推論と200 Responseを確認 |
+| Judge Model Service | 意味評価用Modelを提供 | UC Model Service | PoC評価前 | Platform管理者、Quality Owner | AI Gateway UIまたはUC REST API | PoC Quality実行主体に`EXECUTE`（対象Function／Model等を実行するSQL権限） | FQN／Endpoint URIを`POC_JUDGE_MODEL`（PoC Judge Model Service名を指定する環境変数）へ渡しJudge最小呼出しを確認 |
+| PoC MLflow Experiment | Trace、Evaluation Run、Assessment、Datasetの管理単位 | Workspace Experiment `/Shared/llmops/${bundle.target}/internal-rag-poc`（Deploy Targetごとに分離するWorkspace上の物理Path） | PoC前 | PoC DAB | DAB `experiments`（DABでMLflow Experiment Resourceを定義するBlock名） Resource | Developerに`CAN_EDIT`（対象MLflow Resourceを編集する権限）、Reviewerに`CAN_READ`（対象MLflow Resourceを参照する権限） | `${resources.experiments.poc_experiment.id}`（DAB Resourceから実体ID／値を解決する参照式）をJob Parameter／Local Envに渡し、Trace UIでIDを確認 |
+| PoC Trace保存 | 小規模TraceをExperiment内で保存 | Experiment既定Storage | PoC前 | MLflow | Experiment作成時の既定 | `CAN_EDIT`（対象MLflow Resourceを編集する権限）で書込、`CAN_READ`（対象MLflow Resourceを参照する権限）で閲覧 | Smoke Test TraceのExperiment IDを確認。UC Traceへの移行は本番化Gap |
+| Prompt Registry Schema | Promptバージョン・エイリアスをUCで管理 | `main.llmops_poc`（Unity Catalog上の物理Resource名） SchemaのPrompt Resource | PoC前 | UC管理者 | SQL Grant／Catalog Explorer | 登録者に`CREATE FUNCTION`（Unity Catalog Function／Prompt Resource作成に必要なSQL権限）、`EXECUTE`（対象Function／Model等を実行するSQL権限）、`MANAGE`（対象Resourceを管理する権限）、実行環境に`EXECUTE`（対象Function／Model等を実行するSQL権限） | `MLFLOW_REGISTRY_URI=databricks-uc`（MLflow RegistryをUnity Catalogへ固定する設定）、Prompt FQN、Prompts UIでバージョン／エイリアスを確認 |
+| PoC EvaluationDataset | 固定PoC Caseの評価正本 | UC Table `main.llmops_poc.internal_rag_poc_evaluation`（PoCの固定評価Caseを保持するMLflow Evaluation Dataset） | PoC評価前 | PoC初期セットアップJob | MLflow SDK `create_dataset()`（MLflow Evaluation Datasetを作成するAPI）／`merge_records()`（Evaluation DatasetへCaseを冪等に追加・更新するAPI） | 初期セットアップに`CREATE TABLE`、Evaluationに`SELECT`（Table／Viewを読み取るSQL権限） | Dataset FQNをJob Parameterに渡し、Dataset UIで`case_id`（評価Caseを識別するID）と件数を確認 |
+| AI Search Endpoint／Index | Gold ChunkをHybrid Search | Endpoint／Delta Sync Index | PoC RAG前 | PoC開発者 | SDK、UI | PoC実行主体にQuery権限 | `poc_index_name`（PoCで利用するAI Search Index名）→`POC_INDEX_NAME`（PoCで利用するAI Search Index名を指定する環境変数）、Index `ONLINE`（onlineを指定する設定値／環境変数）とGolden Queryを確認 |
 
-PoC Prompt Schemaの権限は次のように分ける。`MANAGE`はエイリアス変更や権限管理を行うPrompt Managerに限定し、PoC実行環境は`USE CATALOG`、`USE SCHEMA`、`EXECUTE`だけとする。PoC担当者に本番Schemaの`MANAGE`を付与しない。
+PoC Prompt Schemaの権限は次のように分ける。`MANAGE`（対象Resourceを管理する権限）はエイリアス変更や権限管理を行うPrompt Managerに限定し、PoC実行環境は`USE CATALOG`（Catalogを利用するSQL権限）、`USE SCHEMA`（Schemaを利用するSQL権限）、`EXECUTE`（対象Function／Model等を実行するSQL権限）だけとする。PoC担当者に本番Schemaの`MANAGE`（対象Resourceを管理する権限）を付与しない。
 
 ```sql
 -- UC管理者が一度だけ実行するPoC Schema Grantの例。
@@ -1748,17 +1750,17 @@ GRANT EXECUTE ON SCHEMA main.llmops_poc TO `<poc-runtime-principal>`;
 GRANT CREATE TABLE ON SCHEMA main.llmops_poc TO `<poc-bootstrap-principal>`;
 ```
 
-`poc/resources/poc_mlflow.yml`
+`poc/resources/poc_mlflow.yml`（PoC専用MLflow Experimentと利用権限・Experiment ID受渡しを定義するResource設定）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | このFileの責務 | PoC専用Experimentを一度だけ作成し、Developer／Reviewer権限とExperiment IDの受渡し元を定義する |
-| 呼出元／実行契機 | `databricks bundle deploy -t <target>` |
+| 呼出元／実行契機 | `databricks bundle deploy -t <target>`（DAB ResourceをWorkspaceへ配備するCLIコマンド） |
 | 読取／更新 | Bundle Target／Group変数を読み、Workspace Experimentを作成・更新する |
 | 主な処理順序 | Target解決→Experiment Path確定→ACL適用→Resource IDを初期セットアップ／Evaluation Jobへ公開 |
 | 重要な判定 | PoCではUC Trace Locationを設定しない。同PathのExperimentをSDKで重複作成しない |
 | 正常／失敗／再試行 | Deploy成功時は同じExperiment IDを維持。ACL適用失敗時は初期セットアップJobを起動しない |
-| 後続処理 | `poc_bootstrap_job`、`poc_evaluation_job`、Trace記録 |
+| 後続処理 | `poc_bootstrap_job`（PoCのExperiment／Dataset／Prompt等を初期化するJob名）、`poc_evaluation_job`（PoC Evaluationを実行するLakeflow Job Resource名）、Trace記録 |
 
 ```yaml
 # PoCのTrace、Evaluation Run、Assessment、DatasetをひとつのUI入口で確認するExperimentを定義する。
@@ -1780,25 +1782,25 @@ resources:
 
 | Experiment Path | Resource IDの参照 | Trace Storage |
 | --- | --- | --- |
-| `/Shared/llmops/dev/internal-rag-poc` | `${resources.experiments.poc_experiment.id}` | PoCはExperiment既定Storage |
+| `/Shared/llmops/dev/internal-rag-poc`（対象Resource／ソースを指す物理パス） | `${resources.experiments.poc_experiment.id}`（DAB Resourceから実体ID／値を解決する参照式） | PoCはExperiment既定Storage |
 
 ##### 3.3.6.2 PoC設定値の受渡し
 
-DABのServerless Jobに存在しない汎用`environment_variables` Fieldを作らない。JobはDAB Resource参照とBundle変数をTask ParameterでPythonへ渡し、Pythonは`argparse`で必須値を受け取る。Local実行とDatabricks AppsだけはEnvironment Variableを使い、未設定時に個人Experiment、Default Model、Default SchemaへFallbackしない。
+DABのServerless Jobに存在しない汎用`environment_variables`（Jobへ環境変数を渡すと仮定したField名。本文ではServerless Jobに存在しない点を説明） Fieldを作らない。JobはDAB Resource参照とBundle変数をTask ParameterでPythonへ渡し、Pythonは`argparse`（Pythonのコマンドライン引数解析Module）で必須値を受け取る。Local実行とDatabricks AppsだけはEnvironment Variableを使い、未設定時に個人Experiment、Default Model、Default SchemaへFallbackしない。
 
 | 論理設定 | DAB変数／Resource | Job Parameter | Local／App Environment Variable | 値の作成者 |
 | --- | --- | --- | --- | --- |
-| PoC Experiment ID | `${resources.experiments.poc_experiment.id}` | `--experiment-id` | `MLFLOW_POC_EXPERIMENT_ID`／互換`MLFLOW_EXPERIMENT_ID` | DAB Deploy |
-| Tracking URI | `mlflow_tracking_uri` | `--tracking-uri` | `MLFLOW_TRACKING_URI` | Platform Policy／DAB |
-| Registry URI | `mlflow_registry_uri` | `--registry-uri` | `MLFLOW_REGISTRY_URI` | Platform Policy／DAB |
-| Answer Model | `answer_model_service` | `--answer-model-service` | `POC_MODEL_ENDPOINT` | Platform管理者 |
-| Judge Model | `judge_model_service` | `--judge-model` | `POC_JUDGE_MODEL` | Platform／Quality Owner |
-| AI Search Index | `poc_index_name` | `--index-name` | `POC_INDEX_NAME` | `create_search_index.py` |
-| EvaluationDataset | `poc_evaluation_dataset` | `--dataset-name` | `POC_EVALUATION_DATASET` | PoC初期セットアップJob |
-| Prompt URI | `poc_prompt_uri` | `--prompt-uri` | `POC_PROMPT_URI` | `register_poc_prompt.py` |
-| Corpusバージョン | `poc_corpus_version` | `--corpus-version` | `POC_CORPUS_VERSION` | PoC Release担当 |
-| Chunk Schema | `poc_chunk_schema_version` | `--chunk-schema-version` | `POC_CHUNK_SCHEMA_VERSION` | Pipeline Source |
-| Git Commit | `git_commit` | `--git-commit` | `GIT_COMMIT` | CI |
+| PoC Experiment ID | `${resources.experiments.poc_experiment.id}`（DAB Resourceから実体ID／値を解決する参照式） | `--experiment-id`（保存先MLflow Experiment IDを渡すCLI引数） | `MLFLOW_POC_EXPERIMENT_ID`（PoC Trace／Evaluation保存先Experiment IDを指定する環境変数）／互換`MLFLOW_EXPERIMENT_ID`（Realtime Trace保存先Experiment IDを指定する環境変数） | DAB Deploy |
+| Tracking URI | `mlflow_tracking_uri`（MLflow Tracking先を指定するDAB／Job設定） | `--tracking-uri`（MLflow Tracking URIを渡すCLI引数） | `MLFLOW_TRACKING_URI`（MLflow Tracking先を指定する環境変数） | Platform Policy／DAB |
+| Registry URI | `mlflow_registry_uri`（MLflow Registry先を指定するDAB／Job設定） | `--registry-uri`（MLflow Registry URIを渡すCLI引数） | `MLFLOW_REGISTRY_URI`（MLflow Registry保存先を指定する環境変数） | Platform Policy／DAB |
+| Answer Model | `answer_model_service`（回答生成に利用するModel Service） | `--answer-model-service`（回答Model Service名を渡すCLI引数） | `POC_MODEL_ENDPOINT`（PoC回答Model Service名を指定する環境変数） | Platform管理者 |
+| Judge Model | `judge_model_service`（品質判定に利用するJudge Model Service） | `--judge-model`（Judge Model Service名を渡すCLI引数） | `POC_JUDGE_MODEL`（PoC Judge Model Service名を指定する環境変数） | Platform／Quality Owner |
+| AI Search Index | `poc_index_name`（PoCで利用するAI Search Index名） | `--index-name`（AI Search Index名を渡すCLI引数） | `POC_INDEX_NAME`（PoCで利用するAI Search Index名を指定する環境変数） | `create_search_index.py`（承認済み検索同期TableからAI Search Indexを作成・更新し、検索可能状態まで同期する処理） |
+| EvaluationDataset | `poc_evaluation_dataset`（PoCで利用するEvaluation Dataset名設定） | `--dataset-name`（Evaluation Dataset名を渡すCLI引数） | `POC_EVALUATION_DATASET`（PoC Evaluation Dataset名を指定する環境変数） | PoC初期セットアップJob |
+| Prompt URI | `poc_prompt_uri`（PoCで利用するPrompt Version URI設定） | `--prompt-uri`（利用Promptの不変Version URIを渡すCLI引数） | `POC_PROMPT_URI`（PoC回答PromptのVersion URIを指定する環境変数） | `register_poc_prompt.py`（PoCで利用するPromptをMLflow Prompt Registryへ登録し、評価対象Versionを固定する処理） |
+| Corpusバージョン | `poc_corpus_version`（PoCで固定する文書集合Version設定） | `--corpus-version`（PoC文書集合Versionを渡すCLI引数） | `POC_CORPUS_VERSION`（PoC文書集合Versionを指定する環境変数） | PoC Release担当 |
+| Chunk Schema | `poc_chunk_schema_version`（PoCで固定するChunk Schema Version設定） | `--chunk-schema-version`（Chunk Schema Versionを渡すCLI引数） | `POC_CHUNK_SCHEMA_VERSION`（PoC Chunk Schema Versionを指定する環境変数） | Pipeline Source |
+| Git Commit | `git_commit`（実行コードを特定するGit Commit） | `--git-commit`（実行CodeのGit Commitを渡すCLI引数） | `GIT_COMMIT`（実行CodeのGit Commitを指定する環境変数） | CI |
 
 ```mermaid
 flowchart TD
@@ -1816,20 +1818,20 @@ flowchart TD
 
 ##### 3.3.6.3 PoC PromptをPrompt Registryへ登録する
 
-Prompt Registryは、Prompt Templateを名前、変更不能なバージョン、可変エイリアスで管理するMLflow Resourceである。このシステムではUnity Catalog上の`main.llmops_poc.internal_rag_answer`を物理的なPrompt名とし、PoC用`development` エイリアスだけを更新する。実行再現性を保つため、RAGはエイリアスを解決した後のバージョン URIをTraceへ記録する。
+Prompt Registryは、Prompt Templateを名前、変更不能なバージョン、可変エイリアスで管理するMLflow Resourceである。このシステムではUnity Catalog上の`main.llmops_poc.internal_rag_answer`（PoC回答Promptを管理するPrompt Registry上のPrompt名）を物理的なPrompt名とし、PoC用`development`（開発用の可変参照先を表すAlias） エイリアスだけを更新する。実行再現性を保つため、RAGはエイリアスを解決した後のバージョン URIをTraceへ記録する。
 
-`poc/src/register_poc_prompt.py`
+`poc/src/register_poc_prompt.py`（PoC PromptをPrompt Registryへ登録するPythonファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
-| このFileの責務 | Answer PromptをUC Prompt Registryへ不変バージョンとして登録し、PoC専用`development` エイリアスだけを更新する |
+| このFileの責務 | Answer PromptをUC Prompt Registryへ不変バージョンとして登録し、PoC専用`development`（開発用の可変参照先を表すAlias） エイリアスだけを更新する |
 | 呼出元／実行契機 | PoC初期セットアップJob、Prompt変更の承認後 |
-| 読取対象 | Git管理Template、`--tracking-uri`、`--registry-uri` |
-| 更新対象 | `main.llmops_poc.internal_rag_answer`の新バージョンと`development` エイリアス |
+| 読取対象 | Git管理Template、`--tracking-uri`（MLflow Tracking URIを渡すCLI引数）、`--registry-uri`（MLflow Registry URIを渡すCLI引数） |
+| 更新対象 | `main.llmops_poc.internal_rag_answer`（PoC回答Promptを管理するPrompt Registry上のPrompt名）の新バージョンと`development`（開発用の可変参照先を表すAlias） エイリアス |
 | 主な処理順序 | Tracking／Registry Backend固定→Promptバージョン登録→登録バージョン確認→PoC エイリアス切替→不変URI出力 |
 | 重要な判定 | 本番エイリアスを変更しない。実行環境はエイリアスだけでなく解決済みバージョンをTraceへ保存する |
 | 正常／失敗／再試行 | 正常時は新バージョンとURIを出力。登録失敗時はエイリアスを変更しない。再試行は別バージョンを作るため、同Template重複の採用可否をRun Logで判断 |
-| Trace／後続 | `rag_app.py`と`evaluate_poc.py`がPromptをLoadし、Trace／Evaluation Runに解決バージョンを記録 |
+| Trace／後続 | `rag_app.py`（PoC RAGの検索・回答生成・Trace記録を1 Requestとして実行する処理）と`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）がPromptをLoadし、Trace／Evaluation Runに解決バージョンを記録 |
 
 ```python
 """PoC回答PromptをMLflow Prompt Registryへ登録するModule。
@@ -1890,31 +1892,31 @@ if __name__ == "__main__":
 
 | 項目 | 値 |
 | --- | --- |
-| Prompt名 | `main.llmops_poc.internal_rag_answer` |
+| Prompt名 | `main.llmops_poc.internal_rag_answer`（PoC回答Promptを管理するPrompt Registry上のPrompt名） |
 | 登録バージョン | `3` |
 | エイリアス | `development -> 3` |
 | Console出力 | `prompts:/main.llmops_poc.internal_rag_answer/3` |
 
-再実行するとバージョン `3`を上書きせず、新しいバージョン `4`を作成して`development` エイリアスだけを更新する。
+再実行するとバージョン `3`を上書きせず、新しいバージョン `4`を作成して`development`（開発用の可変参照先を表すAlias） エイリアスだけを更新する。
 
 ##### 3.3.6.4 Seed FixtureをPoC EvaluationDatasetへ反映する
 
-EvaluationDatasetは、評価InputとMLflow ExpectationをUnity Catalogで保持し、MLflow ExperimentからバージョンとDigestを追跡できる評価ケースの正本である。このPoCでは`main.llmops_poc.internal_rag_poc_evaluation`というUC Tableが物理的な実体になる。
+EvaluationDatasetは、評価InputとMLflow ExpectationをUnity Catalogで保持し、MLflow ExperimentからバージョンとDigestを追跡できる評価ケースの正本である。このPoCでは`main.llmops_poc.internal_rag_poc_evaluation`（PoCの固定評価Caseを保持するMLflow Evaluation Dataset）というUC Tableが物理的な実体になる。
 
-`tests/poc_cases.json`はEvaluationDatasetそのものではなく、GitでReviewする初期Seed Fixtureである。PoC初期セットアップJobがJSONをEvaluationDatasetへ冪等反映し、`evaluate_poc.py`はJSONを直接読まずDatasetを取得する。
+`tests/poc_cases.json`（PoCの初期評価CaseをGit管理するSeed JSON）はEvaluationDatasetそのものではなく、GitでReviewする初期Seed Fixtureである。PoC初期セットアップJobがJSONをEvaluationDatasetへ冪等反映し、`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）はJSONを直接読まずDatasetを取得する。
 
-`poc/src/seed_poc_evaluation_dataset.py`
+`poc/src/seed_poc_evaluation_dataset.py`（PoCのSeed CaseをEvaluation Datasetへ登録するPythonファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
-| このFileの責務 | Git管理Seedを`inputs`／`expectations`／`tags`契約へ変換し、PoC Experimentに関連付くUC EvaluationDatasetへ反映する |
+| このFileの責務 | Git管理Seedを`inputs`（Evaluation Datasetへ保存する評価対象の入力）／`expectations`（Evaluation Datasetへ保存する期待値）／`tags`（Evaluation CaseをSlice分析するためのTag集合）契約へ変換し、PoC Experimentに関連付くUC EvaluationDatasetへ反映する |
 | 呼出元／実行契機 | PoC初期セットアップJob、Seedバージョン変更時 |
-| 読取対象 | `tests/poc_cases.json`、Experiment ID、Dataset FQN、Seedバージョン |
-| 更新対象 | `main.llmops_poc.internal_rag_poc_evaluation` |
-| 主な処理順序 | MLflow Backend／Experiment固定→Dataset取得または作成→JSON Validation→Case正規化→`case_id+seed_version`で既存確認→未反映RecordだけMerge→件数確認 |
+| 読取対象 | `tests/poc_cases.json`（PoCの初期評価CaseをGit管理するSeed JSON）、Experiment ID、Dataset FQN、Seedバージョン |
+| 更新対象 | `main.llmops_poc.internal_rag_poc_evaluation`（PoCの固定評価Caseを保持するMLflow Evaluation Dataset） |
+| 主な処理順序 | MLflow Backend／Experiment固定→Dataset取得または作成→JSON Validation→Case正規化→`case_id+seed_version`（Seed Caseの重複登録を防ぐ複合Key）で既存確認→未反映RecordだけMerge→件数確認 |
 | 重要な判定 | Case ID、質問、期待拒否を必須とし、機密情報はSeedに含めない。既存バージョンを上書きしない |
 | 正常／失敗／再試行 | 正常時はDataset名・Seedバージョン・追加数・総件数を出力。失敗時はEvaluationを開始しない。再試行は反映済みKeyをSkip |
-| 後続処理 | `smoke_test_poc_workspace.py`が件数を確認し、`evaluate_poc.py`が`to_df()`を評価する |
+| 後続処理 | `smoke_test_poc_workspace.py`（PoC開始前にExperiment・Prompt・AI Search・権限等の必須Resourceが利用可能か疎通確認する処理）が件数を確認し、`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）が`to_df()`（Evaluation DatasetをDataFrameとして読み出すAPI）を評価する |
 
 ```python
 """Git管理Seed FixtureをPoC MLflow EvaluationDatasetへ冪等反映する。"""
@@ -2022,7 +2024,7 @@ if __name__ == "__main__":
 
 ##### tests/poc_cases.jsonのSeed例
 
-`tests/poc_cases.json`は、PoC開始前に正解が分かっているケースをGitでレビューするための初期Seed Fixtureである。次の5件は、単一文書、回答拒否、複数文書横断、略語／表記揺れ、検索には成功しても回答時に条件や数値を誤りやすいケースを、`normalize_cases()`が受け付ける既存スキーマだけで表した例である。文書IDとChunkバージョンIDは例示値であり、実際のSeedでは承認済みPoC文書の不変IDへ置き換える。
+`tests/poc_cases.json`（PoCの初期評価CaseをGit管理するSeed JSON）は、PoC開始前に正解が分かっているケースをGitでレビューするための初期Seed Fixtureである。次の5件は、単一文書、回答拒否、複数文書横断、略語／表記揺れ、検索には成功しても回答時に条件や数値を誤りやすいケースを、`normalize_cases()`（Seed CaseをEvaluation Dataset形式へ正規化する関数）が受け付ける既存スキーマだけで表した例である。文書IDとChunkバージョンIDは例示値であり、実際のSeedでは承認済みPoC文書の不変IDへ置き換える。
 
 ```json
 [
@@ -2089,16 +2091,16 @@ if __name__ == "__main__":
 
 | フィールド | 意味 | 主な入力・確認責任者 | 評価での用途 |
 | --- | --- | --- | --- |
-| `case_id` | Seed内で安定したケースID | RAG／LLMOps担当者 | 冪等反映、Case別比較、Traceとの照合 |
-| `category` | 評価Sliceを表す分類 | 品質責任者、ドメイン担当者 | カテゴリ別Metricと不足ケースの確認 |
-| `question` | RAGへ渡す利用者質問 | ドメイン担当者 | `inputs.question`として本番と同じRAGを実行 |
-| `expected_response` | 承認済み資料に基づく期待回答 | ドメイン担当者 | Correctness、Groundedness、人手レビューの基準 |
-| `expected_document_ids` | 正答に必要な文書IDの集合 | ドメイン担当者、文書管理者 | 文書Recallと複数文書横断の検証 |
-| `expected_chunk_version_ids` | 正答に必要な不変ChunkバージョンIDの集合 | RAG／LLMOps担当者、ドメイン担当者 | Chunk Recall、引用、文書版の検証 |
-| `expected_refused` | 回答拒否が正解か | ドメイン担当者 | 誤回答・誤拒否の判定 |
-| `expected_refusal_reason` | 拒否すべき理由。非拒否時は`null` | ドメイン担当者 | 拒否理由の妥当性と安全動作の確認 |
+| `case_id`（評価Caseを識別するID） | Seed内で安定したケースID | RAG／LLMOps担当者 | 冪等反映、Case別比較、Traceとの照合 |
+| `category`（評価CaseをSlice分析するための分類項目） | 評価Sliceを表す分類 | 品質責任者、ドメイン担当者 | カテゴリ別Metricと不足ケースの確認 |
+| `question`（評価・RAGへ入力する質問） | RAGへ渡す利用者質問 | ドメイン担当者 | `inputs.question`（Evaluation Datasetの入力Question Field）として本番と同じRAGを実行 |
+| `expected_response`（評価Caseで期待する回答） | 承認済み資料に基づく期待回答 | ドメイン担当者 | Correctness、Groundedness、人手レビューの基準 |
+| `expected_document_ids`（正答に必要な文書IDの集合） | 正答に必要な文書IDの集合 | ドメイン担当者、文書管理者 | 文書Recallと複数文書横断の検証 |
+| `expected_chunk_version_ids`（正答に必要なChunk Version IDの集合） | 正答に必要な不変ChunkバージョンIDの集合 | RAG／LLMOps担当者、ドメイン担当者 | Chunk Recall、引用、文書版の検証 |
+| `expected_refused`（回答拒否が正解かを示す期待値） | 回答拒否が正解か | ドメイン担当者 | 誤回答・誤拒否の判定 |
+| `expected_refusal_reason`（期待する回答拒否理由） | 拒否すべき理由。非拒否時は`null`（値がないことを表す値） | ドメイン担当者 | 拒否理由の妥当性と安全動作の確認 |
 
-変換境界は次のとおりである。元JSONにMLflow専用の入れ子を持ち込まず、変換スクリプトだけが`inputs`、`expectations`、`tags`へ対応付ける。
+変換境界は次のとおりである。元JSONにMLflow専用の入れ子を持ち込まず、変換スクリプトだけが`inputs`（Evaluation Datasetへ保存する評価対象の入力）、`expectations`（Evaluation Datasetへ保存する期待値）、`tags`（Evaluation CaseをSlice分析するためのTag集合）へ対応付ける。
 
 ```mermaid
 flowchart LR
@@ -2113,7 +2115,7 @@ flowchart LR
     TAGS --> DATASET
 ```
 
-例えば`poc-001`は、EvaluationDatasetへ次の1行として反映される。`seed_version`はJSONのフィールドではなく、初期セットアップJobの引数から付与する。
+例えば`poc-001`は、EvaluationDatasetへ次の1行として反映される。`seed_version`（Git Seed Case定義のVersion）はJSONのフィールドではなく、初期セットアップJobの引数から付与する。
 
 ```json
 {
@@ -2149,9 +2151,9 @@ dataset=main.llmops_poc.internal_rag_poc_evaluation, seed_version=poc-seed-v1, i
 
 Lakeflow Jobsは、複数Taskの依存順序、実行Parameter、再試行、Schedule、通知を管理するDatabricks Serviceである。ここではPrompt登録、Dataset Seed、Smoke Test、Evaluationを別Taskとして定義し、前段が失敗した場合は後続を起動しない。Jobの作成結果はJobs UI、実行結果はRun／Task RunとMLflow Experimentで確認する。
 
-`poc/resources/poc_bootstrap_job.yml`と`poc/resources/poc_evaluation_job.yml`は、DAB Resource IDとBundle変数をPythonの必須Parameterへ渡す接続層である。DeployはResourceを作るだけで、Prompt登録、Dataset Seed、Smoke Test、EvaluationはJob Runで実行する。
+`poc/resources/poc_bootstrap_job.yml`（PoC開始前の初期Resource作成と疎通確認を実行するBootstrap Job定義）と`poc/resources/poc_evaluation_job.yml`（PoC EvaluationDatasetに対する評価Runを実行するJob定義）は、DAB Resource IDとBundle変数をPythonの必須Parameterへ渡す接続層である。DeployはResourceを作るだけで、Prompt登録、Dataset Seed、Smoke Test、EvaluationはJob Runで実行する。
 
-`poc/resources/poc_bootstrap_job.yml`
+`poc/resources/poc_bootstrap_job.yml`（PoC開始前の初期Resource作成と疎通確認を実行するBootstrap Job定義）
 
 | ロジック概要 | 内容 |
 | --- | --- |
@@ -2229,12 +2231,12 @@ resources:
               - databricks-ai-search
 ```
 
-`poc/resources/poc_evaluation_job.yml`
+`poc/resources/poc_evaluation_job.yml`（PoC EvaluationDatasetに対する評価Runを実行するJob定義）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | 責務／実行契機 | 初期セットアップ合格後に固定EvaluationDatasetと固定ResourceバージョンでPoC評価を実行するJobを定義する |
-| 変数解決 | DAB Experiment IDとBundle変数をTask Parameterへ展開し、Pythonの必須`argparse`へ渡す |
+| 変数解決 | DAB Experiment IDとBundle変数をTask Parameterへ展開し、Pythonの必須`argparse`（Pythonのコマンドライン引数解析Module）へ渡す |
 | 処理順序 | Evaluation Task起動→Dataset取得→RAG／Scorer実行→Evaluation Run保存 |
 | 重要判定 | Answer／Judge Modelを別Parameterにし、Git、Prompt、Index、Corpus、Chunkバージョンを空にしない |
 | 正常／失敗／再試行 | 成功Runを比較証跡化。失敗時はGo判定に使わず、再試行は新Runとして履歴を残す |
@@ -2283,7 +2285,7 @@ resources:
               - databricks-ai-search
 ```
 
-各Taskの`environment_key: default`は、Job下の`environments`で固定したMLflow／AI Search Clientを実際に使うための参照である。Deploy時はResourceとParameterだけが更新され、Pythonの処理は`databricks bundle run`またはJobs Scheduleでのみ実行される。
+各Taskの`environment_key: default`（Lakeflow Job Taskが利用するServerless Environmentを指定する設定）は、Job下の`environments`（Lakeflow Jobで利用する実行Environmentを定義する設定Block）で固定したMLflow／AI Search Clientを実際に使うための参照である。Deploy時はResourceとParameterだけが更新され、Pythonの処理は`databricks bundle run`（DABで配備済みJob／Pipelineを実行するCLIコマンド）またはJobs Scheduleでのみ実行される。
 
 **処理順序**
 
@@ -2295,7 +2297,7 @@ resources:
 
 ##### 3.3.6.6 PoC Workspace Smoke Testを実行する
 
-`poc/src/smoke_test_poc_workspace.py`
+`poc/src/smoke_test_poc_workspace.py`（PoC開始前にExperiment・Prompt・AI Search・権限等の必須Resourceが利用可能か疎通確認する処理）
 
 | ロジック概要 | 内容 |
 | --- | --- |
@@ -2306,7 +2308,7 @@ resources:
 | 主な処理順序 | Backend／Experiment固定→Prompt解決→Dataset件数→Index取得→Answer／Judge最小推論→Trace ID取得→Assessment書込確認 |
 | 重要な判定 | 対象Experiment ID不一致、Dataset 0件、Model／Index利用不可のいずれかでFail Closed |
 | 正常／失敗／再試行 | 全項目をJSONで出力。1項目でも失敗するとJobを失敗させPoC開始不可。Test TraceはTagで識別し再試行可能 |
-| Trace／後続 | Smoke Test Root TraceにResource参照をTagし、合格後に`evaluate_poc.py`を実行 |
+| Trace／後続 | Smoke Test Root TraceにResource参照をTagし、合格後に`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）を実行 |
 
 ```python
 """PoC開始前にWorkspace・MLflow・Model・Search依存をFail Closedで検証する。"""
@@ -2411,28 +2413,28 @@ if __name__ == "__main__":
 
 | 確認対象 | 合格条件 | 失敗時 |
 | --- | --- | --- |
-| Answer／Judge Model Service | 存在、`EXECUTE`可能、最小推論成功 | PoC／自動評価開始不可 |
+| Answer／Judge Model Service | 存在、`EXECUTE`（対象Function／Model等を実行するSQL権限）可能、最小推論成功 | PoC／自動評価開始不可 |
 | MLflow Experiment／Trace | 指定IDがActive、Smoke TraceがそのExperimentに表示 | Trace出力不可として停止 |
 | Prompt Registry | Promptバージョン読取とエイリアス解決成功 | RAG起動不可 |
 | EvaluationDataset | Dataset取得、Seed Record 1件以上 | Evaluation開始不可 |
 | Assessment | Feedback／MLflow Expectation登録成功 | Review開始不可 |
 | AI Search | Index Object取得成功、後続Golden Query成功 | RAG起動不可 |
 
-`poc/src/rag_app.py`
+`poc/src/rag_app.py`（PoC RAGの検索・回答・Traceを実装するPythonファイル）
 
-MLflow Traceは1回のRAG Requestの入出力と処理経路を時系列で残す証跡であり、Spanは検索やModel呼出しなどTrace内の一区間である。この実装ではRAG全体を`AGENT`、検索を`RETRIEVER`、生成Model呼び出しを`LLM` Spanとして記録する。`RETRIEVER` Spanの出力は`Document`へ正規化し、Prompt、Model Service、Index、Corpus／Chunkバージョン、Git CommitはTrace Tagへ付与する。結果はPoC ExperimentのTraces UIで確認する。
+MLflow Traceは1回のRAG Requestの入出力と処理経路を時系列で残す証跡であり、Spanは検索やModel呼出しなどTrace内の一区間である。この実装ではRAG全体を`AGENT`（RAG全体を表すMLflow Span Type）、検索を`RETRIEVER`（文書検索処理を表すMLflow Span Type）、生成Model呼び出しを`LLM`（Model推論処理を表すMLflow Span Type） Spanとして記録する。`RETRIEVER`（文書検索処理を表すMLflow Span Type） Spanの出力は`Document`（MLflow Retrieval Scorerが参照できる標準文書形式）へ正規化し、Prompt、Model Service、Index、Corpus／Chunkバージョン、Git CommitはTrace Tagへ付与する。結果はPoC ExperimentのTraces UIで確認する。
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | このFileの責務 | AI Searchの根拠だけで回答し、検索・Model・拒否・出典を構造化出力とTraceに残す |
-| 呼出元／実行契機 | `evaluate_poc.py`、限定Tester用Launcher、1質問ごと |
+| 呼出元／実行契機 | `evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）、限定Tester用Launcher、1質問ごと |
 | 読取対象 | Promptバージョン、AI Search Index、Answer Model Service、Corpus／Chunk／Git バージョン |
 | 更新対象 | MLflow Trace／Spanのみ。文書マニフェスト、Index、Datasetは更新しない |
-| Call Flow | `answer_question()`→Prompt解決・Tag→`retrieve_chunks()`→0件拒否またはContext構築→`generate_answer()`→出典検証→`PocResult` |
+| Call Flow | `answer_question()`（PoC RAGの検索から回答生成までを実行する関数）→Prompt解決・Tag→`retrieve_chunks()`（AI Searchから根拠Chunkを取得する関数）→0件拒否またはContext構築→`generate_answer()`（取得根拠から回答を生成する関数）→出典検証→`PocResult`（PoC版RAGの最終実行結果を表す型） |
 | 重要な判定 | Search 0件ならLLMを呼ばない。生成回答に安定した出典がなければ回答を破棄しFail Closedで拒否 |
-| Traceとの関係 | Root=`AGENT`、Search=`RETRIEVER`、Model Service呼出し=`LLM`。解決済みPromptバージョンとModel Service FQNをTag |
-| 正常／失敗／再試行 | 正常時は出典付き`PocResult`。DependencyエラーはTrace エラーに残しTableは更新しない。Requestは非破壊的なため再実行可能だが、Evaluationは新Traceとして残す |
-| 後続処理 | `poc_scorers.py`がID・出典・拒否を評価し、`evaluate_poc.py`がRunに集約 |
+| Traceとの関係 | Root=`AGENT`（RAG全体を表すMLflow Span Type）、Search=`RETRIEVER`（文書検索処理を表すMLflow Span Type）、Model Service呼出し=`LLM`（Model推論処理を表すMLflow Span Type）。解決済みPromptバージョンとModel Service FQNをTag |
+| 正常／失敗／再試行 | 正常時は出典付き`PocResult`（PoC版RAGの最終実行結果を表す型）。DependencyエラーはTrace エラーに残しTableは更新しない。Requestは非破壊的なため再実行可能だが、Evaluationは新Traceとして残す |
+| 後続処理 | `poc_scorers.py`（PoC用Scorerを定義するPythonファイル）がID・出典・拒否を評価し、`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）がRunに集約 |
 
 ```python
 """PoC AI Search結果だけを根拠に回答する最小RAG Application。
@@ -2664,7 +2666,7 @@ def answer_question(
     )
 ```
 
-**想定出力サンプル（`PocResult`とTrace）**
+**想定出力サンプル（`PocResult`（PoC版RAGの最終実行結果を表す型）とTrace）**
 
 ```json
 {
@@ -2677,28 +2679,28 @@ def answer_question(
 }
 ```
 
-| Trace階層 | `span_type` | 主な入力 | 主な出力 |
+| Trace階層 | `span_type`（MLflow Spanの処理種別を指定する項目） | 主な入力 | 主な出力 |
 | --- | --- | --- | --- |
-| `poc_rag` | `AGENT` | 質問、Index、Model Service、各バージョン | 上記`PocResult` |
-| `poc_retrieve` | `RETRIEVER` | 質問、Index | `Document(page_content=..., metadata.chunk_id=...)`の配列 |
-| `poc_generate_answer` | `LLM` | Prompt、Model Service FQN | 出典付き回答文字列 |
+| `poc_rag`（PoC TraceでRAG全体を表すRoot Span名） | `AGENT`（RAG全体を表すMLflow Span Type） | 質問、Index、Model Service、各バージョン | 上記`PocResult`（PoC版RAGの最終実行結果を表す型） |
+| `poc_retrieve`（PoC Traceで文書検索処理を表すSpan名） | `RETRIEVER`（文書検索処理を表すMLflow Span Type） | 質問、Index | `Document(page_content=..., metadata.chunk_id=...)`の配列 |
+| `poc_generate_answer`（PoC Traceで回答生成処理を表すLLM Span名） | `LLM`（Model推論処理を表すMLflow Span Type） | Prompt、Model Service FQN | 出典付き回答文字列 |
 
 検索0件なら`refused=true`、`refusal_reason="NO_RETRIEVAL_RESULT"`となり、LLM Spanは生成されない。
 
-`poc/src/poc_scorers.py`
+`poc/src/poc_scorers.py`（PoC用Scorerを定義するPythonファイル）
 
-ScorerはTrace、`outputs`、MLflow Expectationから品質結果を生成し、その結果をFeedback AssessmentとしてEvaluation Runへ残す評価器である。ここでは次の2種類を明確に分ける。
+ScorerはTrace、`outputs`（既存実行結果として保存する評価対象の出力）、MLflow Expectationから品質結果を生成し、その結果をFeedback AssessmentとしてEvaluation Runへ残す評価器である。ここでは次の2種類を明確に分ける。
 
-- **Built-in Scorer／Judge（MLflow公式）**：`Correctness`、`RetrievalGroundedness`、`RetrievalRelevance`、`RetrievalSufficiency`。意味判断が必要で、Judge Modelの指定も評価構成の一部なので`evaluate_poc.py`で組み合わせる。
-- **Custom Code Scorer（本システムのPython実装）**：`expected_document_recall`、`expected_chunk_recall`、`citation_valid`、`expected_refusal`。ID、集合、Booleanを決定論的に比較するため`poc_scorers.py`へ集約し、本番Quality Bundleでも再利用する。
+- **Built-in Scorer／Judge（MLflow公式）**：`Correctness`（回答が期待内容に照らして正しいか評価するMLflow Judge Scorer）、`RetrievalGroundedness`（回答が取得根拠に基づくか評価するMLflow RAG Scorer）、`RetrievalRelevance`（取得文書が質問に関連するか評価するMLflow Scorer）、`RetrievalSufficiency`（取得根拠が回答に十分か評価するMLflow RAG Scorer）。意味判断が必要で、Judge Modelの指定も評価構成の一部なので`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）で組み合わせる。
+- **Custom Code Scorer（本システムのPython実装）**：`expected_document_recall`（期待文書を取得できた割合を評価するScorer）、`expected_chunk_recall`（期待Chunkを取得できた割合を評価するScorer）、`citation_valid`（回答内の出典IDが取得根拠に存在するか決定論的に評価するScorer）、`expected_refusal`（期待する回答拒否と実際の拒否結果が一致するか評価するScorer）。ID、集合、Booleanを決定論的に比較するため`poc_scorers.py`（PoC用Scorerを定義するPythonファイル）へ集約し、本番Quality Bundleでも再利用する。
 
-`@scorer`は通常のPython関数をMLflow Scorerとして扱うDecoratorである。`pass_if`は数値結果からPass／Failを導く条件であり、Scorerを実行する関数でもPromptでもない。人がTrace UIで入力するFeedback／MLflow Expectationと、EvaluationがScorer結果として作るFeedbackは、どちらもAssessmentとしてTraceに関連付くが、作成主体と用途が異なる。
+`@scorer`（MLflowで独自Scorer関数を定義するDecorator）は通常のPython関数をMLflow Scorerとして扱うDecoratorである。`pass_if`（Scorerの数値結果からPass／Failを決める条件）は数値結果からPass／Failを導く条件であり、Scorerを実行する関数でもPromptでもない。人がTrace UIで入力するFeedback／MLflow Expectationと、EvaluationがScorer結果として作るFeedbackは、どちらもAssessmentとしてTraceに関連付くが、作成主体と用途が異なる。
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | このFileの責務 | RAG出力とMLflow Expectationを決定論的に比較し、再実行しても同じ値になるFeedbackを返す |
-| 呼出元／実行契機 | `evaluate_poc.py`がDataset RecordごとにScorerとして呼ぶ |
-| 読取／更新 | `outputs`と`expectations`だけを読み、外部TableやTraceを直接更新しない。MLflow Evaluationが戻り値をAssessment化する |
+| 呼出元／実行契機 | `evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）がDataset RecordごとにScorerとして呼ぶ |
+| 読取／更新 | `outputs`（既存実行結果として保存する評価対象の出力）と`expectations`（Evaluation Datasetへ保存する期待値）だけを読み、外部TableやTraceを直接更新しない。MLflow Evaluationが戻り値をAssessment化する |
 | 主な処理順序 | 期待集合を取得→実績集合と比較→Pass条件を計算→Rationale付きFeedbackを返す |
 | 重要な判定 | 期待集合が空のCase、拒否Case、未知出典を明示的に扱い、LLM Judgeへ委譲しない |
 | 正常／失敗／再試行 | Pure Functionとして同一入力へ同一結果。必須Keyの契約不一致はEvaluation Runを失敗させる |
@@ -2761,30 +2763,30 @@ def expected_refusal(outputs: dict, expectations: dict) -> Feedback:
 
 **想定出力サンプル（ケース別Feedback）**
 
-| Scorer | `value` | `rationale`の例 |
+| Scorer | `value`（Scorerが返す評価値） | `rationale`（Scorer／Judgeが返す判定理由）の例 |
 | --- | ---: | --- |
-| `expected_document_recall` | `1.0` | `expected={'DOC-RAG-001'}, actual={'DOC-RAG-001'}` |
-| `expected_chunk_recall` | `0.5` | 期待2 Chunkのうち1 Chunkだけ取得 |
-| `citation_valid` | `true` | `citations=['[C1]'], missing=[]` |
-| `expected_refusal` | `true` | 期待・実績ともに非拒否 |
+| `expected_document_recall`（期待文書を取得できた割合を評価するScorer） | `1.0` | `expected={'DOC-RAG-001'}, actual={'DOC-RAG-001'}` |
+| `expected_chunk_recall`（期待Chunkを取得できた割合を評価するScorer） | `0.5` | 期待2 Chunkのうち1 Chunkだけ取得 |
+| `citation_valid`（回答内の出典IDが取得根拠に存在するか決定論的に評価するScorer） | `true`（真を表すBoolean値） | `citations=['[C1]'], missing=[]` |
+| `expected_refusal`（期待する回答拒否と実際の拒否結果が一致するか評価するScorer） | `true`（真を表すBoolean値） | 期待・実績ともに非拒否 |
 
 文書／Chunk IDや出典の一致は同じ入力なら常に同じ値になる。意味的な正しさは、この後のBuilt-in Judgeで別に評価する。
 
-`poc/src/evaluate_poc.py`
+`poc/src/evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | このFileの責務 | UC EvaluationDatasetの各CaseにPoC RAGを実行し、決定論的ScorerとJudgeを同じEvaluation Runへ記録する |
-| 呼出元／実行契機 | `poc_evaluation_job`、初期セットアップのSmoke Test合格後、Prompt／Model／Index変更ごと |
+| 呼出元／実行契機 | `poc_evaluation_job`（PoC Evaluationを実行するLakeflow Job Resource名）、初期セットアップのSmoke Test合格後、Prompt／Model／Index変更ごと |
 | 読取対象 | Experiment ID、EvaluationDataset、Promptバージョン、AI Search Index、Answer／Judge Model Service、各バージョン |
 | 更新対象 | Evaluation Run、CaseごとのRAG Trace、Scorer Assessment、Run Parameter |
-| Call Flow | `main()`→Backend／Experiment／Dataset固定→`evaluate()`がCaseごとに`predict_fn()`→`answer_question()`→Scorer→`log_evaluation_configuration()` |
+| Call Flow | `main()`（対象Scriptの主要処理を開始するEntry Point関数）→Backend／Experiment／Dataset固定→`evaluate()`（固定Datasetに対してScorer／Judgeを実行する評価API）がCaseごとに`predict_fn()`（Evaluationから評価対象処理を呼び出す関数）→`answer_question()`（PoC RAGの検索から回答生成までを実行する関数）→Scorer→`log_evaluation_configuration()`（Evaluation Runへ評価構成を記録する関数） |
 | 重要な判定 | Dataset 0件、Git Commit未設定、Prompt／Model／Index不明なら開始しない。Answer ModelとJudge Modelを別Parameterにする |
-| Traceとの関係 | 1 Dataset Recordに1 `AGENT` Trace。ScorerはTraceとMLflow ExpectationからAssessmentを作る |
+| Traceとの関係 | 1 Dataset Recordに1 `AGENT`（RAG全体を表すMLflow Span Type） Trace。ScorerはTraceとMLflow ExpectationからAssessmentを作る |
 | 正常／失敗／再試行 | 正常時はRun ID、Dataset Digest、不変バージョンを出力。失敗時はRelease判定に使わない。再試行は新Evaluation Runとして比較可能に残す |
 | 後続処理 | PoC実行記録、Slice分析、Go／No-Go、本番化Gap判定 |
 
-`predict_fn`はPromptではない。MLflow EvaluationがEvaluationDatasetの各Recordを1件ずつ評価対象Applicationへ渡すための、Adapter／Callback関数である。
+`predict_fn`（MLflow Evaluationが評価対象RAGを実行するために呼ぶ関数）はPromptではない。MLflow EvaluationがEvaluationDatasetの各Recordを1件ずつ評価対象Applicationへ渡すための、Adapter／Callback関数である。
 
 ```mermaid
 flowchart LR
@@ -2795,7 +2797,7 @@ flowchart LR
     RESULT --> SCORE["Custom Scorer + Built-in Judge"]
 ```
 
-Dataset Recordの`inputs.question`が`predict_fn`の`question`引数へ渡され、RecordごとにPoC RAGを1回実行する。戻り値の`outputs`と実行中に生成されたTraceをScorerが評価する。次のPoC版は、**EvaluationDatasetの1 CaseをPoC RAGへ渡して、評価可能な構造化出力を返す薄いAdapter**である。RAGロジックを再実装せず、実利用と同じ`answer_question()` Entry Pointを呼ぶ。`args`はDatasetの入力ではなく、Jobが評価Run全体で固定するIndex、Prompt、Model、Corpus等の構成である。
+Dataset Recordの`inputs.question`（Evaluation Datasetの入力Question Field）が`predict_fn`（MLflow Evaluationが評価対象RAGを実行するために呼ぶ関数）の`question`（評価・RAGへ入力する質問）引数へ渡され、RecordごとにPoC RAGを1回実行する。戻り値の`outputs`（既存実行結果として保存する評価対象の出力）と実行中に生成されたTraceをScorerが評価する。次のPoC版は、**EvaluationDatasetの1 CaseをPoC RAGへ渡して、評価可能な構造化出力を返す薄いAdapter**である。RAGロジックを再実装せず、実利用と同じ`answer_question()`（PoC RAGの検索から回答生成までを実行する関数） Entry Pointを呼ぶ。`args`（コマンドライン引数を保持する値）はDatasetの入力ではなく、Jobが評価Run全体で固定するIndex、Prompt、Model、Corpus等の構成である。
 
 ```python
 """PoC RAGをMLflow GenAI Evaluationでケース別・集計評価する。"""
@@ -2948,31 +2950,31 @@ if __name__ == "__main__":
 
 | Case | 文書Recall | Chunk Recall | 出典 | 拒否 | Retrieval Relevance | Groundedness | Correctness |
 | --- | ---: | ---: | --- | --- | --- | --- | --- |
-| `poc-001` | 1.0 | 1.0 | `true` | `true` | `yes` | `yes` | `yes` |
-| `poc-002` | 0.0 | 0.0 | `true` | `false` | `no` | `yes` | `no` |
+| `poc-001` | 1.0 | 1.0 | `true`（真を表すBoolean値） | `true`（真を表すBoolean値） | `yes`（合格・Yesを表す例示値） | `yes`（合格・Yesを表す例示値） | `yes`（合格・Yesを表す例示値） |
+| `poc-002` | 0.0 | 0.0 | `true`（真を表すBoolean値） | `false`（偽を表すBoolean値） | `no`（不合格・Noを表す例示値） | `yes`（合格・Yesを表す例示値） | `no`（不合格・Noを表す例示値） |
 
 Evaluation Runには集計値として、例えば`expected_document_recall/mean=0.50`、`citation_valid/mean=1.00`が残る。Consoleには`evaluation_run_id=...`が出力され、Run ParameterからDataset Digest、Promptバージョン、Answer／Judge Model Service、Index、Corpus／Chunkバージョン、Git Commitを比較できる。
 
-`tests/poc_cases.json`は初回Seed Fixtureであり、Evaluation Jobはこれを直接読まない。`seed_poc_evaluation_dataset.py`がUC EvaluationDatasetへ反映し、`evaluate_poc.py`はDatasetの`inputs`と`expectations`を読む。単一の`poc_pass_rate`へ潰さず、各ScorerのCase別Feedback、Rationale、集計MetricをEvaluation Runへ残す。JSONスキーマ、5種類の具体例、変換後のEvaluationDataset行は「3.3.6.4 tests/poc_cases.jsonのSeed例」を正本とし、ここには重複記載しない。
+`tests/poc_cases.json`（PoCの初期評価CaseをGit管理するSeed JSON）は初回Seed Fixtureであり、Evaluation Jobはこれを直接読まない。`seed_poc_evaluation_dataset.py`（PoCのSeed CaseをEvaluation Datasetへ登録するPythonファイル）がUC EvaluationDatasetへ反映し、`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）はDatasetの`inputs`（Evaluation Datasetへ保存する評価対象の入力）と`expectations`（Evaluation Datasetへ保存する期待値）を読む。単一の`poc_pass_rate`（PoC全体を単一値へ集約した合格率Metric名）へ潰さず、各ScorerのCase別Feedback、Rationale、集計MetricをEvaluation Runへ残す。JSONスキーマ、5種類の具体例、変換後のEvaluationDataset行は「3.3.6.4 tests/poc_cases.jsonのSeed例」を正本とし、ここには重複記載しない。
 
-PoCのAssessment入力は、**MLflow Trace UIを標準経路**とする。AssessmentはTrace／Spanへ付与するMLflow公式の評価Recordの総称であり、今回の実績がよかったかを表す`Feedback`と、同じ入力で何を正解とするかを表す`Expectation`を分けて保存する。
+PoCのAssessment入力は、**MLflow Trace UIを標準経路**とする。AssessmentはTrace／Spanへ付与するMLflow公式の評価Recordの総称であり、今回の実績がよかったかを表す`Feedback`（実行結果に対する評価値・理由を表すMLflow Assessment）と、同じ入力で何を正解とするかを表す`Expectation`（評価Caseで期待する正解条件を表すMLflow Assessment）を分けて保存する。
 
-少人数のReviewerはTrace UIで対象Traceを開き、`internal_rag_quality` Feedback、Rationale、`expected_response`、`expected_document_ids`、`expected_chunk_version_ids`、`expected_refused`、`expected_refusal_reason`を入力する。PoC専用のAssessment登録ScriptやUIと重複するNotebookは用意しない。これにより、入力結果、Reviewer、Trace、Scorer結果を同じUI入口で確認できる。
+少人数のReviewerはTrace UIで対象Traceを開き、`internal_rag_quality`（内部・RAG・品質を保持する項目） Feedback、Rationale、`expected_response`（評価Caseで期待する回答）、`expected_document_ids`（正答に必要な文書IDの集合）、`expected_chunk_version_ids`（正答に必要なChunk Version IDの集合）、`expected_refused`（回答拒否が正解かを示す期待値）、`expected_refusal_reason`（期待する回答拒否理由）を入力する。PoC専用のAssessment登録ScriptやUIと重複するNotebookは用意しない。これにより、入力結果、Reviewer、Trace、Scorer結果を同じUI入口で確認できる。
 
 PoCではレビュー待ちキュー自動配送、定期Labeling Session、Judge Alignmentを必須にしない。ただし、同名のJudge Feedbackと人間Feedbackが十分に集まり、そのJudgeをPilotのリリース判定に使うなら、PoC後半またはPilot中にAlignmentと独立Validationを実施する。
 
 #### 3.3.7 PoC監視・記録基盤
 
-PoCの目的は、RAG、Trace、Evaluation、人間Assessment、原因分析、修正後の再評価が成立するかを確かめることである。専用のCase状態機械、SLA Table、自動一次分類／Close Jobを作ることではない。したがって、標準機能を次の順で使い、不足する集約結果だけを`analysis/`配下の簡易表へ記録する。
+PoCの目的は、RAG、Trace、Evaluation、人間Assessment、原因分析、修正後の再評価が成立するかを確かめることである。専用のCase状態機械、SLA Table、自動一次分類／Close Jobを作ることではない。したがって、標準機能を次の順で使い、不足する集約結果だけを`analysis/`（対象Resource／ソースを指す物理パス）配下の簡易表へ記録する。
 
 1. Lakeflow Jobs／Pipeline UIでRun、Event Log、エラー、件数を確認する。
 2. AI Search UIで同期状態を確認する。
 3. MLflow Trace／Evaluation UIでTrace、Scorer、Judge、Feedback、MLflow Expectationを確認する。
-4. 失敗候補を`poc_failure_summary.md`へ原因・症状単位でまとめる。
-5. 改善するテーマだけを`poc_improvement_backlog.md`または既存Issue Trackerへ登録する。
+4. 失敗候補を`poc_failure_summary.md`（PoCで検出した失敗を症状・原因分類・代表Trace・件数単位で整理する簡易分析記録）へ原因・症状単位でまとめる。
+5. 改善するテーマだけを`poc_improvement_backlog.md`（PoCで改善対象に選んだ課題と変更内容・評価結果・採否を追跡する改善バックログ）または既存Issue Trackerへ登録する。
 6. 固定EvaluationDatasetで再評価し、採用／却下とEvaluation Run IDをバックログへ追記する。
 
-`poc_failure_summary.md`と`poc_improvement_backlog.md`はDatabricks／MLflow Resourceではない。PoC用の簡易な分析成果物であり、Markdown、Spreadsheet、GitHub Issues等、チームがすでに使える媒体でよい。質問全文やChunk全文を複製せず、Trace ID、Evaluation Run ID、原因分類、件数、代表例、判断理由だけを参照する。
+`poc_failure_summary.md`（PoCで検出した失敗を症状・原因分類・代表Trace・件数単位で整理する簡易分析記録）と`poc_improvement_backlog.md`（PoCで改善対象に選んだ課題と変更内容・評価結果・採否を追跡する改善バックログ）はDatabricks／MLflow Resourceではない。PoC用の簡易な分析成果物であり、Markdown、Spreadsheet、GitHub Issues等、チームがすでに使える媒体でよい。質問全文やChunk全文を複製せず、Trace ID、Evaluation Run ID、原因分類、件数、代表例、判断理由だけを参照する。
 
 | 必要な証跡 | PoCの標準確認先 | PoCで追加する最小記録 |
 | --- | --- | --- |
@@ -2992,8 +2994,8 @@ PoCではRunごとの技術確認と、実施日の終わりの品質確認を�
 | --- | --- | --- | --- |
 | Pipeline／Evaluation Runごと | Jobs、Pipeline、AI Search、MLflowがRun、エラー、Trace、Scorer結果を保存する | 開発者が成功、件数、バージョン、同期、Trace生成を確認する | 公式UI／Run。必要なRun IDだけ簡易なPoC実行記録へ残す |
 | 限定Testerの利用時 | RAGがTraceを生成し、Feedback入力対象を表示する | ドメイン担当者が重要な誤回答・拒否へTrace UIからFeedback／MLflow Expectationを入力する | MLflow Assessment |
-| PoC実施日の日次確認 | Scorer Fail、Judge Fail、Retrieval 0件、エラー、User Feedbackを一覧化する | RAG／LLMOps担当者が重複と類似した失敗をまとめ、代表Traceから暫定原因を確認する | `poc_failure_summary.md` |
-| 改善前後 | 固定EvaluationDatasetで同じScorer群を実行する | PoC Ownerが主要変更を1種類に限定し、採用／却下を判断する | Evaluation Run、`poc_improvement_backlog.md` |
+| PoC実施日の日次確認 | Scorer Fail、Judge Fail、Retrieval 0件、エラー、User Feedbackを一覧化する | RAG／LLMOps担当者が重複と類似した失敗をまとめ、代表Traceから暫定原因を確認する | `poc_failure_summary.md`（PoCで検出した失敗を症状・原因分類・代表Trace・件数単位で整理する簡易分析記録） |
+| 改善前後 | 固定EvaluationDatasetで同じScorer群を実行する | PoC Ownerが主要変更を1種類に限定し、採用／却下を判断する | Evaluation Run、`poc_improvement_backlog.md`（PoCで改善対象に選んだ課題と変更内容・評価結果・採否を追跡する改善バックログ） |
 | セキュリティSignal発生時 | ACL／Masking検査、Trace、監査Logで検知する | 利用停止、影響確認、セキュリティ責任者への連絡を即時に行う | 組織のIncident記録＋証跡ID |
 
 PoCは母数が小さいため、重要な失敗ケースは原則確認する。ただし、同じ原因・症状・バージョンであることが明らかなケースは代表例だけを詳しく確認し、残りは件数として集約する。24時間オンコール、固定SLA、専用Dashboard、専用SQL Alert、自動チケット連携は本番化Gapとして評価し、PoCの必須実装にはしない。
@@ -3008,7 +3010,7 @@ PoCでは「一連の処理が動いたか」だけでなく、どのコンポ�
 | Parse／Prep | 成功率、形式別エラー、処理時間 | 特定形式、表、画像、複雑なLayoutで失敗していないか | Attempt／エラーテーブル |
 | Chunk | Chunk数、長さ、境界、欠落 | 意味単位で適切に分割されているか | Silver、Trace |
 | Retrieval | 文書Recall、Chunk Recall、0件率、再検索率 | 正しい文書・Chunkを取得できているか | Retriever Span、Evaluation Run |
-| マルチモーダル | `visual_page_available`、`rag.visual_context_used`、画像付きCase正答率 | 図、グラフ、表、画像主体のPageで必要なときだけVision経路へ入り、画像内容を正しく回答できるか | Silver、Retriever Span、Trace、Evaluation Run |
+| マルチモーダル | `visual_page_available`（該当Chunkに利用可能なページ画像があるかを示す項目）、`rag.visual_context_used`（RAG実行情報をMLflow Traceへ記録するTag）、画像付きCase正答率 | 図、グラフ、表、画像主体のPageで必要なときだけVision経路へ入り、画像内容を正しく回答できるか | Silver、Retriever Span、Trace、Evaluation Run |
 | 回答 | Groundedness、Correctness、出典 | 取得した根拠だけで正しく回答しているか | Trace、Assessment |
 | 拒否 | 拒否一致率、誤回答、誤拒否 | 回答可能／不可能を正しく判断しているか | EvaluationDataset |
 | Agent経路 | Node遷移、再検索回数、Loop | 不要な再検索や誤った分岐がないか | MLflow Trace |
@@ -3026,99 +3028,176 @@ PoCでは「一連の処理が動いたか」だけでなく、どのコンポ�
 
 問題分析は`失敗Trace 1件 = 改善チケット1件`ではない。Scorerや人間が見つけるのは個々の失敗証跡であり、改善対象は複数証跡に共通するシステム上の原因テーマである。
 
-**失敗パターン識別子（本資料独自用語）**：重複候補を見つけるため、症状、暫定原因、Release、文書／質問カテゴリ等を正規化して作る識別値である。PoCは手動列、本番は品質管理ジョブのHashとして実装できる。物理列名`dedup_key`は変更しない。
+**失敗パターン識別子（本資料独自用語）**：重複候補を見つけるため、症状、暫定原因、Release、文書／質問カテゴリ等を正規化して作る識別値である。PoCは手動列、本番は品質管理ジョブのHashとして実装できる。物理列名`dedup_key`（同じ失敗候補を重複判定するための識別Key）は変更しない。
 
-**失敗原因グループ（本資料独自用語）**：同じ症状・原因・改善で解消できる失敗候補の集合である。1グループに複数Traceを関連付け、件数と代表Traceを持つ。物理列名`family_id`は変更しない。
+**失敗原因グループ（本資料独自用語）**：同じ症状・原因・改善で解消できる失敗候補の集合である。1グループに複数Traceを関連付け、件数と代表Traceを持つ。物理列名`family_id`（同じ症状・原因でまとめる失敗原因グループID）は変更しない。
 
-**根本原因分類体系（本資料独自の運用分類）**：利用者の期待から見て最初に破綻したコンポーネントを分類するTaxonomyである。`proposed_root_cause`はシステムの暫定候補、`confirmed_root_cause`は人が証跡を確認して確定した原因を表し、いずれもMLflow標準Fieldではない。
+**原因分類（本資料独自の運用分類）**：利用者の期待から見て、最初に問題が起きた場所を分類するための区分である。システムはEvaluation結果から暫定候補`proposed_root_cause`（システムが付ける暫定的な根本原因候補）を出してよいが、最終原因`confirmed_root_cause`（人がTrace等を確認して確定した根本原因）はTraceや比較実験を確認した人が確定する。どちらもMLflow標準Fieldではない。
 
 **改善対象（本資料独自用語）**：確定原因から決める実際の修正対象（Corpus、Parser、Chunk、Retrieval、Prompt、Model、エージェント処理分岐、ACL、Judge等）である。
 
-**監視検知イベント（本資料独自用語）**：Job、Scorer、SQL Alert、セキュリティQuery等の検知結果を、重複排除やCase化の前に共通スキーマへ正規化したイベントである。MLflowの標準Resource名ではなく、物理実体は`internal_rag_monitoring_signals`の1行、識別列は`signal_id`である。
+**監視検知イベント（本資料独自用語）**：Job、Scorer、SQL Alert、セキュリティQuery等の検知結果を、重複排除やCase化の前に共通スキーマへ正規化したイベントである。MLflowの標準Resource名ではなく、物理実体は`internal_rag_monitoring_signals`（品質・運用監視で検知したイベントを集約するTable）の1行、識別列は`signal_id`（監視で検知した1イベントを識別するID）である。
 
-本資料で使う根本原因分類は次のとおりである。この一覧はDatabricks／MLflowの公式Taxonomyではなく、本システムの分析・振り分け方針である。
+本資料で使う根本原因分類は次のとおりである。この一覧はDatabricks／MLflowの公式Taxonomyではなく、本システムの分析・振り分け方針である。**本文では人が見てすぐ意味を理解できる日本語を先に示し、保存値や実装上の識別子として既存の英字コードを括弧内に残す。**
 
-| 根本原因 | 最初に確認する問題 | 主な改善対象 |
+| 人が見る原因名 | 最初に確認する問題 | 主な改善対象 |
 | --- | --- | --- |
-| `DOCUMENT` | 必要文書がない、古い、内容が誤っている | Corpus、文書更新手順 |
-| `PARSE` | 表、画像、Layout、文字を正しく解析できない | Parser、OCR、形式別処理 |
-| `PREP` | 検索用整形で重要情報が欠落する | Prep指示、整形規則 |
-| `CHUNK` | 境界、長さ、Metadata継承が不適切 | Chunk方式、Overlap、Metadata |
-| `RETRIEVAL` | 正しい文書／Chunkを取得できない | Filter、Top-k、Rerank、Index |
-| `QUERY_REWRITE` | 略語展開・言い換えで意図が変わる | Rewrite Prompt／規則 |
-| `SUFFICIENCY` | 根拠不足なのに回答、または十分なのに再検索する | 十分性判定、閾値 |
-| `ANSWER_PROMPT` | 根拠は正しいが回答、要約、拒否が不適切 | Answer Prompt |
-| `MODEL` | 指示追従、長文理解、生成安定性が不足する | モデル経路、Parameter |
-| `ROUTING` | Agentが誤Nodeへ遷移、不要なLoopを行う | Graph条件、上限、Fallback |
-| `CITATION` | 回答と引用、Stable ID、文書版が不正 | 出典生成・検証 |
-| `ACL` | 権限外検索、過剰拒否、Scope伝播不良 | Identity、ACL Filter、セキュリティテスト |
-| `JUDGE` | 人間と自動評価の基準が一致しない | Judge Prompt、Alignment、Validation |
-| `PLATFORM` | 429、Timeout、同期遅延、Service障害 | 再試行、Capacity、Runbook |
+| 文書不足・旧版（`DOCUMENT`（必要文書・公開Versionに原因がある分類値）） | 必要文書がない、古い、内容が誤っている | 文書内容、公開Version、更新手順 |
+| 文書解析の失敗（`PARSE`（文書解析に原因がある分類値）） | 表、画像、Layout、文字を正しく解析できない | Parser、OCR、形式別処理 |
+| 検索用整形の失敗（`PREP`（検索用整形に原因がある分類値）） | 検索用整形で重要情報が欠落する | 検索用整形、正規化規則 |
+| Chunk分割の問題（`CHUNK`（Chunk分割に原因がある分類値）） | 境界、長さ、Metadata継承が不適切 | Chunk方式、Overlap、Metadata |
+| 検索設定の問題（`RETRIEVAL`（検索・順位付けに原因がある分類値）） | 正しい文書／Chunkを取得できない、または順位が悪い | Filter、取得件数、Rerank、Index |
+| 検索Queryの問題（`QUERY_REWRITE`（検索Query書換えに原因がある分類値）） | 略語展開・言い換えで意図が変わる | Query Rewriteの指示・規則 |
+| 根拠十分性判定の問題（`SUFFICIENCY`（根拠十分性判定に原因がある分類値）） | 根拠不足なのに回答、または十分なのに再検索する | 十分性判定、閾値 |
+| 回答生成の問題（`ANSWER_PROMPT`（回答Promptに原因がある分類値）） | 根拠は正しいが回答、要約、拒否が不適切 | Answer Prompt |
+| 生成モデルの問題（`MODEL`（利用Modelに原因がある分類値）） | 指示追従、長文理解、生成安定性が不足する | モデル経路、Parameter |
+| 処理分岐の問題（`ROUTING`（LangGraphの処理分岐に原因がある分類値）） | 誤った処理へ進む、不要な再検索を行う | Graph条件、上限、Fallback |
+| 出典の問題（`CITATION`（出典生成・検証に原因がある分類値）） | 回答と引用、Stable ID、文書版が不正 | 出典生成・検証 |
+| 権限制御の問題（`ACL`（権限制御に原因がある分類値）） | 権限外検索、過剰拒否、権限情報の伝播不良 | Identity、ACL Filter、セキュリティテスト |
+| 自動評価の問題（`JUDGE`（自動評価に原因がある分類値）） | 人間と自動評価の基準が一致しない | Judge Prompt、Alignment、Validation |
+| 基盤・外部Serviceの問題（`PLATFORM`（実行基盤・外部Serviceに原因がある分類値）） | 429、Timeout、同期遅延、Service障害 | 再試行、Capacity、Runbook |
+
+#### Evaluation結果から、まず疑う場所を絞る
+
+Evaluationの数値は、根本原因そのものではなく**「次にどこを詳しく見るか」を決めるための手掛かり**として使う。数値だけで`confirmed_root_cause`（人がTrace等を確認して確定した根本原因）を確定せず、Trace／Span、取得文書、比較実験を確認したうえで人が最終原因を確定する。
+
+##### まず見る全体像
+
+最初の図では、個別設定や実装名を出さず、Evaluation結果から「検索」「回答」「権限」「自動評価」のどこを疑うかだけを判断する。
 
 ```mermaid
 flowchart TD
-    subgraph MF["MLflow"]
-        direction TB
-        TRACE["Trace・Scorer・Feedback"]
-        EXPECT["MLflow Expectation"]
-        DATASET["EvaluationDataset"]
-    end
-    subgraph QJ["品質管理ジョブ／Databricks SQL"]
-        direction TB
-        SIGNAL["監視検知イベント"]
-        TRIAGE["識別子・重複排除・暫定分類"]
-        GROUP["失敗原因グループ候補"]
-    end
-    subgraph HUMAN["人によるレビュー"]
-        direction TB
-        REVIEW["正解・根本原因・業務影響を確定"]
-        PRIORITY["優先順位・改善対象・採否を決定"]
-    end
-    subgraph ISSUE["品質改善課題／外部Issue Tracker"]
-        direction TB
-        CASE["担当・状態・期限を追跡"]
-    end
-    subgraph GIT["Git管理の修正"]
-        direction TB
-        EDIT["Python／SQL／Prompt／文書を変更"]
-    end
-    subgraph EVALUATION["評価・リリース"]
-        direction TB
-        REEVAL["Evaluation Run"]
-        HOLDOUT["未使用Holdout・リリース判定"]
-        DEPLOY["デプロイ・カナリア検証"]
-    end
-    TRACE --> SIGNAL --> TRIAGE --> GROUP --> REVIEW
-    REVIEW --> EXPECT --> PRIORITY --> CASE --> EDIT
-    EDIT --> DATASET --> REEVAL --> HOLDOUT --> DEPLOY
-    DEPLOY --> TRACE
+    START["Evaluation結果を見る"] --> ACL{"権限違反がある？"}
+    ACL -->|はい| ACL_CAUSE["権限制御を確認"]
+    ACL -->|いいえ| SEARCH{"検索の評価が悪い？"}
+
+    SEARCH -->|はい| SEARCH_DETAIL["検索系を詳しく確認"]
+    SEARCH -->|いいえ| ANSWER{"回答の評価が悪い？"}
+
+    ANSWER -->|はい| ANSWER_DETAIL["回答・判定系を詳しく確認"]
+    ANSWER -->|いいえ| JUDGE{"人の評価と自動評価がずれる？"}
+
+    JUDGE -->|はい| JUDGE_CAUSE["自動評価の基準を確認"]
+    JUDGE -->|いいえ| OK["大きな問題なし<br/>質問カテゴリなど別の切り口で再確認"]
 ```
+
+##### 検索系の詳細
+
+検索系では、最初に**必要文書を拾えていないのか**、それとも**必要文書は拾えているが上位順位が悪いのか**を分ける。取得件数やRerankは、同じEvaluation Datasetで条件だけを変えて比較して判断する。
+
+```mermaid
+flowchart TD
+    START["検索の評価が悪い"] --> RECALL{"必要文書を拾えている？"}
+
+    RECALL -->|いいえ| TOPK{"取得件数を増やすと改善？"}
+    TOPK -->|はい| TOPK_CAUSE["検索件数不足<br/>取得件数を増やして再評価"]
+    TOPK -->|いいえ| QUERY{"検索Queryを変えると改善？"}
+
+    QUERY -->|はい| QUERY_CAUSE["検索Queryを改善"]
+    QUERY -->|いいえ| DOC{"必要文書は検索対象にある？"}
+
+    DOC -->|いいえ| DOC_CAUSE["文書不足・公開Versionを確認"]
+    DOC -->|はい| CHUNK{"必要な情報が適切に分割されている？"}
+
+    CHUNK -->|いいえ| CHUNK_CAUSE["文書解析・整形・Chunk分割を確認"]
+    CHUNK -->|はい| INDEX_CAUSE["Embedding・検索方式・Filterを比較"]
+
+    RECALL -->|はい| RANK{"上位順位の評価が悪い？"}
+    RANK -->|いいえ| SEARCH_OK["検索は概ね正常"]
+    RANK -->|はい| RERANK{"Rerankで改善？"}
+
+    RERANK -->|はい| RERANK_CAUSE["Rerank採用候補<br/>品質向上とLatencyを比較"]
+    RERANK -->|いいえ| REDUCE{"取得件数を減らすと改善？"}
+
+    REDUCE -->|はい| NOISE_CAUSE["検索件数が多すぎる<br/>不要な文書を減らす"]
+    REDUCE -->|いいえ| RANK_CAUSE["Embedding・HYBRID検索・Chunk品質を再確認"]
+```
+
+検索件数の判断では、例えば`5 → 10`件で必要文書Recallが大きく改善し、`10 → 20`件ではほとんど改善しないなら、10件前後を候補とする。逆に必要文書はすでに取得できているのに上位順位の評価が低く、Rerankを入れるとnDCGやRetrieval Relevanceが改善するなら、Rerankを採用候補とする。改善幅が小さくLatencyだけ増える場合は採用しない。
+
+##### 回答・判定系の詳細
+
+検索が概ね正常なら、次に「根拠が十分か」「根拠を正しく使って回答したか」「正しい内容か」「出典・拒否判断は正しいか」の順に確認する。
+
+```mermaid
+flowchart TD
+    START["検索は概ね正常"] --> SUFF{"根拠は十分？"}
+
+    SUFF -->|いいえ| HAVE_DOC{"必要文書は取得できている？"}
+    HAVE_DOC -->|いいえ| BACK_SEARCH["検索系へ戻る"]
+    HAVE_DOC -->|はい| SUFF_CAUSE["根拠十分性の判定基準を確認"]
+
+    SUFF -->|はい| GROUND{"回答は取得根拠に沿っている？"}
+    GROUND -->|いいえ| ANSWER_CAUSE["回答Prompt・生成モデルを確認"]
+    GROUND -->|はい| CORRECT{"回答内容は正しい？"}
+
+    CORRECT -->|いいえ| DOC_CORRECT{"根拠文書の内容自体は正しい？"}
+    DOC_CORRECT -->|いいえ| DOC_CAUSE2["文書内容・公開Versionを確認"]
+    DOC_CORRECT -->|はい| MODEL_CAUSE["回答Prompt・生成モデルを確認"]
+
+    CORRECT -->|はい| CITATION{"出典は正しい？"}
+    CITATION -->|いいえ| CITATION_CAUSE["出典生成・検証を確認"]
+    CITATION -->|はい| REFUSE{"回答／拒否の判断は正しい？"}
+
+    REFUSE -->|いいえ| ROUTE_CAUSE["根拠十分性・処理分岐・回答Promptを確認"]
+    REFUSE -->|はい| ANSWER_OK["回答系は概ね正常"]
+```
+
+Evaluation結果から最初に疑う場所は次のように整理する。ここで示すのは**暫定原因**であり、最終原因は代表Traceを開いて確認する。
+
+| Evaluationで見えた症状 | 最初に疑う場所 | 次に行う確認・比較 |
+| --- | --- | --- |
+| 必要文書Recallが低い | 検索件数、検索Query、文書、Chunk、Index | 取得件数を変える。Queryを変える。期待文書の公開状態とChunkを確認する |
+| 取得件数を増やすとRecallが改善 | 検索件数不足 | 5、10、20件等で比較し、Recallが頭打ちになる最小件数を選ぶ |
+| Recallは十分だがnDCG／Retrieval Relevanceが低い | 検索順位 | Rerankなし／ありを比較する |
+| Rerankで順位品質が改善 | Rerank採用候補 | 品質改善幅とLatency増加を比較する |
+| 取得件数を減らすとRelevanceが改善 | 検索件数が多すぎる | 不要Chunkを減らし、回答品質とRecallが落ちないか確認する |
+| Retrievalは良いがGroundednessが低い | 回答Prompt、生成モデル | LLM Spanと取得根拠を比較する |
+| Groundednessは良いがCorrectnessが低い | 文書内容、回答Prompt、生成モデル | 根拠文書自体の正しさを先に確認する |
+| Citationだけ悪い | 出典生成 | 出典ID、引用対応、文書Versionを確認する |
+| 回答すべき／拒否すべき判断が悪い | 根拠十分性、処理分岐、回答Prompt | 十分性判定とGraph遷移をTraceで確認する |
+| 人の評価とJudgeがずれる | 自動評価 | Judge Prompt、閾値、Human Feedbackとの一致を確認する |
+| ACL違反 | 権限制御 | Identity伝播、検索Filter、検索後再検証を確認する |
+
 
 #### 3.6.1 改善サイクルの工程・担当・実行境界
 
-次表は、問題検知から本番監視へ戻るまでの責任分界である。各行の「PoC」は最小手運用、「本番」は定期運用時の実体を示す。PoCでは`evaluate_poc.py`、MLflow UI、Markdown／Spreadsheet、必要に応じた手動Issueで実施し、品質改善課題用Delta Table、自動トリアージ、Jira等との自動連携を必須にしない。本番ではProduction Monitoring、SQL Alert、Lakeflow Jobs、Quality Bundle、`internal_rag_monitoring_signals`、グループ集約、Review App／Labeling Session、品質改善課題または外部Issue、Evaluation Job、リリース判定Jobを組み合わせる。
+上の診断フローで疑う場所を絞った後、運用上は次の順序で改善へつなげる。ここでは詳細Resource名を並べず、担当者が何をするかだけを先に示す。
+
+```mermaid
+flowchart TD
+    MONITOR["Evaluation・本番監視で<br/>問題候補を見つける"] --> GROUP["同じ傾向をまとめる"]
+    GROUP --> REVIEW["代表Traceを確認する"]
+    REVIEW --> CAUSE["人が原因と優先度を確定する"]
+    CAUSE --> FIX["対象を1種類に絞って修正する"]
+    FIX --> REEVAL["同じEvaluation Datasetで再評価する"]
+    REEVAL --> RELEASE["合格した構成だけをリリースする"]
+    RELEASE --> MONITOR
+```
+
+次表は、問題検知から本番監視へ戻るまでの責任分界である。各行の「PoC」は最小手運用、「本番」は定期運用時の実体を示す。PoCでは`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）、MLflow UI、Markdown／Spreadsheet、必要に応じた手動Issueで実施し、品質改善課題用Delta Table、自動トリアージ、Jira等との自動連携を必須にしない。本番ではProduction Monitoring、SQL Alert、Lakeflow Jobs、Quality Bundle、`internal_rag_monitoring_signals`（品質・運用監視で検知したイベントを集約するTable）、グループ集約、Review App／Labeling Session、品質改善課題または外部Issue、Evaluation Job、リリース判定Jobを組み合わせる。
 
 | 工程 | 主担当 | 使用ツール／UI | 使用するソースコード／Job | 入力 | 出力 | 自動／手動 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1. 失敗候補検出 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: MLflow Evaluation Run／Trace UI。本番: Production Monitoring、SQL Alert、Jobs UI | PoC: `poc/src/evaluate_poc.py`。本番: `bundles/quality/src/register_monitoring.py`、`bundles/quality/resources/operational_monitoring.yml` | Scorer／Judge結果、検索0件、エラー、利用者Feedback | 失敗候補または`internal_rag_monitoring_signals`の行 | 自動。PoCは実行後の一覧選択を手動 |
-| 2. 失敗パターン識別子生成 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: Markdown／Spreadsheet。本番: SQL Job | PoC: ソースコードなし。本番: `bundles/quality/src/triage_operational_signals.sql` | 症状、暫定原因、Release、文書／質問カテゴリ | `dedup_key` | 本番は自動、PoCは手動 |
-| 3. 重複集約 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: Markdown／Spreadsheet。本番: Databricks SQL／Jobs UI | PoC: ソースコードなし。本番: `bundles/quality/src/triage_operational_signals.sql` | `dedup_key`付き候補 | 重複件数、最古・代表候補 | 本番は自動、PoCは手動 |
-| 4. 失敗原因グループ候補生成 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: 簡易分析表。本番: Databricks SQL | PoC: ソースコードなし。本番: `bundles/quality/src/triage_operational_signals.sql` | 重複集約、症状、暫定原因 | `family_id`候補、件数、暫定原因 | 暫定生成は自動化可能、確定は人 |
-| 5. 代表Trace選択 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: Trace UI。本番: Labeling Session／Review App | PoC: ソースコードなし。本番: `bundles/quality/src/create_review_queue.py` | グループ候補、Severity候補、業務カテゴリ | 代表Trace、Critical／重要Traceのレビュー待ちキュー | 本番は自動、PoCは手動 |
+| 1. 失敗候補検出 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: MLflow Evaluation Run／Trace UI。本番: Production Monitoring、SQL Alert、Jobs UI | PoC: `poc/src/evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）。本番: `bundles/quality/src/register_monitoring.py`（Production Monitoring用Scorerを登録・開始するPythonファイル）、`bundles/quality/resources/operational_monitoring.yml`（本番運用Monitoring Job／Alertを定義する設定ファイル） | Scorer／Judge結果、検索0件、エラー、利用者Feedback | 失敗候補または`internal_rag_monitoring_signals`（品質・運用監視で検知したイベントを集約するTable）の行 | 自動。PoCは実行後の一覧選択を手動 |
+| 2. 失敗パターン識別子生成 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: Markdown／Spreadsheet。本番: SQL Job | PoC: ソースコードなし。本番: `bundles/quality/src/triage_operational_signals.sql`（監視イベントの重複排除・暫定原因分類を行うSQLファイル） | 症状、暫定原因、Release、文書／質問カテゴリ | `dedup_key`（同じ失敗候補を重複判定するための識別Key） | 本番は自動、PoCは手動 |
+| 3. 重複集約 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: Markdown／Spreadsheet。本番: Databricks SQL／Jobs UI | PoC: ソースコードなし。本番: `bundles/quality/src/triage_operational_signals.sql`（監視イベントの重複排除・暫定原因分類を行うSQLファイル） | `dedup_key`（同じ失敗候補を重複判定するための識別Key）付き候補 | 重複件数、最古・代表候補 | 本番は自動、PoCは手動 |
+| 4. 失敗原因グループ候補生成 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: 簡易分析表。本番: Databricks SQL | PoC: ソースコードなし。本番: `bundles/quality/src/triage_operational_signals.sql`（監視イベントの重複排除・暫定原因分類を行うSQLファイル） | 重複集約、症状、暫定原因 | `family_id`（同じ症状・原因でまとめる失敗原因グループID）候補、件数、暫定原因 | 暫定生成は自動化可能、確定は人 |
+| 5. 代表Trace選択 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: Trace UI。本番: Labeling Session／Review App | PoC: ソースコードなし。本番: `bundles/quality/src/create_review_queue.py`（代表Traceのレビュー待ちキューを作るPythonファイル） | グループ候補、Severity候補、業務カテゴリ | 代表Trace、Critical／重要Traceのレビュー待ちキュー | 本番は自動、PoCは手動 |
 | 6. ドメインレビュー | ドメイン担当者 | Trace UIまたはReview App | **ソースコードなし** | 質問、回答、取得文書、利用可能な承認済み資料 | 正しい回答、正しい文書、拒否要否と理由 | 手動 |
-| 7. MLflow Expectation確定 | ドメイン担当者 | Trace UIまたはReview App | **ソースコードなし** | ドメインレビュー結果 | `expected_response`、期待文書／Chunk、拒否期待値 | 手動 |
-| 8. 技術根本原因確定 | RAG／LLMOps担当者 | Trace UI、Retriever／LLM Span、Jobs／Pipeline UI | **ソースコードなし** | MLflow Expectation、取得Chunk、Prompt／Index／Release情報 | `confirmed_root_cause` | 手動 |
+| 7. MLflow Expectation確定 | ドメイン担当者 | Trace UIまたはReview App | **ソースコードなし** | ドメインレビュー結果 | `expected_response`（評価Caseで期待する回答）、期待文書／Chunk、拒否期待値 | 手動 |
+| 8. 技術根本原因確定 | RAG／LLMOps担当者 | Trace UI、Retriever／LLM Span、Jobs／Pipeline UI | **ソースコードなし** | MLflow Expectation、取得Chunk、Prompt／Index／Release情報 | `confirmed_root_cause`（人がTrace等を確認して確定した根本原因） | 手動 |
 | 9. Severity・業務影響確定 | 品質責任者、業務Owner、必要時セキュリティ責任者 | Review App、Quality Review | **ソースコードなし** | 原因、発生件数、影響業務、ACL／機密性 | 最終Severity、業務影響、緊急対応要否 | 手動。候補値だけ自動化可能 |
 | 10. 優先順位決定 | 品質責任者／PoC Owner | Weekly Quality Review、簡易バックログ | **ソースコードなし** | Severity、業務影響、件数、再現性、修正コスト | Priority、着手順、保留理由 | 手動 |
-| 11. 品質改善課題／外部Issue登録 | PoC: PoC Owner。本番: 品質管理ジョブ＋品質責任者 | PoC: Markdown／Spreadsheet／任意Issue。本番: 品質改善課題または外部Issue Tracker | PoC: ソースコードなし。本番: `bundles/quality/src/triage_operational_signals.sql` | 承認済みグループ、Priority、代表Trace | Case／Issue ID、担当、状態、SLA | PoCは手動。本番は候補作成を自動、起票方針は人が承認 |
+| 11. 品質改善課題／外部Issue登録 | PoC: PoC Owner。本番: 品質管理ジョブ＋品質責任者 | PoC: Markdown／Spreadsheet／任意Issue。本番: 品質改善課題または外部Issue Tracker | PoC: ソースコードなし。本番: `bundles/quality/src/triage_operational_signals.sql`（監視イベントの重複排除・暫定原因分類を行うSQLファイル） | 承認済みグループ、Priority、代表Trace | Case／Issue ID、担当、状態、SLA | PoCは手動。本番は候補作成を自動、起票方針は人が承認 |
 | 12. 改善対象決定 | RAG／LLMOps担当者、対象Owner、品質責任者 | Review App、Quality Review | **ソースコードなし** | 確定原因、同じ修正で解消できる範囲 | 改善対象、Owner、変更を1種類に絞った計画 | 手動 |
 | 13. ソース変更 | 改善対象のOwner | Git、コードレビュー、文書承認UI | 後述「根本原因から実ファイルへの対応表」の既存ファイル | Case、再現Trace、Baseline構成 | Git Commit、文書版、Prompt／Index／Model候補 | 手動 |
-| 14. EvaluationDatasetケース更新 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: Git＋初期セットアップJob。本番: Review App＋Dataset同期Job | PoC: `tests/poc_cases.json`、`poc/src/seed_poc_evaluation_dataset.py`。本番: `bundles/quality/src/sync_evaluation_dataset.py` | 承認済み期待値、Case ID、Split方針 | EvaluationDataset Record、Dataset Digest | PoCはレビュー後に手動更新、本番同期は自動 |
-| 15. 再評価 | PoC: PoC Owner。本番: 品質管理ジョブ | MLflow Evaluation Run、Jobs UI | PoC: `poc/src/evaluate_poc.py`。本番: `bundles/quality/src/evaluate_rag.py` | 固定Dataset、Baseline／Candidate、Scorer／Judge版 | Case別Feedback、Metric、Trace、Run ID | 実行・集計は自動、結果解釈は人 |
-| 16. 未使用Holdout評価 | 品質責任者、品質管理ジョブ | MLflow Evaluation Run | `bundles/quality/src/evaluate_rag.py` | 未使用Holdout、候補RAGリリース | Holdout Metric、セキュリティ／ACL結果 | 評価は自動、妥当性確認は人 |
-| 17. リリース判定 | Release Manager、品質・業務・セキュリティ責任者 | Jobs UI、意思決定記録 | `bundles/quality/src/release_gate.py` | Holdout、性能、コスト、セキュリティ結果 | pass／fail候補、最終Decision、理由 | 条件判定は自動、最終可否は手動 |
-| 18. デプロイ／カナリア検証 | Release Manager、Platform／LLMOps担当者 | DAB、Databricks Apps、Trace／監視UI | `bundles/realtime/app/rag_release.py`、`bundles/realtime/resources/realtime_app.yml` | 承認済み不変リリース構成 | 限定公開または本番Channel、観測対象Release ID | デプロイは自動化可能、拡大・停止は人 |
-| 19. 本番監視 | Quality／運用担当者 | Production Monitoring、SQL Alert、Dashboard、Trace UI | `bundles/quality/src/register_monitoring.py`、`bundles/quality/resources/operational_monitoring.yml` | 本番Trace、Scorer、Latency、Token、検索件数 | 新しい監視検知イベント、Alert、傾向Metric | 検知・集計は自動、対応判断は人 |
+| 14. EvaluationDatasetケース更新 | PoC: RAG／LLMOps担当者。本番: 品質管理ジョブ | PoC: Git＋初期セットアップJob。本番: Review App＋Dataset同期Job | PoC: `tests/poc_cases.json`（PoCの初期評価CaseをGit管理するSeed JSON）、`poc/src/seed_poc_evaluation_dataset.py`（PoCのSeed CaseをEvaluation Datasetへ登録するPythonファイル）。本番: `bundles/quality/src/sync_evaluation_dataset.py`（承認済みReview結果をEvaluation Datasetへ同期するPythonファイル） | 承認済み期待値、Case ID、Split方針 | EvaluationDataset Record、Dataset Digest | PoCはレビュー後に手動更新、本番同期は自動 |
+| 15. 再評価 | PoC: PoC Owner。本番: 品質管理ジョブ | MLflow Evaluation Run、Jobs UI | PoC: `poc/src/evaluate_poc.py`（PoC Evaluationを実行するPythonファイル）。本番: `bundles/quality/src/evaluate_rag.py`（本番候補RAGをEvaluationするPythonファイル） | 固定Dataset、Baseline／Candidate、Scorer／Judge版 | Case別Feedback、Metric、Trace、Run ID | 実行・集計は自動、結果解釈は人 |
+| 16. 未使用Holdout評価 | 品質責任者、品質管理ジョブ | MLflow Evaluation Run | `bundles/quality/src/evaluate_rag.py`（本番候補RAGをEvaluationするPythonファイル） | 未使用Holdout、候補RAGリリース | Holdout Metric、セキュリティ／ACL結果 | 評価は自動、妥当性確認は人 |
+| 17. リリース判定 | Release Manager、品質・業務・セキュリティ責任者 | Jobs UI、意思決定記録 | `bundles/quality/src/release_gate.py`（Holdout品質・Security・SLO・Cost結果を集約し、リリース可否の機械判定材料を作る処理） | Holdout、性能、コスト、セキュリティ結果 | pass／fail候補、最終Decision、理由 | 条件判定は自動、最終可否は手動 |
+| 18. デプロイ／カナリア検証 | Release Manager、Platform／LLMOps担当者 | DAB、Databricks Apps、Trace／監視UI | `bundles/realtime/app/rag_release.py`（本番RAGのリリース構成読込を実装するPythonファイル）、`bundles/realtime/resources/realtime_app.yml`（Realtime RAGのDatabricks App Resource・Binding・環境変数参照を定義する設定） | 承認済み不変リリース構成 | 限定公開または本番Channel、観測対象Release ID | デプロイは自動化可能、拡大・停止は人 |
+| 19. 本番監視 | Quality／運用担当者 | Production Monitoring、SQL Alert、Dashboard、Trace UI | `bundles/quality/src/register_monitoring.py`（Production Monitoring用Scorerを登録・開始するPythonファイル）、`bundles/quality/resources/operational_monitoring.yml`（本番運用Monitoring Job／Alertを定義する設定ファイル） | 本番Trace、Scorer、Latency、Token、検索件数 | 新しい監視検知イベント、Alert、傾向Metric | 検知・集計は自動、対応判断は人 |
 
 自動化と人の境界は、次のように固定する。
 
@@ -3135,9 +3214,9 @@ flowchart TD
 | Scorer／Judgeによる失敗候補検出 | ○ | 評価結果は作れるが、業務上の正解確定は人が行う |
 | EvaluationDatasetとEvaluation Run | ○ | 入力、期待値、Case別結果、Metricを追跡できる |
 | Production Monitoring | ○ | 登録済みScorerを本番Traceへ適用できるが、Case管理までは行わない |
-| 失敗パターン識別子・重複排除 | × | `triage_operational_signals.sql`等の独自SQL／Jobが必要 |
+| 失敗パターン識別子・重複排除 | × | `triage_operational_signals.sql`（監視Signalを重複排除し、暫定原因・Severity候補へ一次分類するSQL）等の独自SQL／Jobが必要 |
 | 失敗原因グループの生成・承認 | △ | Traceを根拠にできるが、集約ロジックと人の承認は独自運用 |
-| Review Appでの正解・原因入力 | △ | UIとAssessmentは標準機能。`root_cause`や状態遷移は本システム独自 |
+| Review Appでの正解・原因入力 | △ | UIとAssessmentは標準機能。`root_cause`（品質問題の根本原因分類）や状態遷移は本システム独自 |
 | Severity、業務影響、Priorityの最終決定 | × | 品質責任者、業務Owner、セキュリティ責任者の判断が必要 |
 | 品質改善課題／担当／SLA／作業状態 | × | 任意Delta Tableまたは外部Issue Trackerで管理する |
 | Python／SQL／文書／Promptの修正 | × | Git、文書審査、各Ownerのコードレビューで実施する |
@@ -3150,44 +3229,44 @@ PoCでは次の11段階を1つの改善テーマについて順に実施する�
 
 | 段階 | 実施内容 | ファイル | UI | 担当者 |
 | ---: | --- | --- | --- | --- |
-| 1 | 固定Seedで評価を実行する | `poc/src/evaluate_poc.py` | Lakeflow Jobs UI | RAG／LLMOps担当者 |
-| 2 | MLflow Evaluation RunのCase別失敗と集計値を確認する | `poc/src/evaluate_poc.py` | MLflow Evaluation UI | PoC Owner |
+| 1 | 固定Seedで評価を実行する | `poc/src/evaluate_poc.py`（PoC Evaluationを実行するPythonファイル） | Lakeflow Jobs UI | RAG／LLMOps担当者 |
+| 2 | MLflow Evaluation RunのCase別失敗と集計値を確認する | `poc/src/evaluate_poc.py`（PoC Evaluationを実行するPythonファイル） | MLflow Evaluation UI | PoC Owner |
 | 3 | 失敗CaseのTraceを開く | ソースコードなし | MLflow Trace UI | RAG／LLMOps担当者 |
 | 4 | 正しい回答・文書・拒否条件を確認し、Feedback／MLflow Expectationを付ける | ソースコードなし | MLflow Trace UI | ドメイン担当者 |
-| 5 | Retriever Span、取得Chunk、Query Rewrite、Prompt、回答Spanを調べる | `poc/src/rag_app.py` | MLflow Trace UI、AI Search UI | RAG／LLMOps担当者 |
-| 6 | `失敗パターン識別子／根本原因／失敗原因グループ／改善対象／件数／代表Trace ID`を簡易分析表へ記録する | `analysis/poc_failure_summary.md`相当。媒体はMarkdown／Spreadsheetでよい | GitまたはSpreadsheet | RAG／LLMOps担当者 |
+| 5 | Retriever Span、取得Chunk、Query Rewrite、Prompt、回答Spanを調べる | `poc/src/rag_app.py`（PoC RAGの検索・回答・Traceを実装するPythonファイル） | MLflow Trace UI、AI Search UI | RAG／LLMOps担当者 |
+| 6 | `失敗パターン識別子／根本原因／失敗原因グループ／改善対象／件数／代表Trace ID`を簡易分析表へ記録する | `analysis/poc_failure_summary.md`（PoCで検出した失敗を症状・原因分類・代表Trace・件数単位で整理する簡易分析記録）相当。媒体はMarkdown／Spreadsheetでよい | GitまたはSpreadsheet | RAG／LLMOps担当者 |
 | 7 | 同じ症状・原因・修正で解消できるCaseを集約する | ソースコードなし | 簡易分析表 | RAG／LLMOps担当者、ドメイン担当者 |
-| 8 | 件数、Severity、業務影響から今回直すテーマを選ぶ | `analysis/poc_improvement_backlog.md`相当 | 簡易バックログ、必要時Issue Tracker | PoC Owner、品質責任者 |
+| 8 | 件数、Severity、業務影響から今回直すテーマを選ぶ | `analysis/poc_improvement_backlog.md`（PoCで改善対象に選んだ課題と変更内容・評価結果・採否を追跡する改善バックログ）相当 | 簡易バックログ、必要時Issue Tracker | PoC Owner、品質責任者 |
 | 9 | 対象を1種類に限定してソースを修正する | 原因に対応するPoCのPython／SQL／文書 | Git、コードレビュー | 対象Owner |
-| 10 | 同じ固定Datasetで新しいEvaluation Runを作る | `poc/src/evaluate_poc.py` | Lakeflow Jobs UI、MLflow Evaluation UI | RAG／LLMOps担当者 |
+| 10 | 同じ固定Datasetで新しいEvaluation Runを作る | `poc/src/evaluate_poc.py`（PoC Evaluationを実行するPythonファイル） | Lakeflow Jobs UI、MLflow Evaluation UI | RAG／LLMOps担当者 |
 | 11 | BaselineとCandidateをCase／Slice別に比較し、採用または却下する | ソースコードなし | MLflow Evaluation UI、簡易バックログ | PoC Owner、ドメイン担当者 |
 
 #### 3.6.4 根本原因から改善対象・実ファイル・Ownerへの対応
 
-「回答が悪い」だけでPromptへ送らず、利用者の期待から見て最初に破綻した箇所を直す。`ANSWER`は概念上の原因名であり、後続の既存実装で使う`ANSWER_PROMPT`または`PROMPT`という値を無断で変更しない。
+「回答が悪い」だけでPromptへ送らず、利用者の期待から見て最初に破綻した箇所を直す。`ANSWER`（回答生成に原因がある概念上の分類値）は概念上の原因名であり、後続の既存実装で使う`ANSWER_PROMPT`（回答Promptに原因がある分類値）または`PROMPT`（Promptに原因がある既存実装上の分類値）という値を無断で変更しない。
 
 | 根本原因 | 改善対象 | 確認・変更する既存ソース | 実際に変更する主担当 |
 | --- | --- | --- | --- |
-| `DOCUMENT` | Corpus、文書内容、公開版 | `bundles/document-workflow/app/*`、`bundles/ingestion/src/apply_manifest_request.py` | 文書管理者／ドメイン担当者が判断し、Manifest Executorが反映。実装変更はデータエンジニア |
-| `PARSE` | Parser、OCR、形式別解析 | `bundles/ingestion/src/02_document_parse.sql` | データエンジニア／RAGエンジニア |
-| `PREP` | 検索用整形、正規化 | `bundles/ingestion/src/03_search_prep.sql` | データエンジニア／RAGエンジニア |
-| `CHUNK` | 分割境界、長さ、Overlap、Metadata | `bundles/ingestion/src/04_chunks_silver.sql` | データエンジニア／RAGエンジニア |
-| `RETRIEVAL` | Filter、Top-k、Rerank、Index | `bundles/realtime/app/rag_graph.py`、`bundles/ingestion/src/create_search_index.py` | RAG／LLMOps担当者 |
-| `QUERY_REWRITE` | 略語展開、言い換え規則、Rewrite Prompt | `bundles/quality/prompts/query_rewrite.md`、`bundles/realtime/app/rag_graph.py` | RAG／LLMOps担当者＋ドメインレビュー |
-| `ANSWER`（既存実装値`ANSWER_PROMPT`／`PROMPT`） | Answer Prompt、回答・拒否・引用規則 | `bundles/quality/prompts/answer.md`、`bundles/realtime/app/rag_graph.py` | RAG／LLMOps担当者＋ドメインレビュー |
-| `MODEL` | Model Service、Destination Route | `bundles/quality/databricks.yml`、`bundles/realtime/app/rag_release.py` | LLMOps／Platform担当者 |
-| `ACL` | Identity伝播、ACL Filter、セキュリティ回帰 | `bundles/realtime/app/identity_context.py`、`bundles/realtime/app/rag_graph.py` | IAM／Platform／RAG担当者 |
-| `JUDGE` | Judge定義、Alignment、Validation | `bundles/quality/src/evaluate_rag.py`、`bundles/quality/src/align_judge.py`、`bundles/quality/src/register_monitoring.py` | Quality／LLMOps担当者 |
+| `DOCUMENT`（必要文書・公開Versionに原因がある分類値） | Corpus、文書内容、公開版 | `bundles/document-workflow/app/*`、`bundles/ingestion/src/apply_manifest_request.py`（承認済み文書Workflow Requestを検証し、文書マニフェストと監査履歴へ反映する処理） | 文書管理者／ドメイン担当者が判断し、Manifest Executorが反映。実装変更はデータエンジニア |
+| `PARSE`（文書解析に原因がある分類値） | Parser、OCR、形式別解析 | `bundles/ingestion/src/02_document_parse.sql`（文書本文・ページ・構造情報を解析し、後続の検索用整形へ渡す解析処理） | データエンジニア／RAGエンジニア |
+| `PREP`（検索用整形に原因がある分類値） | 検索用整形、正規化 | `bundles/ingestion/src/03_search_prep.sql`（解析結果を検索向けに正規化・整形し、Chunk生成へ渡す検索前処理） | データエンジニア／RAGエンジニア |
+| `CHUNK`（Chunk分割に原因がある分類値） | 分割境界、長さ、Overlap、Metadata | `bundles/ingestion/src/04_chunks_silver.sql`（検索・回答に使うChunkを生成し、Chunk本文・出典・Version MetadataをSilver層へ整える処理） | データエンジニア／RAGエンジニア |
+| `RETRIEVAL`（検索・順位付けに原因がある分類値） | Filter、Top-k、Rerank、Index | `bundles/realtime/app/rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル）、`bundles/ingestion/src/create_search_index.py`（承認済み検索同期TableからAI Search Indexを作成・更新し、検索可能状態まで同期する処理） | RAG／LLMOps担当者 |
+| `QUERY_REWRITE`（検索Query書換えに原因がある分類値） | 略語展開、言い換え規則、Rewrite Prompt | `bundles/quality/prompts/query_rewrite.md`（検索Query書換えPromptをGit管理するMarkdownファイル）、`bundles/realtime/app/rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル） | RAG／LLMOps担当者＋ドメインレビュー |
+| `ANSWER`（既存実装値`ANSWER_PROMPT`（回答Promptに原因がある分類値）／`PROMPT`（Promptに原因がある既存実装上の分類値）） | Answer Prompt、回答・拒否・引用規則 | `bundles/quality/prompts/answer.md`（回答生成PromptをGit管理するMarkdownファイル）、`bundles/realtime/app/rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル） | RAG／LLMOps担当者＋ドメインレビュー |
+| `MODEL`（利用Modelに原因がある分類値） | Model Service、Destination Route | `bundles/quality/databricks.yml`（Quality BundleのResourceとJobを定義するDAB設定ファイル）、`bundles/realtime/app/rag_release.py`（本番RAGのリリース構成読込を実装するPythonファイル） | LLMOps／Platform担当者 |
+| `ACL`（権限制御に原因がある分類値） | Identity伝播、ACL Filter、セキュリティ回帰 | `bundles/realtime/app/identity_context.py`（利用者IdentityをServer側で解決し、検索に使うPrincipal集合と権限Hashを生成する処理）、`bundles/realtime/app/rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル） | IAM／Platform／RAG担当者 |
+| `JUDGE`（自動評価に原因がある分類値） | Judge定義、Alignment、Validation | `bundles/quality/src/evaluate_rag.py`（本番候補RAGをEvaluationするPythonファイル）、`bundles/quality/src/align_judge.py`（人の評価結果とJudge結果を比較し、Judgeの判定基準を調整・検証する処理）、`bundles/quality/src/register_monitoring.py`（Production Monitoring用Scorerを登録・開始するPythonファイル） | Quality／LLMOps担当者 |
 
-実装上の接続先は、監視検知イベント表`internal_rag_monitoring_signals`、品質改善課題、レビュー記録、一次分類ジョブ、`bundles/quality/src/triage_operational_signals.sql`が「4.3.4.15」、レビュー記録の状態と責任分界が「5.2.2.1」、EvaluationDataset同期が「5.2.2.2」、Review App／Assessment収集が「5.2.2.8」、Production Monitoringの登録が「4.3.4.14」、継続運用が「5.2.2.7」にある。3.5節は判断契約、これらの節は物理実装であり、どちらか一方だけでは運用フローにならない。
+実装上の接続先は、監視検知イベント表`internal_rag_monitoring_signals`（品質・運用監視で検知したイベントを集約するTable）、品質改善課題、レビュー記録、一次分類ジョブ、`bundles/quality/src/triage_operational_signals.sql`（監視イベントの重複排除・暫定原因分類を行うSQLファイル）が「4.3.4.15」、レビュー記録の状態と責任分界が「5.2.2.1」、EvaluationDataset同期が「5.2.2.2」、Review App／Assessment収集が「5.2.2.8」、Production Monitoringの登録が「4.3.4.14」、継続運用が「5.2.2.7」にある。3.5節は判断契約、これらの節は物理実装であり、どちらか一方だけでは運用フローにならない。
 
 #### 3.6.5 役割と判断の境界
 
 | 主体 | いつ | 自動化／判断すること | 確定しないこと |
 | --- | --- | --- | --- |
-| システム／品質管理ジョブ | Run後の日次・定期処理 | Scorer Fail、Judge Fail、Retrieval 0件、User Feedback、セキュリティ監視検知イベント、エラーから候補抽出。重複排除、失敗パターン識別子、`proposed_root_cause`、Severity候補、Owner候補、失敗原因グループ集約 | 業務上の正解、技術根本原因、最終Priority |
-| ドメイン担当者 | 代表Traceのレビュー時 | `expected_response`、`expected_document_ids`、`expected_chunk_version_ids`、`expected_refused`等のMLflow Expectationを確定 | Retriever／Prompt等の技術原因 |
-| RAG／LLMOps担当者 | MLflow Expectation確定後 | Retriever Span、取得Chunk、Index／Corpusバージョン、Query Rewrite、LLM Span、Promptバージョン、モデル経路、エージェント処理分岐を確認し、`confirmed_root_cause`を確定 | 業務影響と最終改善順 |
+| システム／品質管理ジョブ | Run後の日次・定期処理 | Scorer Fail、Judge Fail、Retrieval 0件、User Feedback、セキュリティ監視検知イベント、エラーから候補抽出。重複排除、失敗パターン識別子、`proposed_root_cause`（システムが付ける暫定的な根本原因候補）、Severity候補、Owner候補、失敗原因グループ集約 | 業務上の正解、技術根本原因、最終Priority |
+| ドメイン担当者 | 代表Traceのレビュー時 | `expected_response`（評価Caseで期待する回答）、`expected_document_ids`（正答に必要な文書IDの集合）、`expected_chunk_version_ids`（正答に必要なChunk Version IDの集合）、`expected_refused`（回答拒否が正解かを示す期待値）等のMLflow Expectationを確定 | Retriever／Prompt等の技術原因 |
+| RAG／LLMOps担当者 | MLflow Expectation確定後 | Retriever Span、取得Chunk、Index／Corpusバージョン、Query Rewrite、LLM Span、Promptバージョン、モデル経路、エージェント処理分岐を確認し、`confirmed_root_cause`（人がTrace等を確認して確定した根本原因）を確定 | 業務影響と最終改善順 |
 | 品質責任者／PoC Owner | 日次まとめ・Weekly Quality Review | 原因分類、Severity、業務影響、発生件数、再現性、利用頻度、修正コストから優先順位を決定 | Scorer候補を無条件に採用しない |
 
 PoCには自動品質管理ジョブを新設せず、MLflowの検索・Evaluation結果を使って担当者が簡易表で候補抽出と失敗原因グループ化を行う。本番は同じ判断契約をJob化するが、人が判断すべきMLflow Expectation、根本原因、優先順位は残す。
@@ -3219,9 +3298,9 @@ Priorityは件数だけでなく、Severity、業務影響、セキュリティ�
 
 | Priority例 | 対象例 | 判断理由 |
 | --- | --- | --- |
-| `P0` | ACL越境、Secret／PII露出 | 1件でも影響が重大で即時停止・Incident対応が必要 |
-| `P1` | 高頻度Retrieval不良、重大な出典不良 | 利用頻度と業務判断への影響が大きい |
-| `P2` | 限定カテゴリの軽微なPrompt表現 | 回避可能で業務影響が限定的 |
+| `P0`（p0を指定する設定値／環境変数） | ACL越境、Secret／PII露出 | 1件でも影響が重大で即時停止・Incident対応が必要 |
+| `P1`（p1を指定する設定値／環境変数） | 高頻度Retrieval不良、重大な出典不良 | 利用頻度と業務判断への影響が大きい |
+| `P2`（p2を指定する設定値／環境変数） | 限定カテゴリの軽微なPrompt表現 | 回避可能で業務影響が限定的 |
 
 例えば`検索失敗 100件 / Medium`より`ACL違反 1件 / Critical`を先に扱うことがある。品質責任者は失敗原因グループ単位でPriorityを決め、今週着手する上位テーマだけをバックログ化する。3〜5テーマは説明上の目安であり、固定仕様ではない。
 
@@ -3239,7 +3318,7 @@ MLflowはTrace、Assessment、Scorer、Evaluation等の品質証跡管理に適�
 | External Issue | 担当、Status、Priority、SLA、実装作業 | Jira、GitHub Issues、ServiceNow等 |
 | Incident／セキュリティIncident | 可用性・セキュリティの緊急指揮と影響調査 | 組織のIncident管理基盤 |
 
-PoCでは外部Issue Trackerとの自動連携も独自Delta Case Tableも必須にしない。MLflow UI、簡易Markdown／Spreadsheet、必要な上位テーマだけの手動Issueで足りる。本番では、**監視検知イベント**を起点に自動連携できる。これはJob、Scorer、Alert、セキュリティQuery等の検知結果を同じSchemaへ正規化したEventであり、公式Resource名ではない。流れは`監視検知イベント → 重複排除／Severity → 失敗原因グループ → 品質改善課題 → 外部Issue`となる。外部Issue Trackerを採用する場合、Status、Assignee、Priority、SLAは外部側を正本とし、Databricks側には証跡ID、`family_id`、外部Issue ID、同期状態だけを保持して二重管理しない。
+PoCでは外部Issue Trackerとの自動連携も独自Delta Case Tableも必須にしない。MLflow UI、簡易Markdown／Spreadsheet、必要な上位テーマだけの手動Issueで足りる。本番では、**監視検知イベント**を起点に自動連携できる。これはJob、Scorer、Alert、セキュリティQuery等の検知結果を同じSchemaへ正規化したEventであり、公式Resource名ではない。流れは`監視検知イベント → 重複排除／Severity → 失敗原因グループ → 品質改善課題 → 外部Issue`となる。外部Issue Trackerを採用する場合、Status、Assignee、Priority、SLAは外部側を正本とし、Databricks側には証跡ID、`family_id`（同じ症状・原因でまとめる失敗原因グループID）、外部Issue ID、同期状態だけを保持して二重管理しない。
 
 #### 3.6.10 日次と週次
 
@@ -3293,10 +3372,10 @@ PoC Ownerは、処理成功だけではなく、次の成果物が揃い、業�
 | 資産 | 本番でも維持 | 本番での変更 |
 | --- | --- | --- |
 | Bronze／Attempt／エラー／Silver | Dataset責務とAI Function単一実行 | 文書マニフェスト由来ID、Scanner結果、監査列を追加 |
-| Chunk Schema | `chunk_to_embed`／`chunk_to_retrieve`とバージョン ID | ACL、公開範囲、Stable Source Refを追加 |
+| Chunk Schema | `chunk_to_embed`（Embedding生成へ渡すChunk本文）／`chunk_to_retrieve`（検索後にLLMへ返すChunk本文）とバージョン ID | ACL、公開範囲、Stable Source Refを追加 |
 | PoC Gold | Materialized Viewという形式 | 最新成功版ではなく文書マニフェストの公開バージョン参照一致版へ置換 |
 | AI Search／RAG | Retrieval、出典、拒否 | ACL Filter、リリース構成台帳、回答検証を追加 |
-| Evaluation／Assessment | `mlflow.genai.evaluate()`、Trace Schema、決定論的Scorer、RAG Judge、最小Feedback／MLflow Expectation | UC Dataset、権限評価用テスト条件、Training／Holdout、正式Reviewer、ACL／旧版Gate、Monitoringを追加 |
+| Evaluation／Assessment | `mlflow.genai.evaluate()`（Evaluation DatasetとScorer／Judgeで評価Runを作成するMLflow API）、Trace Schema、決定論的Scorer、RAG Judge、最小Feedback／MLflow Expectation | UC Dataset、権限評価用テスト条件、Training／Holdout、正式Reviewer、ACL／旧版Gate、Monitoringを追加 |
 
 #### 3.8.1 PoCでは持たず、本番で追加する管理資産と「なぜ必要か」
 
@@ -3375,9 +3454,9 @@ Parse / Prep / Chunk Schema Version
 ACL Policy Version
 ```
 
-ここで重要なのは、**本番RAGの構成情報をMLflow Trace Tagへ個別に複製しない**ことである。本番で利用するCode、Prompt、Model、Index、文書集合、ACL Policy等の組合せはRAGリリース構成台帳を正本とし、Traceにはその1行を指す`rag.release_id`だけを構成参照Tagとして残す。
+ここで重要なのは、**本番RAGの構成情報をMLflow Trace Tagへ個別に複製しない**ことである。本番で利用するCode、Prompt、Model、Index、文書集合、ACL Policy等の組合せはRAGリリース構成台帳を正本とし、Traceにはその1行を指す`rag.release_id`（実行したRAGリリースをTraceから参照するTag）だけを構成参照Tagとして残す。
 
-したがって問題調査では、まずTraceの`rag.release_id`からRAGリリース構成台帳を参照し、「このRequestがどのPrompt、Index、文書集合、Model等の承認済み組合せで動いたか」を復元する。Traceへ個別の構成Tagを大量に持たせないことで、台帳とTraceのどちらが正本かを曖昧にしない。
+したがって問題調査では、まずTraceの`rag.release_id`（実行したRAGリリースをTraceから参照するTag）からRAGリリース構成台帳を参照し、「このRequestがどのPrompt、Index、文書集合、Model等の承認済み組合せで動いたか」を復元する。Traceへ個別の構成Tagを大量に持たせないことで、台帳とTraceのどちらが正本かを曖昧にしない。
 
 ##### Trace Tagと本番管理資産の役割分担
 
@@ -3385,7 +3464,7 @@ ACL Policy Version
 
 | 役割 | 主な管理資産 | Traceとの関係 |
 | --- | --- | --- |
-| Requestの実行条件を再現する | 文書集合スナップショット、Index Release、RAGリリース構成台帳 | Traceの`rag.release_id`からRAGリリース構成台帳を参照して「何を使ったか」を復元する |
+| Requestの実行条件を再現する | 文書集合スナップショット、Index Release、RAGリリース構成台帳 | Traceの`rag.release_id`（実行したRAGリリースをTraceから参照するTag）からRAGリリース構成台帳を参照して「何を使ったか」を復元する |
 | 現在の公開状態を統制する | 文書マニフェスト、文書バージョン管理台帳、Search Sync Table | Traceへ全内容は保存せず、Corpus／Searchの正しい状態を作るために使う |
 | 品質・運用を統制する | Evaluation Dataset、Release Gate、権限評価用テスト条件、Production Monitoring | Release前後の品質確認や継続監視に使い、必要な結果だけTrace／Evaluationへ残す |
 
@@ -3396,17 +3475,17 @@ ACL Policy Version
 
 | 本番で追加するもの | 物理的な実体 | PoCではどうするか | 本番で必要になる理由 | 実装しない場合に困ること | 位置づけ |
 | --- | --- | --- | --- | --- | --- |
-| 文書マニフェスト | `main.llmops.document_source_manifest` Delta Table | 最新Parse／Prep成功VersionをPoC Goldへ出す | Pipelineの「最新の処理成功Version」と、人が「現在RAGへ公開すると決めたVersion」を分離する。新Versionを取り込んでも内容確認・承認が終わるまでは旧Versionを公開し続けられるようにする | File差替えやParse／Prep成功だけで未確認Versionが検索対象になり得る。問題発生時も「前のVersionへ戻す」を単純なPointer切替として実施できない | 本番Baselineで必須 |
-| 文書バージョン管理台帳 | `main.llmops.document_version_registry` | Bronze／Attempt／Silver履歴で十分 | 各VersionについてParse／Prep／Chunk／Reviewがどこまで完了しているかを履歴として管理し、「Versionの処理・審査状態」と「現在公開中のVersion」を分離する。v1公開中にv2を処理・審査する状態を明示できるようにする | v2が処理失敗中なのか、審査待ちなのか、承認済みなのかを一つの公開状態だけでは表現できない。旧Versionが切戻し候補として技術的に利用可能かも判断しづらくなる | 本番Baselineで必須 |
-| 文書Workflow／監査履歴 | `document_workflow_requests`、`document_manifest_audit_events` | 開発者の手動操作とPoC実行記録 | 文書公開・停止・切戻しを直接Table更新ではなく、申請→承認→実行という管理された操作にし、誰が何を要求し、誰が承認し、実際に何が変更されたかを残す | 「なぜこのVersionが公開されたか」「誰が停止したか」を後から説明できない。直接SQL更新、誤操作、反映失敗、再実行を監査上区別しづらい | 統制が必要な本番では必須 |
-| Search Sync Table | `main.llmops.internal_docs_search_sync` | PoC GoldをAI Searchへ直接同期してよい | Gold Currentが変化しただけではAI Searchを即時変更せず、**検索公開すると確定したGold状態をCDF有効な物理Delta Tableへ反映してからAI Searchへ同期する境界**を作る。追加・更新だけでなく、旧版・削除・失効Chunkの削除もCDFで同期し、同じ公開時点から文書集合スナップショットを確定する | Gold上ではv3へ切り替わっているのにIndexはまだv2、削除済みChunkがIndexに残っている、といった「Goldの現在値」と「検索実体」のずれを管理しづらい。Publish失敗時の再実行境界や、どこまで公開済みかの確認も曖昧になる | 本資料のAI Search構成では必須 |
-| **文書集合スナップショット** | `main.llmops.corpus_snapshot_members` | 原則省略。PoC RunでCorpus VersionをTag記録 | **ある評価・Index Release時点で検索対象だった文書Version集合を不変IDで固定する**。文書本文やChunkを複製するのではなく、`corpus_snapshot_id → document_id + document_version_id`の対応を保持する | 文書更新後に、過去TraceやEvaluationがどの文書集合を検索していたか分からなくなる。Prompt変更による差分なのか、Corpus変更による差分なのかも切り分けにくい | 本番再現性・監査・切戻しのため必須 |
+| 文書マニフェスト | `main.llmops.document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable） Delta Table | 最新Parse／Prep成功VersionをPoC Goldへ出す | Pipelineの「最新の処理成功Version」と、人が「現在RAGへ公開すると決めたVersion」を分離する。新Versionを取り込んでも内容確認・承認が終わるまでは旧Versionを公開し続けられるようにする | File差替えやParse／Prep成功だけで未確認Versionが検索対象になり得る。問題発生時も「前のVersionへ戻す」を単純なPointer切替として実施できない | 本番Baselineで必須 |
+| 文書バージョン管理台帳 | `main.llmops.document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table） | Bronze／Attempt／Silver履歴で十分 | 各VersionについてParse／Prep／Chunk／Reviewがどこまで完了しているかを履歴として管理し、「Versionの処理・審査状態」と「現在公開中のVersion」を分離する。v1公開中にv2を処理・審査する状態を明示できるようにする | v2が処理失敗中なのか、審査待ちなのか、承認済みなのかを一つの公開状態だけでは表現できない。旧Versionが切戻し候補として技術的に利用可能かも判断しづらくなる | 本番Baselineで必須 |
+| 文書Workflow／監査履歴 | `document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）、`document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable） | 開発者の手動操作とPoC実行記録 | 文書公開・停止・切戻しを直接Table更新ではなく、申請→承認→実行という管理された操作にし、誰が何を要求し、誰が承認し、実際に何が変更されたかを残す | 「なぜこのVersionが公開されたか」「誰が停止したか」を後から説明できない。直接SQL更新、誤操作、反映失敗、再実行を監査上区別しづらい | 統制が必要な本番では必須 |
+| Search Sync Table | `main.llmops.internal_docs_search_sync`（AI Searchへ同期する現在公開Chunkを保持するTable） | PoC GoldをAI Searchへ直接同期してよい | Gold Currentが変化しただけではAI Searchを即時変更せず、**検索公開すると確定したGold状態をCDF有効な物理Delta Tableへ反映してからAI Searchへ同期する境界**を作る。追加・更新だけでなく、旧版・削除・失効Chunkの削除もCDFで同期し、同じ公開時点から文書集合スナップショットを確定する | Gold上ではv3へ切り替わっているのにIndexはまだv2、削除済みChunkがIndexに残っている、といった「Goldの現在値」と「検索実体」のずれを管理しづらい。Publish失敗時の再実行境界や、どこまで公開済みかの確認も曖昧になる | 本資料のAI Search構成では必須 |
+| **文書集合スナップショット** | `main.llmops.corpus_snapshot_members`（文書集合スナップショットの構成文書Versionを保持するTable） | 原則省略。PoC RunでCorpus VersionをTag記録 | **ある評価・Index Release時点で検索対象だった文書Version集合を不変IDで固定する**。文書本文やChunkを複製するのではなく、`corpus_snapshot_id → document_id + document_version_id`の対応を保持する | 文書更新後に、過去TraceやEvaluationがどの文書集合を検索していたか分からなくなる。Prompt変更による差分なのか、Corpus変更による差分なのかも切り分けにくい | 本番再現性・監査・切戻しのため必須 |
 | **Index Release** | Release ID付きAI Search Index＋Index設定 | PoC Indexを固定して比較 | 文書集合スナップショットだけでなく、Embedding Model、Query Embedding、Schema、Index設定を含めて「検索基盤の1 Version」として固定する | 同じCorpusでもEmbeddingやIndex設定が変われば検索結果は変わるが、その差分原因を特定できない。旧検索構成へ確実に戻すことも難しくなる | 本番Baselineで必須 |
-| **RAGリリース構成台帳** | `main.llmops.rag_release_manifest`の1行 | PoCではPrompt／Index／Git等を個別記録してもよい。本番では`rag.release_id`へ一本化する | **Code、Prompt、モデル経路、Index Release、文書集合スナップショット、ACL Policy、Judge等の「評価済み組合せそのもの」を1つのReleaseとして固定する**。本番RAGを部品単位ではなく、評価済み構成単位で扱う | Promptだけ新しくIndexは旧版、など一度も評価していない新旧混在構成が本番で動き得る。障害時も各Resourceを個別に戻す必要があり、完全なロールバックを保証しにくい | 本番Baselineで必須 |
-| Release参照／Channel | `production`等が指す`rag_release_id` | PoCは対象候補を明示して実行 | 本番が使う構成を`production → rag_release_id`という1つのPointerで管理し、昇格・ロールバックをRelease単位の参照切替にする | Prompt、Index、Model等を順番に切り替える途中で新旧構成が混在する。ロールバック時も一部Resourceだけ戻し忘れる可能性がある | RAG Releaseを採用する本番では必須 |
+| **RAGリリース構成台帳** | `main.llmops.rag_release_manifest`（承認済みRAGリリース構成の正本となるDelta Table）の1行 | PoCではPrompt／Index／Git等を個別記録してもよい。本番では`rag.release_id`（実行したRAGリリースをTraceから参照するTag）へ一本化する | **Code、Prompt、モデル経路、Index Release、文書集合スナップショット、ACL Policy、Judge等の「評価済み組合せそのもの」を1つのReleaseとして固定する**。本番RAGを部品単位ではなく、評価済み構成単位で扱う | Promptだけ新しくIndexは旧版、など一度も評価していない新旧混在構成が本番で動き得る。障害時も各Resourceを個別に戻す必要があり、完全なロールバックを保証しにくい | 本番Baselineで必須 |
+| Release参照／Channel | `production`（本番で現在利用する参照先を表すAlias）等が指す`rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID） | PoCは対象候補を明示して実行 | 本番が使う構成を`production → rag_release_id`という1つのPointerで管理し、昇格・ロールバックをRelease単位の参照切替にする | Prompt、Index、Model等を順番に切り替える途中で新旧構成が混在する。ロールバック時も一部Resourceだけ戻し忘れる可能性がある | RAG Releaseを採用する本番では必須 |
 | Training／Holdout分離 | UC管理MLflow EvaluationDataset | 1つの固定PoC Datasetでもよい | 改善・Prompt Optimizationに利用したCaseと、最終Release可否を判定する未使用Caseを分離し、過学習・評価リークを抑える | Training Caseへ最適化しただけのCandidateを「品質向上」と誤認する。Optimizerや人が見たCaseだけ高スコアになっていても検出しづらい | 継続改善を行うなら必須に近い強い推奨 |
 | Realtime／Evaluation／Labeling Experiment分離 | 用途別MLflow Experiment | PoCは1 Experimentにまとめてよい | 本番Request Trace、Release評価Run、人間Reviewを、書込主体、Reviewer、保持期間、権限、UC Trace要否の違いに合わせて分離する | 本番利用Trace、評価Run、人間Labelが同一Experimentへ混在し、権限・Retention・運用ルールが複雑になる。ただし機能上は1 Experimentでも成立するため、必須機能ではなく運用分離のための推奨設計である | 運用上強く推奨。要件次第で簡略化可能 |
-| Release Gate | `release_gate.py`＋Holdout／Security／SLO／Cost結果 | PoC OwnerがKPIとRiskからGo／No-Go | Accuracyだけでなく、Retrieval、Groundedness、ACL、Latency、Cost等を同じCandidateに対して確認し、必要条件を満たしたものだけを昇格候補にする | 回答品質は良いがACL越境している、LatencyやCostが急増している、といったCandidateを人が見落として本番投入できてしまう | 本番Baselineで必須 |
+| Release Gate | `release_gate.py`（Holdout・Security・SLO・Costからリリース判定材料を作るPythonファイル）＋Holdout／Security／SLO／Cost結果 | PoC OwnerがKPIとRiskからGo／No-Go | Accuracyだけでなく、Retrieval、Groundedness、ACL、Latency、Cost等を同じCandidateに対して確認し、必要条件を満たしたものだけを昇格候補にする | 回答品質は良いがACL越境している、LatencyやCostが急増している、といったCandidateを人が見落として本番投入できてしまう | 本番Baselineで必須 |
 | 権限評価用テスト条件／ACL Gate | Git Fixture＋Evaluation入力 | 限定Testerと簡易ACL確認 | 「どのIdentityならどの文書を検索できるか」を再現可能なTest Caseとして固定し、Releaseごとに権限制御を回帰試験する | 通常ユーザーの回答品質テストには合格しても、別Groupの利用者が権限外文書を取得する不具合を本番まで検出できない | ACL付きRAGでは必須 |
 | Service Principal職務分離 | Data Pipeline、Quality、Realtime等のSP | 開発者Identityで実行可能 | データ生成、品質判定、Release、本番Runtimeを別Identityへ分け、1つのCredentialで生成から承認・公開まで完結しないようにする | 1つのCredential侵害や誤操作で、文書生成・品質判定・Release・本番実行まで操作できる。監査上も「どの役割が何をしたか」を分離しづらい | 金融等の統制要件では必須。一般用途では分離粒度を簡略化可能 |
 | Production Monitoring | MLflow Production Monitoring、SQL Alert、監視検知イベント | PoC期間中にRunごと確認 | Release時点の評価だけでなく、本番投入後に発生する入力分布、文書更新、利用量、外部Service、Latency、品質の変化を継続検知する | Release時には正常でも、その後の文書更新によるRecall低下、429増加、Latency悪化、誤回答増加を利用者申告まで発見できない | 本番Baselineで必須 |
@@ -3415,10 +3494,10 @@ ACL Policy Version
 
 文書マニフェストは、「技術的に処理できたVersion」と「業務上いま公開してよいVersion」を分離するために使う。
 
-| Version | Parse／Prep | Review | `approved_document_version_id` | Gold／AI Search |
+| Version | Parse／Prep | Review | `approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照） | Gold／AI Search |
 | --- | --- | --- | --- | --- |
-| `v1` | `succeeded` | `approved` | `v1` | 公開中 |
-| `v2` | `succeeded` | `pending` | `v1`のまま | 非公開 |
+| `v1` | `succeeded`（正常終了を表す状態値） | `approved`（承認済みを表す状態値） | `v1` | 公開中 |
+| `v2` | `succeeded`（正常終了を表す状態値） | `pending`（未処理・確認待ちを表す状態値） | `v1`のまま | 非公開 |
 
 `v2`は技術的には検索可能なChunkまで作成できているが、まだ人の審査が終わっていない。このとき文書マニフェストが`v1`を指しているため、Gold Currentは`v1`を公開し続ける。
 
@@ -3430,10 +3509,10 @@ ACL Policy Version
 
 | Version | Parse | Prep | Review | 現在公開 |
 | --- | --- | --- | --- | --- |
-| `v1` | `succeeded` | `succeeded` | `approved` | ○ |
-| `v2` | `succeeded` | `succeeded` | `pending` | × |
+| `v1` | `succeeded`（正常終了を表す状態値） | `succeeded`（正常終了を表す状態値） | `approved`（承認済みを表す状態値） | ○ |
+| `v2` | `succeeded`（正常終了を表す状態値） | `succeeded`（正常終了を表す状態値） | `pending`（未処理・確認待ちを表す状態値） | × |
 
-`document_version_registry`は`v1`、`v2`それぞれの技術状態・審査状態を保持し、`document_source_manifest.approved_document_version_id`は「現在公開するVersion」として`v1`を指し続ける。これにより、`v2`がParse／Prepへ成功しただけで自動公開されず、審査完了後にだけ公開Pointerを切り替えられる。
+`document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）は`v1`、`v2`それぞれの技術状態・審査状態を保持し、`document_source_manifest.approved_document_version_id`（文書マニフェスト上の現在公開Version参照列）は「現在公開するVersion」として`v1`を指し続ける。これにより、`v2`がParse／Prepへ成功しただけで自動公開されず、審査完了後にだけ公開Pointerを切り替えられる。
 
 この台帳がないと、「`v2`は処理失敗中なのか、処理済みで審査待ちなのか、承認済みだが未公開なのか」を一つの公開状態だけでは表現できない。過去Versionがロールバック先として利用可能かも判断しづらくなる。
 
@@ -3443,9 +3522,9 @@ ACL Policy Version
 
 | 時刻 | 資産 | 状態 |
 | --- | --- | --- |
-| 10:00 | `document_workflow_requests` | `action=publish_v2`, `status=approved`, `requested_by=user-a`, `approved_by=user-b` |
+| 10:00 | `document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table） | `action=publish_v2`, `status=approved`, `requested_by=user-a`, `approved_by=user-b` |
 | 10:01 | Manifest Executor | `v1 → v2`への切替を実行 |
-| 10:01 | `document_manifest_audit_events` | `previous=v1`, `new=v2`, `outcome=succeeded` |
+| 10:01 | `document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable） | `previous=v1`, `new=v2`, `outcome=succeeded` |
 
 もしExecutorが失敗した場合、Requestは「承認済み」でもAudit Eventは`outcome=failed`になる。これにより、**人は公開を承認したが、システム反映は失敗した**という状態を区別できる。
 
@@ -3453,7 +3532,7 @@ Workflow／監査履歴がないと、現在のPointerだけを見ても「誰�
 
 ##### Search Sync Tableを分ける理由の具体例
 
-Search Sync Tableは過去の文書集合スナップショットを全件保持する履歴Tableではない。**現在AI Searchへ同期する物理データを保持する公開境界**であり、過去の文書Version集合を不変に残す役割は`corpus_snapshot_members`が担う。
+Search Sync Tableは過去の文書集合スナップショットを全件保持する履歴Tableではない。**現在AI Searchへ同期する物理データを保持する公開境界**であり、過去の文書Version集合を不変に残す役割は`corpus_snapshot_members`（文書集合スナップショットと構成文書Versionの対応を保持するTable）が担う。
 
 たとえば文書Aを`v2`から`v3`へ公開切替すると、次のように状態が変わる。
 
@@ -3491,7 +3570,7 @@ Search Sync Tableを挟まない場合、Gold Currentの変更とAI Searchへの
 
 文書集合スナップショットは、ある評価・検索Release時点で「どの文書Version集合を検索していたか」を固定する。
 
-| `corpus_snapshot_id` | `document_id` | `document_version_id` |
+| `corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID） | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID） |
 | --- | --- | --- |
 | `corpus-101` | `DOC-A` | `v3` |
 | `corpus-101` | `DOC-B` | `v2` |
@@ -3499,13 +3578,13 @@ Search Sync Tableを挟まない場合、Gold Currentの変更とAI Searchへの
 
 翌日に`DOC-B`が`v3`へ更新され、新しいSnapshotが次のようになったとする。
 
-| `corpus_snapshot_id` | `document_id` | `document_version_id` |
+| `corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID） | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID） |
 | --- | --- | --- |
 | `corpus-102` | `DOC-A` | `v3` |
 | `corpus-102` | `DOC-B` | `v3` |
 | `corpus-102` | `DOC-C` | `v5` |
 
-過去Traceの`rag.release_id`からRAGリリース構成台帳を参照し、そのReleaseの`corpus_snapshot_id=corpus-101`を取得できれば、そのRequestは`DOC-B/v2`を検索対象としていたと再現できる。文書集合スナップショットがないと、後から現在の文書集合だけを見てしまい、「Promptが悪かったのか、文書集合が変わったのか」を切り分けられない。
+過去Traceの`rag.release_id`（実行したRAGリリースをTraceから参照するTag）からRAGリリース構成台帳を参照し、そのReleaseの`corpus_snapshot_id=corpus-101`を取得できれば、そのRequestは`DOC-B/v2`（対象Resource／ソースを指す物理パス）を検索対象としていたと再現できる。文書集合スナップショットがないと、後から現在の文書集合だけを見てしまい、「Promptが悪かったのか、文書集合が変わったのか」を切り分けられない。
 
 文書集合スナップショットは文書本文やChunk全体をSnapshotごとに複製するものではなく、**Snapshot IDと文書Version集合の対応を保持する**。 本番障害をStagingで再現する場合は、このMember一覧を使って当時と同じ文書Version集合を再構築できる。したがって文書集合スナップショットは監査・評価再現だけでなく、**Production-equivalent 再実行 Corpusを作るための再構築仕様**としても機能する。
 
@@ -3518,9 +3597,9 @@ Search Sync Tableを挟まない場合、Gold Currentの変更とAI Searchへの
 | `index-21` | `corpus-101` | `embed-v1` | `embed-v1` | `chunk-v3` | 0.92 |
 | `index-22` | `corpus-101` | `embed-v2` | `embed-v2` | `chunk-v3` | 0.84 |
 
-この例では文書集合は同じだが、検索品質が低下している。`index_release_id`があれば、「Corpus変更」ではなく「検索構成変更」が原因候補だと切り分けられる。
+この例では文書集合は同じだが、検索品質が低下している。`index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID）があれば、「Corpus変更」ではなく「検索構成変更」が原因候補だと切り分けられる。
 
-Index Releaseを持たずIndex名だけを使い回すと、同じ名前のIndexでも中身のEmbeddingや設定が変わり、過去の検索挙動を再現できなくなる。 文書集合全体のスナップショット 再実行では、文書集合スナップショットだけ合わせてもEmbeddingやIndex Schemaが異なれば検索順位は一致しないため、元Traceの`index_release_id`からEmbedding、Query Embedding、同期列、Chunk Schema、検索設定を解決し、Staging側の再構築Indexへ適用する。
+Index Releaseを持たずIndex名だけを使い回すと、同じ名前のIndexでも中身のEmbeddingや設定が変わり、過去の検索挙動を再現できなくなる。 文書集合全体のスナップショット 再実行では、文書集合スナップショットだけ合わせてもEmbeddingやIndex Schemaが異なれば検索順位は一致しないため、元Traceの`index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID）からEmbedding、Query Embedding、同期列、Chunk Schema、検索設定を解決し、Staging側の再構築Indexへ適用する。
 
 ##### RAGリリース構成台帳が必要になる具体例
 
@@ -3546,8 +3625,8 @@ RAG Releaseを作っても、本番がどのReleaseを使うかを1つのPointer
 
 | Channel | 切替前 | 切替後 |
 | --- | --- | --- |
-| `production` | `rag-release-17` | `rag-release-18` |
-| `candidate` | `rag-release-18` | `rag-release-19` |
+| `production`（本番で現在利用する参照先を表すAlias） | `rag-release-17` | `rag-release-18` |
+| `candidate`（評価中の候補構成を表す状態値） | `rag-release-18` | `rag-release-19` |
 
 本番昇格は`production → rag-release-18`の参照切替だけで済み、問題があれば`production → rag-release-17`へ戻す。
 
@@ -3668,12 +3747,12 @@ PoC版を捨てて作り直すのではなく、メダリオンのDataset責務�
 
 ### 4.2 本番導入時のデータモデル全体像
 
-本番導入時は、PoCのPipelineを本番用物理名へ置き換えるだけではなく、**人が決める文書状態と公開Version**を永続管理する。管理フローとPipelineは独立して進み、`internal_docs_chunks_silver`と`document_source_manifest`が`internal_docs_current_mv`で合流する。
+本番導入時は、PoCのPipelineを本番用物理名へ置き換えるだけではなく、**人が決める文書状態と公開Version**を永続管理する。管理フローとPipelineは独立して進み、`internal_docs_chunks_silver`（Version付き検索Chunk履歴を保持するSilver Table）と`document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable）が`internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View）で合流する。
 
 要求上の「文書変更申請」「文書変更履歴」は、現行Sourceの物理名ではそれぞれ次に対応する。
 
-- 文書変更申請 = `document_workflow_requests`
-- 文書変更履歴 = `document_manifest_audit_events`
+- 文書変更申請 = `document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）
+- 文書変更履歴 = `document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable）
 
 物理Schemaを無断で別名へ置き換えず、以降はこの実名を使う。
 
@@ -3709,7 +3788,7 @@ flowchart TD
 | AI Search | Gold CurrentをRelease単位で検索可能にし、Snapshotと組み合わせて再現性・ロールバックを確保する。 |
 | RAG | 公開済みIndexだけを参照し、ACL、出典、Trace、品質評価を適用する。 |
 
-`document_workflow_requests`と`document_manifest_audit_events`は、上図の「人の判断を安全に反映し、後から監査できるようにする」ための詳細Tableである。Pipeline内部の`Attempt`／`Quality`／隔離Tableも同様に詳細実装として後段で展開する。
+`document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）と`document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable）は、上図の「人の判断を安全に反映し、後から監査できるようにする」ための詳細Tableである。Pipeline内部の`Attempt`（Parse／Prep等の1回の試行結果を表す概念）／`Quality`（Lakeflow Tableの品質用途を示すProperty値）／隔離Tableも同様に詳細実装として後段で展開する。
 
 **初読では、次のTable一覧を全列読む必要はない。「1行の意味」と「主な役割」を先に確認し、Key・書込元・読取元は設計／実装時に参照する。**
 
@@ -3719,57 +3798,57 @@ flowchart TD
 
 | 分類 | 物理名 | 物理種別 | 1行の意味 | 主なKey | 主な役割 | 書込元 | 読取元 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 文書管理 | `main.llmops.document_source_manifest` | Delta Table | 1論理文書の現在状態 | `document_id` | ACL、Lifecycle、現在公開Version Pointerの正本 | Manifest Executor | 文書管理UI、Pipeline、Gold、Realtime |
-| 文書管理 | `main.llmops.document_version_registry` | Delta Table | 1論理文書の1内容Version | `document_id`, `document_version_id` | Parse／Prep技術状態と審査履歴をVersion単位で保持 | Registry同期／文書Workflow | 文書管理UI、公開Version選択 |
-| 文書管理 | `main.llmops.document_workflow_requests` | Delta Table | 人が申請・承認した1変更Request | `request_id` | 「こう変更したい」という意図をBase Manifest更新から分離 | 文書管理UI／Workflow Backend | Manifest Executor、監査 |
-| 文書管理 | `main.llmops.document_manifest_audit_events` | Delta Table | Manifest／Registryへ実際に反映した1変更Event | `event_id`, `command_id` | 「実際にこう変更された」という変更前後・実行SP・承認者の証跡 | Manifest Executor | 監査、障害調査 |
-| 文書管理 | `main.llmops.document_intake_scan_results` | Delta Table（条件付き） | Staging Fileに対する1外部検査結果 | `scan_request_id` | Malware／署名検査がPolicy上必要な場合の信頼済み結果 | 外部Scanner連携 | 文書登録Workflow |
+| 文書管理 | `main.llmops.document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable） | Delta Table | 1論理文書の現在状態 | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | ACL、Lifecycle、現在公開Version Pointerの正本 | Manifest Executor | 文書管理UI、Pipeline、Gold、Realtime |
+| 文書管理 | `main.llmops.document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table） | Delta Table | 1論理文書の1内容Version | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | Parse／Prep技術状態と審査履歴をVersion単位で保持 | Registry同期／文書Workflow | 文書管理UI、公開Version選択 |
+| 文書管理 | `main.llmops.document_workflow_requests`（Unity Catalog上の物理Resource名） | Delta Table | 人が申請・承認した1変更Request | `request_id`（1回のRAG Requestを識別するID） | 「こう変更したい」という意図をBase Manifest更新から分離 | 文書管理UI／Workflow Backend | Manifest Executor、監査 |
+| 文書管理 | `main.llmops.document_manifest_audit_events`（Unity Catalog上の物理Resource名） | Delta Table | Manifest／Registryへ実際に反映した1変更Event | `event_id`（イベント・IDを表す識別子）, `command_id`（文書変更処理指示を識別し監査Eventと紐付けるID） | 「実際にこう変更された」という変更前後・実行SP・承認者の証跡 | Manifest Executor | 監査、障害調査 |
+| 文書管理 | `main.llmops.document_intake_scan_results`（Unity Catalog上の物理Resource名） | Delta Table（条件付き） | Staging Fileに対する1外部検査結果 | `scan_request_id`（外部Malware／署名検査Requestを識別するID） | Malware／署名検査がPolicy上必要な場合の信頼済み結果 | 外部Scanner連携 | 文書登録Workflow |
 
 ##### Pipeline
 
 | 分類 | 物理名 | 物理種別 | 1行の意味 | 主なKey | 主な役割 | 書込元 | 読取元 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Pipeline | `internal_docs_source_events` | Private Streaming Table | Volumeから検知した1 Source Event | `source_uri`, `content_hash` | `read_files`を一度だけ行い登録済み／未登録を分岐 | Lakeflow Pipeline | Bronze、未登録隔離 |
-| Pipeline | `internal_docs_unregistered_sources` | Streaming Table（隔離） | Manifestに登録されていない1 Source Event | `source_uri`, `content_hash` | 未登録Fileを監査・明示再実行用に保持 | Lakeflow Pipeline | 運用調査、再実行 |
-| Pipeline | `internal_docs_bronze` | Streaming Table | 登録済み1文書Versionの取込履歴 | `document_id`, `document_version_id` | 原文、Hash、登録属性、Preflightを追記保持 | Lakeflow Pipeline | `internal_docs_unique_versions` |
-| Pipeline | `internal_docs_unique_versions` | Private Streaming Table | AI Functionへ渡す一意な1文書Version | `document_id`, `document_version_id` | Parse重複実行を防止 | `01b_unique_versions.py` | `internal_docs_parse_attempts` |
-| Pipeline | `internal_docs_parse_attempts` | Private Streaming Table | 1文書Versionに対する1回のParse試行結果 | `document_id`, `document_version_id` | `ai_parse_document`結果を一度だけ物理保持 | Parse SQL | `internal_docs_parse_quality` |
-| Pipeline | `internal_docs_parse_quality` | Private Streaming Table | Parse Attemptへ品質判定を付けた1行 | `document_id`, `document_version_id` | 成功／隔離を同一条件で分岐 | Parse SQL | `internal_docs_parsed`, `internal_docs_parse_errors` |
-| Pipeline | `internal_docs_parsed` | Streaming Table | Parse成功した1文書Version | `document_id`, `document_version_id` | Prepへ渡すParse成功履歴 | Parse SQL | `internal_docs_prep_attempts`, Registry同期 |
-| Pipeline | `internal_docs_parse_errors` | Streaming Table（隔離） | Parse失敗した1文書Version | `document_id`, `document_version_id` | エラー理由・処理Versionを監査し、原因分類・復旧判断に使う | Parse SQL | 隔離Runbook、Registry同期 |
-| Pipeline | `internal_docs_prep_attempts` | Private Streaming Table | 1文書Versionに対する1回のPrep試行結果 | `document_id`, `document_version_id` | `ai_prep_search`結果を一度だけ物理保持 | Prep SQL | `internal_docs_prep_quality` |
-| Pipeline | `internal_docs_prep_quality` | Private Streaming Table | Prep Attemptへ品質判定を付けた1行 | `document_id`, `document_version_id` | 成功／隔離を同一条件で分岐 | Prep SQL | `internal_docs_prepared`, `internal_docs_prep_errors` |
-| Pipeline | `internal_docs_prepared` | Streaming Table | Prep成功した1文書Version | `document_id`, `document_version_id` | Chunk展開へ渡すPrep成功履歴 | Prep SQL | `internal_docs_chunks_silver`, Registry同期 |
-| Pipeline | `internal_docs_prep_errors` | Streaming Table（隔離） | Prep失敗した1文書Version | `document_id`, `document_version_id` | エラー理由・処理Versionを監査し、原因分類・復旧判断に使う | Prep SQL | 隔離Runbook、Registry同期 |
-| Pipeline | `internal_docs_chunks_silver` | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id` | 全成功Versionの検索Chunk履歴と代表ページ画像参照を追記保持 | Chunk SQL | `internal_docs_current_mv` |
-| Pipeline | `internal_docs_current_mv` | Materialized View | 現在公開してよい1 Chunk | `chunk_version_id` | SilverとManifest Pointer／ACL／Lifecycleを結合したGold Current | Gold SQL | Search Publish Job |
+| Pipeline | `internal_docs_source_events`（監視Volumeで検知した文書Source Eventを保持する中間Table） | Private Streaming Table | Volumeから検知した1 Source Event | `source_uri`（原文または取得元を特定するURI）, `content_hash`（原文内容の同一性を確認するHash） | `read_files`（DatabricksでVolume等からFileを読み込むStreaming Source）を一度だけ行い登録済み／未登録を分岐 | Lakeflow Pipeline | Bronze、未登録隔離 |
+| Pipeline | `internal_docs_unregistered_sources`（文書マニフェスト未登録のSourceを隔離するTable） | Streaming Table（隔離） | Manifestに登録されていない1 Source Event | `source_uri`（原文または取得元を特定するURI）, `content_hash`（原文内容の同一性を確認するHash） | 未登録Fileを監査・明示再実行用に保持 | Lakeflow Pipeline | 運用調査、再実行 |
+| Pipeline | `internal_docs_bronze`（本番原文Binaryと取込Metadataを追記保持するBronze Table） | Streaming Table | 登録済み1文書Versionの取込履歴 | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | 原文、Hash、登録属性、Preflightを追記保持 | Lakeflow Pipeline | `internal_docs_unique_versions`（AI Functionへ渡す一意な文書Versionを保持する中間Table） |
+| Pipeline | `internal_docs_unique_versions`（AI Functionへ渡す一意な文書Versionを保持する中間Table） | Private Streaming Table | AI Functionへ渡す一意な1文書Version | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | Parse重複実行を防止 | `01b_unique_versions.py`（同一文書Versionの重複を検出し、後続処理へ一意なVersionだけを渡す前処理） | `internal_docs_parse_attempts`（文書解析結果とエラーを一度だけ保持する試行結果Table） |
+| Pipeline | `internal_docs_parse_attempts`（文書解析結果とエラーを一度だけ保持する試行結果Table） | Private Streaming Table | 1文書Versionに対する1回のParse試行結果 | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | `ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）結果を一度だけ物理保持 | Parse SQL | `internal_docs_parse_quality`（Parse結果に品質判定を付ける中間Table） |
+| Pipeline | `internal_docs_parse_quality`（Parse結果に品質判定を付ける中間Table） | Private Streaming Table | Parse Attemptへ品質判定を付けた1行 | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | 成功／隔離を同一条件で分岐 | Parse SQL | `internal_docs_parsed`（Parse成功結果を保持するTable）, `internal_docs_parse_errors`（Parse失敗結果を隔離して保持するTable） |
+| Pipeline | `internal_docs_parsed`（Parse成功結果を保持するTable） | Streaming Table | Parse成功した1文書Version | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | Prepへ渡すParse成功履歴 | Parse SQL | `internal_docs_prep_attempts`（検索用整形結果とエラーを一度だけ保持する試行結果Table）, Registry同期 |
+| Pipeline | `internal_docs_parse_errors`（Parse失敗結果を隔離して保持するTable） | Streaming Table（隔離） | Parse失敗した1文書Version | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | エラー理由・処理Versionを監査し、原因分類・復旧判断に使う | Parse SQL | 隔離Runbook、Registry同期 |
+| Pipeline | `internal_docs_prep_attempts`（検索用整形結果とエラーを一度だけ保持する試行結果Table） | Private Streaming Table | 1文書Versionに対する1回のPrep試行結果 | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | `ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）結果を一度だけ物理保持 | Prep SQL | `internal_docs_prep_quality`（Prep結果に品質判定を付ける中間Table） |
+| Pipeline | `internal_docs_prep_quality`（Prep結果に品質判定を付ける中間Table） | Private Streaming Table | Prep Attemptへ品質判定を付けた1行 | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | 成功／隔離を同一条件で分岐 | Prep SQL | `internal_docs_prepared`（Prep成功結果を保持するTable）, `internal_docs_prep_errors`（Prep失敗結果を隔離して保持するTable） |
+| Pipeline | `internal_docs_prepared`（Prep成功結果を保持するTable） | Streaming Table | Prep成功した1文書Version | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | Chunk展開へ渡すPrep成功履歴 | Prep SQL | `internal_docs_chunks_silver`（Version付き検索Chunk履歴を保持するSilver Table）, Registry同期 |
+| Pipeline | `internal_docs_prep_errors`（Prep失敗結果を隔離して保持するTable） | Streaming Table（隔離） | Prep失敗した1文書Version | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | エラー理由・処理Versionを監査し、原因分類・復旧判断に使う | Prep SQL | 隔離Runbook、Registry同期 |
+| Pipeline | `internal_docs_chunks_silver`（Version付き検索Chunk履歴を保持するSilver Table） | Streaming Table | 1文書Version内の1 Chunk | `chunk_version_id`（検索Chunkの内容・版を一意に識別するID） | 全成功Versionの検索Chunk履歴と代表ページ画像参照を追記保持 | Chunk SQL | `internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View） |
+| Pipeline | `internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View） | Materialized View | 現在公開してよい1 Chunk | `chunk_version_id`（検索Chunkの内容・版を一意に識別するID） | SilverとManifest Pointer／ACL／Lifecycleを結合したGold Current | Gold SQL | Search Publish Job |
 
 ##### Search公開
 
 | 分類 | 物理名 | 物理種別 | 1行の意味 | 主なKey | 主な役割 | 書込元 | 読取元 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Search公開 | `main.llmops.internal_docs_search_sync` | CDF有効Delta Table | AI Searchへ同期する現在公開Chunk 1件 | `chunk_version_id` | Materialized ViewとAI Searchの間の物理同期境界 | `publish_search_sync_table.py` | AI Search Delta Sync Index |
-| Search公開 | `main.llmops.corpus_snapshot_members` | Delta Table | 1 文書集合スナップショットに含まれる1文書Version | `corpus_snapshot_id`, `document_id`, `document_version_id` | Snapshot IDと公開Version集合を不変に対応付ける | Search Publish Job | Index Release、Evaluation、RAG Release |
+| Search公開 | `main.llmops.internal_docs_search_sync`（AI Searchへ同期する現在公開Chunkを保持するTable） | CDF有効Delta Table | AI Searchへ同期する現在公開Chunk 1件 | `chunk_version_id`（検索Chunkの内容・版を一意に識別するID） | Materialized ViewとAI Searchの間の物理同期境界 | `publish_search_sync_table.py`（公開確定したCurrent ChunkをAI Search同期専用Tableへ反映し、検索公開境界を作る処理） | AI Search Delta Sync Index |
+| Search公開 | `main.llmops.corpus_snapshot_members`（文書集合スナップショットの構成文書Versionを保持するTable） | Delta Table | 1 文書集合スナップショットに含まれる1文書Version | `corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID）, `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）, `document_version_id`（文書内容ごとの不変バージョンID） | Snapshot IDと公開Version集合を不変に対応付ける | Search Publish Job | Index Release、Evaluation、RAG Release |
 
 ##### Quality／MLflow
 
 | 分類 | 物理名 | 物理種別 | 1行の意味 | 主なKey | 主な役割 | 書込元 | 読取元 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 評価 | `main.llmops.internal_rag_train` | MLflow EvaluationDataset（Unity Catalog Table） | 改善探索用の1評価Case | `case_instance_id` | Retrieval／Prompt等の候補探索 | Seed／品質管理ジョブ | Evaluation、Prompt Optimization |
-| 評価 | `main.llmops.internal_rag_holdout` | MLflow EvaluationDataset（Unity Catalog Table） | 最終判定用の1未使用評価Case | `case_instance_id` | Release Gate用の固定Holdout | Seed／品質管理ジョブ | Release Evaluation |
-| Release | `main.llmops.rag_release_manifest` | Delta Table | 1不変RAG Release構成 | `rag_release_id` | Git、Prompt、モデル経路、Index、Corpus、Judgeを組として固定 | Quality／Release Job | Realtime Agent、Evaluation、ロールバック |
-| Monitoring | `main.llmops.internal_rag_monitoring_signals` | Delta Table | 1つの正規化済み監視検知Event | `signal_id`, `dedup_key` | Job／Alert／Scorer／Security検知を同じ契約へ正規化 | Detector／品質管理ジョブ | 一次分類ジョブ |
-| Monitoring | `main.llmops.internal_rag_monitoring_thresholds` | Delta Table | 1 Policy Version・Metricの閾値 | `policy_version`, `metric_name` | Monitoring閾値と承認DecisionをSource Codeから分離 | Quality運用 | Alert／Monitoring Query |
-| Quality | `main.llmops.internal_rag_quality_cases` | Delta Table（任意） | 1つの失敗原因グループの改善Case | `quality_case_id`, `failure_family_id` | 外部Issue Trackerを正本にしない場合の改善・再評価・Close管理 | 一次分類／品質管理ジョブ | Dashboard、Alert、運用担当 |
+| 評価 | `main.llmops.internal_rag_train`（候補改善に利用するTraining Evaluation Dataset） | MLflow EvaluationDataset（Unity Catalog Table） | 改善探索用の1評価Case | `case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID） | Retrieval／Prompt等の候補探索 | Seed／品質管理ジョブ | Evaluation、Prompt Optimization |
+| 評価 | `main.llmops.internal_rag_holdout`（候補探索に使わない最終判定用Holdout Evaluation Dataset） | MLflow EvaluationDataset（Unity Catalog Table） | 最終判定用の1未使用評価Case | `case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID） | Release Gate用の固定Holdout | Seed／品質管理ジョブ | Release Evaluation |
+| Release | `main.llmops.rag_release_manifest`（承認済みRAGリリース構成の正本となるDelta Table） | Delta Table | 1不変RAG Release構成 | `rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID） | Git、Prompt、モデル経路、Index、Corpus、Judgeを組として固定 | Quality／Release Job | Realtime Agent、Evaluation、ロールバック |
+| Monitoring | `main.llmops.internal_rag_monitoring_signals`（品質・運用監視の検知イベントを保持するTable） | Delta Table | 1つの正規化済み監視検知Event | `signal_id`（監視で検知した1イベントを識別するID）, `dedup_key`（同じ失敗候補を重複判定するための識別Key） | Job／Alert／Scorer／Security検知を同じ契約へ正規化 | Detector／品質管理ジョブ | 一次分類ジョブ |
+| Monitoring | `main.llmops.internal_rag_monitoring_thresholds`（Unity Catalog上の物理Resource名） | Delta Table | 1 Policy Version・Metricの閾値 | `policy_version`（適用した権限・公開ポリシーのVersion）, `metric_name`（Monitoring閾値を適用するMetric名） | Monitoring閾値と承認DecisionをSource Codeから分離 | Quality運用 | Alert／Monitoring Query |
+| Quality | `main.llmops.internal_rag_quality_cases`（品質改善課題を保持するTable） | Delta Table（任意） | 1つの失敗原因グループの改善Case | `quality_case_id`（品質改善課題を識別するID）, `failure_family_id`（同じ症状・原因でまとめる失敗原因グループID） | 外部Issue Trackerを正本にしない場合の改善・再評価・Close管理 | 一次分類／品質管理ジョブ | Dashboard、Alert、運用担当 |
 
-`internal_rag_quality_cases`は外部Jira／ServiceNow等を正本にする組織では必須ではない。外部Tracker採用時は、Status、Assignee、Priority、SLAを二重管理しない。
+`internal_rag_quality_cases`（同じ原因の問題を改善単位で管理する品質改善課題Table）は外部Jira／ServiceNow等を正本にする組織では必須ではない。外部Tracker採用時は、Status、Assignee、Priority、SLAを二重管理しない。
 
 **関連Resource（Tableではないもの）**
 
 | Resource | 物理的な実体 | 本番導入時の役割 |
 | --- | --- | --- |
 | 文書入力 | Staging Volume、監視対象Volume、画像Volume | 文書審査前後の原本境界 |
-| AI Search Index | Release単位のDelta Sync Index | `internal_docs_search_sync`を検索公開 |
+| AI Search Index | Release単位のDelta Sync Index | `internal_docs_search_sync`（AI Searchへ同期する現在公開Chunkを保持するTable）を検索公開 |
 | MLflow Experiment | Realtime／Evaluation／Labeling Experiment | Trace、Evaluation、Assessmentを用途別に分離 |
 | Prompt Registry | UC-backed Prompt Resource | Git Markdownから登録した不変Prompt Versionを保持 |
 | Model Service | Unity AI Gateway Model Service | Answer／Judge等のRoute・権限・Rate Limit統制 |
@@ -3780,12 +3859,12 @@ flowchart TD
 
 本番導入時の文書管理ERは、次の4 Tableを中心にする。
 
-- 文書マニフェスト: `document_source_manifest`
-- 文書バージョン管理台帳: `document_version_registry`
-- 文書変更申請: `document_workflow_requests`
-- 文書変更履歴: `document_manifest_audit_events`
+- 文書マニフェスト: `document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable）
+- 文書バージョン管理台帳: `document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）
+- 文書変更申請: `document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）
+- 文書変更履歴: `document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable）
 
-`approved_document_version_id`は「その文書で現在公開すると人が選んだVersion」を指すPointerであり、「最新Version」や「Parse成功Version」を自動選択する列ではない。
+`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）は「その文書で現在公開すると人が選んだVersion」を指すPointerであり、「最新Version」や「Parse成功Version」を自動選択する列ではない。
 
 ```mermaid
 erDiagram
@@ -3836,9 +3915,9 @@ erDiagram
 
 **関係の要点**
 
-`document_source_manifest` 1行に対して、`document_version_registry`には複数Versionが存在する。`approved_document_version_id`はその複数Versionのうち、人が現在公開すると選択した1 Versionへの論理Pointerである。Databricks上の情報制約へ依存せず、Manifest ExecutorとInvariant Queryで整合性を保証する。
+`document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable） 1行に対して、`document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）には複数Versionが存在する。`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）はその複数Versionのうち、人が現在公開すると選択した1 Versionへの論理Pointerである。Databricks上の情報制約へ依存せず、Manifest ExecutorとInvariant Queryで整合性を保証する。
 
-`document_workflow_requests`は**「こう変更したい」**という申請・承認済み意図を保持する。`document_manifest_audit_events`は**「実際にこう変更された」**という物理反映結果を保持する。この2つを分離することで、申請済みだが未反映、反映失敗、再実行を監査できる。
+`document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）は**「こう変更したい」**という申請・承認済み意図を保持する。`document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable）は**「実際にこう変更された」**という物理反映結果を保持する。この2つを分離することで、申請済みだが未反映、反映失敗、再実行を監査できる。
 
 #### 4.2.4 本番導入時のデータフロー図
 
@@ -3899,14 +3978,14 @@ flowchart TD
     SYNC --> IDX
 ```
 
-**合流点**は`internal_docs_current_mv`である。SilverにVersionが存在しても、`document_source_manifest.approved_document_version_id`と一致し、公開状態・ACL・Lifecycle条件を満たさなければGold Currentへ出ない。したがって、「Pipeline処理成功」と「人が公開を承認した」は別の事実として保持される。
+**合流点**は`internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View）である。SilverにVersionが存在しても、`document_source_manifest.approved_document_version_id`（文書マニフェスト上の現在公開Version参照列）と一致し、公開状態・ACL・Lifecycle条件を満たさなければGold Currentへ出ない。したがって、「Pipeline処理成功」と「人が公開を承認した」は別の事実として保持される。
 
 整合性差分確認、レビュー待ちキュー自動配送、Prompt Optimization等の本番導入後機能は、この図には描かない。
 
 
 ### 4.3 本番開始前に構築する運用・統制機能
 
-本番開発では、PoC SourceをBaselineとして文書マニフェスト契約、Service Principal、登録・承認ワークフロー、必要な場合の外部Scanner、隔離、Search Sync、リリース構成台帳、ACL Filter、Training／Holdout Gateを追加する。PoCのTrace Schema、`inputs`／`expectations`契約、決定論的Scorer、RAG Judgeを捨てず、本番用Quality Bundleへ移してバージョン固定する。prod固有値をSourceへ埋め込まず、DAB Target、Terraform、Secret／Federationで環境差を注入する。
+本番開発では、PoC SourceをBaselineとして文書マニフェスト契約、Service Principal、登録・承認ワークフロー、必要な場合の外部Scanner、隔離、Search Sync、リリース構成台帳、ACL Filter、Training／Holdout Gateを追加する。PoCのTrace Schema、`inputs`（Evaluation Datasetへ保存する評価対象の入力）／`expectations`（Evaluation Datasetへ保存する期待値）契約、決定論的Scorer、RAG Judgeを捨てず、本番用Quality Bundleへ移してバージョン固定する。prod固有値をSourceへ埋め込まず、DAB Target、Terraform、Secret／Federationで環境差を注入する。
 
 #### 4.3の読み方（章内ナビゲーション）
 
@@ -3935,14 +4014,14 @@ Production Monitoringは「本番導入後に考える機能」ではない。�
 
 | PoC Source | 本番Source | 主な変更 |
 | --- | --- | --- |
-| `poc/src/01_bronze.sql` | `bundles/ingestion/src/01_bronze_ingestion.sql` | 文書マニフェスト JOIN、未登録隔離、取込時監査属性 |
-| `poc/src/01b_unique_versions.py` | `01b_deduplicate_versions.py` | `document_id`と`document_version_id`の複合Key |
-| `poc/src/02_parse.sql`／`03_prep.sql` | 同名の本番SQL | バージョン、エラー分類、処理バージョン、再試行情報 |
-| `poc/src/04_chunks_silver.sql` | `04_chunks_silver.sql` | ACL、公開範囲、Stable ID、Source Ref |
-| `poc/src/05_gold_poc.sql` | `05_gold_current.sql` | 文書マニフェスト最新値と承認参照を必須化 |
-| `poc/src/register_poc_prompt.py` | `bundles/quality/prompts/*.md`、`src/register_prompts.py` | PoCの短いPython直書きは維持し、本番本文はGit ReviewできるMarkdownからPrompt Registry候補Versionへ登録 |
-| `poc/src/rag_app.py` | `rag_release.py`、`rag_graph.py` | ACL、Snapshot、Prompt／Index／Model／Git固定、回答検証 |
-| `poc/src/poc_scorers.py`／`evaluate_poc.py` | Quality Bundle | UC Dataset、Training／Holdout、権限評価用テスト条件、Scorer／Judgeバージョン固定、リリース判定、Monitoring |
+| `poc/src/01_bronze.sql`（PoC Bronze取込を定義するSQLファイル） | `bundles/ingestion/src/01_bronze_ingestion.sql`（原文と取込MetadataをBronze層へ受け入れ、後続処理の起点を作る取込処理） | 文書マニフェスト JOIN、未登録隔離、取込時監査属性 |
+| `poc/src/01b_unique_versions.py`（PoCで文書Version重複を除外するPythonファイル） | `01b_deduplicate_versions.py`（同一文書Versionの重複を排除し、文書Version単位の一意性を保証する前処理） | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）と`document_version_id`（文書内容ごとの不変バージョンID）の複合Key |
+| `poc/src/02_parse.sql`（PoCの文書Parse処理を定義するSQLファイル）／`03_prep.sql`（解析済み文書を検索しやすい形へ正規化し、Chunk生成前の検索用表現を作る処理） | 同名の本番SQL | バージョン、エラー分類、処理バージョン、再試行情報 |
+| `poc/src/04_chunks_silver.sql`（PoCのChunk生成を定義するSQLファイル） | `04_chunks_silver.sql`（検索・回答に使うChunkを生成し、Chunk本文・出典・Version MetadataをSilver層へ整える処理） | ACL、公開範囲、Stable ID、Source Ref |
+| `poc/src/05_gold_poc.sql`（PoCの検索公開用Goldを定義するSQLファイル） | `05_gold_current.sql`（本番で現在検索対象にできる承認済み・現行・未削除ChunkだけをGold層へ確定する処理） | 文書マニフェスト最新値と承認参照を必須化 |
+| `poc/src/register_poc_prompt.py`（PoC PromptをPrompt Registryへ登録するPythonファイル） | `bundles/quality/prompts/*.md`（Quality BundleでGit管理するPrompt Markdown群）、`src/register_prompts.py`（Git管理したPromptを検証してPrompt Registryへ登録し、同一内容の重複Version作成を防ぐ処理） | PoCの短いPython直書きは維持し、本番本文はGit ReviewできるMarkdownからPrompt Registry候補Versionへ登録 |
+| `poc/src/rag_app.py`（PoC RAGの検索・回答・Traceを実装するPythonファイル） | `rag_release.py`（RAGリリース構成の読込・検証を実装するPythonファイル）、`rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル） | ACL、Snapshot、Prompt／Index／Model／Git固定、回答検証 |
+| `poc/src/poc_scorers.py`（PoC用Scorerを定義するPythonファイル）／`evaluate_poc.py`（PoC Evaluationを実行するPythonファイル） | Quality Bundle | UC Dataset、Training／Holdout、権限評価用テスト条件、Scorer／Judgeバージョン固定、リリース判定、Monitoring |
 | MLflow Trace UIで入力したPoC Assessment | Label Schema／正式Review契約 | Reviewer権限、Masking、保持期間、監査項目を追加 |
 
 ここからは、前述の正常系と統制を実装するPython、SQL、YAML、Terraformを示す。各コードの直前に実行主体、入力、出力、必要理由、正常時・失敗時・再実行時の状態を記載する。宣言的な表変換はSQL、外部API、File Move、条件付き`MERGE／DELETE`、整合性差分確認などの命令的処理はPythonへ分離する。
@@ -3953,7 +4032,7 @@ PoC章で成立性を確認した契約とDataset責務をBaselineとして固�
 
 1. Workspace管理者がProduction MonitoringのBeta利用可否、System Tables、SQL Warehouse、Serverless Budget Policyを確認する。
 2. Platform管理者がAnswer／Judge用Model Service、AI GatewayのRate Limit、利用権限を準備する。
-3. Identity／文書マニフェスト担当が標準6系統のTrust Boundary、Workspace割当、`run_as`、UC GRANTを構築する。
+3. Identity／文書マニフェスト担当が標準6系統のTrust Boundary、Workspace割当、`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）、UC GRANTを構築する。
 4. Platform / Deploy IdentityがRealtime／Evaluation／Labelingの3 Experimentを別IDで作り、Realtimeだけを作成時にUC Trace Locationへ固定する。以後の品質処理はQuality SPが実行する。
 5. Prompt Registry SchemaとEvaluationDataset Schemaを作成し、Git管理の4つのPrompt Markdownを候補Versionとして登録する。登録・実行・Review権限を分離する。
 6. 文書管理UI、単一のWorkflow Request、Manifest Executor、監査Eventを構築する。Stagingの自動事前検査後に人がRAG投入を承認し、処理後に別の人が公開Versionを選ぶ。外部Scannerは必要な場合だけ追加する。
@@ -4105,29 +4184,29 @@ internal-docs-rag/
 
 | Bundle／Package | 主な責務 | 独立させる理由 |
 | --- | --- | --- |
-| `infra/identity`、`infra/databricks` | SP作成、Workspace割当、初期セットアップ、UC Grant | Account／Platform管理権限をアプリDABから分離する |
-| `internal-rag-common` | State、検索文書、引用、Prompt名 | 取り込み・評価・本番の契約を一致させる |
-| `document-workflow` | 文書一覧、Version一覧、RAG投入審査、公開Version選択、停止・切戻し | 業務判断をData PipelineやRealtime Appから分け、SQL直接更新を避ける |
-| `ingestion` | Manifest Executor、文書解析、Chunk、Index同期 | 人の判断を検証・反映する境界と、データ生成を分ける |
-| `quality` | Prompt、Dataset、評価、最適化、Judge | 品質変更の権限と定期Jobを分離する |
-| `realtime` | LangGraph、Agent Server、Streamlit | 低遅延アプリの依存関係とリリースを分離する |
+| `infra/identity`（対象Resource／ソースを指す物理パス）、`infra/databricks`（対象Resource／ソースを指す物理パス） | SP作成、Workspace割当、初期セットアップ、UC Grant | Account／Platform管理権限をアプリDABから分離する |
+| `internal-rag-common`（RAG共通データ型・処理を提供するPython Package名） | State、検索文書、引用、Prompt名 | 取り込み・評価・本番の契約を一致させる |
+| `document-workflow`（文書審査UIと変更申請を配備するDAB Bundle名） | 文書一覧、Version一覧、RAG投入審査、公開Version選択、停止・切戻し | 業務判断をData PipelineやRealtime Appから分け、SQL直接更新を避ける |
+| `ingestion`（文書取込・解析・検索公開を配備するDAB Bundle名） | Manifest Executor、文書解析、Chunk、Index同期 | 人の判断を検証・反映する境界と、データ生成を分ける |
+| `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | Prompt、Dataset、評価、最適化、Judge | 品質変更の権限と定期Jobを分離する |
+| `realtime`（RAG ApplicationとAgent Serverを配備するDAB Bundle名） | LangGraph、Agent Server、Streamlit | 低遅延アプリの依存関係とリリースを分離する |
 
 **旧Sourceの分類**
 
 | Source | 分類 | 扱いと理由 |
 | --- | --- | --- |
-| `apply_manifest_request.py`、`manifest_executor_job.yml`、`document-workflow/app/*` | 1. 本番導入時に必要 | 単一Workflow Requestを検証し、人の判断をManifestとAudit Eventへ反映する最小構成 |
-| `submit_document_registration.py`、`register_document.py`、`submit_document_approval.py`、`approve_document_version.py`、`apply_manifest_commands.py`、`document_manifest_job.yml` | 2. 本番導入後の厳格構成 | 登録／承認Command、Job、Executorを個別に分ける必要が監査・規制で確認された場合だけ使う |
-| `reconcile_source_manifest.py` | 2. 本番導入後の高度化 | 不整合が頻発し、人手照合でSLAを満たせなくなった場合に候補生成と自動一次分類を追加 |
-| 旧の別々のRegistration／Approval Command Table | 3. 新しい簡易Workflowに置換 | 標準構成では単一`document_workflow_requests`と`document_manifest_audit_events`を使い、不要なQueueの細分化を避ける |
+| `apply_manifest_request.py`（承認済み文書Workflow Requestを検証し、文書マニフェストと監査履歴へ反映する処理）、`manifest_executor_job.yml`（文書Workflow Requestを取得し、承認済み変更を文書マニフェストへ反映するJob定義）、`document-workflow/app/*` | 1. 本番導入時に必要 | 単一Workflow Requestを検証し、人の判断をManifestとAudit Eventへ反映する最小構成 |
+| `submit_document_registration.py`（文書登録要求を検証して登録処理指示として受け付け、後続の登録処理へ渡す処理）、`register_document.py`（文書登録申請を処理するPythonファイル）、`submit_document_approval.py`（文書Versionの公開承認要求を受け付け、承認処理指示として後続処理へ渡す処理）、`approve_document_version.py`（承認済み文書Versionを公開対象へ切り替え、旧VersionとのCurrent状態を整合させる処理）、`apply_manifest_commands.py`（登録・承認の処理指示を正本へ反映するPythonファイル）、`document_manifest_job.yml`（厳格運用で登録・承認の処理指示を個別Jobとして実行する文書管理Job定義） | 2. 本番導入後の厳格構成 | 登録／承認処理指示、Job、Executorを個別に分ける必要が監査・規制で確認された場合だけ使う |
+| `reconcile_source_manifest.py`（原文・Registry・文書マニフェストの差分を照合し、不整合候補を抽出する処理） | 2. 本番導入後の高度化 | 不整合が頻発し、人手照合でSLAを満たせなくなった場合に候補生成と自動一次分類を追加 |
+| 旧の別々の登録／承認処理指示テーブル | 3. 新しい簡易Workflowに置換 | 標準構成では単一`document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）と`document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable）を使い、不要なQueueの細分化を避ける |
 
 エージェント型RAGでは状態遷移、再検索上限、条件分岐が必要なためLangGraphを使用する。一方、単純なモデル呼び出しだけの箇所へ不要なChainを追加せず、AI Search SDKやMLflow APIは直接呼び出す。
 
-`quality` Bundleのうち、`seed_evaluation_dataset.py`、`evaluate_rag.py`、`release_gate.py`、`register_monitoring.py`は本番導入／Pilotまでに完成させる。`create_review_queue.py`、`sync_review_assessments.py`、`sync_evaluation_dataset.py`、`align_judge.py`は、本番後の定期Reviewと継続改善で初めて自動運用する。PoC用`poc_scorers.py`の決定論的判定は共通PackageまたはQuality Bundleへ移し、同じ定義を再利用する。
+`quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） Bundleのうち、`seed_evaluation_dataset.py`（固定した評価CaseをTraining／Holdout EvaluationDatasetへ登録し、再現可能な評価母集団を作る処理）、`evaluate_rag.py`（指定したRAG Releaseを固定EvaluationDataset上で実行し、Scorer／Judge結果を記録する処理）、`release_gate.py`（Holdout・Security・SLO・Costからリリース判定材料を作るPythonファイル）、`register_monitoring.py`（Production Monitoring用Scorerを登録・開始するPythonファイル）は本番導入／Pilotまでに完成させる。`create_review_queue.py`（本番Traceから人手確認が必要な代表Caseを抽出し、レビュー候補へまとめる処理）、`sync_review_assessments.py`（Review Appで付与されたAssessment／Expectationを品質管理側へ同期する処理）、`sync_evaluation_dataset.py`（承認済みレビューCaseをEvaluation Datasetへ同期するPythonファイル）、`align_judge.py`（人の評価結果とJudge結果を比較し、Judgeの判定基準を調整・検証する処理）は、本番後の定期Reviewと継続改善で初めて自動運用する。PoC用`poc_scorers.py`（PoC用Scorerを定義するPythonファイル）の決定論的判定は共通PackageまたはQuality Bundleへ移し、同じ定義を再利用する。
 
 ##### 4.3.3.1 本番Workspace・MLflow初期セットアップ
 
-本番ではExperimentを1つにまとめない。Realtime Trace、Release評価、Labeling Sessionは保持期間、書込主体、参照者、UC Trace要否が異なるため、別Experiment IDにする。DABの`experiments` ResourceはExperiment自体を宣言できるが、現行SchemaにはUC `trace_location`を指定するFieldがない。このため、本番3 ExperimentはDABとSDKの両方で重複作成せず、**MLflow SDKによる初期セットアップだけ**が作成する。DABは初期セットアップJobと後続Jobを定義し、作成済みIDをBundle変数として受け取る。
+本番では、**Realtime実行、オフラインEvaluation、人によるLabeling／Reviewの3用途を1つのMLflow Experimentへ混在させない**。ここで分ける単位はAgentではなく用途・運用境界である。Realtimeでは本番RequestのTrace、EvaluationではCandidate比較やリリース判定、Labeling／Reviewでは専門家によるAssessmentやExpectationを扱う。これらは保持期間、書込主体、参照者、UC Trace要否が異なるため、用途ごとに別Experiment IDにする。DABの`experiments`（DABでMLflow Experiment Resourceを定義するBlock名） ResourceはExperiment自体を宣言できるが、現行SchemaにはUC `trace_location`（MLflow Traceの保存先を指定する設定）を指定するFieldがない。このため、本番3 ExperimentはDABとSDKの両方で重複作成せず、**MLflow SDKによる初期セットアップだけ**が作成する。DABは初期セットアップJobと後続Jobを定義し、作成済みIDをBundle変数として受け取る。
 
 ```mermaid
 flowchart TD
@@ -4145,9 +4224,9 @@ flowchart TD
 
 | Experiment | 物理名 | 保存対象 | Trace Storage | 書込主体 | 主な読取主体 |
 | --- | --- | --- | --- | --- | --- |
-| Realtime | `/Shared/llmops/prod/internal-rag-realtime` | 本番Request Trace、Production Monitoring Feedback | UC Trace Table 4表 | Realtime App SP、Monitoring Job Identity | LLMOps、セキュリティ、Reviewer |
-| Evaluation | `/Shared/llmops/prod/internal-rag-evaluation` | Evaluation Run、リリース判定、Judge検証 | Experiment既定Storage | Quality SP | Quality Owner、Release Manager |
-| Labeling | `/Shared/llmops/prod/internal-rag-labeling` | Labeling Session側へ複製されたTraceとAssessment | Experiment既定Storage | Quality SP、Reviewer | Domain Expert、Quality Owner |
+| Realtime | `/Shared/llmops/prod/internal-rag-realtime`（対象Resource／ソースを指す物理パス） | 本番Request Trace、Production Monitoring Feedback | UC Trace Table 4表 | Realtime App SP、Monitoring Job Identity | LLMOps、セキュリティ、Reviewer |
+| Evaluation | `/Shared/llmops/prod/internal-rag-evaluation`（対象Resource／ソースを指す物理パス） | Evaluation Run、リリース判定、Judge検証 | Experiment既定Storage | Quality SP | Quality Owner、Release Manager |
+| Labeling | `/Shared/llmops/prod/internal-rag-labeling`（対象Resource／ソースを指す物理パス） | Labeling Session側へ複製されたTraceとAssessment | Experiment既定Storage | Quality SP、Reviewer | Domain Expert、Quality Owner |
 
 UC Trace LocationはExperiment作成時にしか関連付けられず、後から別Table Prefixへ付け替えられない。既存の同名Experimentを名前だけで再利用せず、初期セットアップの初回出力IDをCI/CDの環境別設定へ固定する。再実行時は期待IDが一致する場合だけ再利用し、同名・別IDならFail Closedにする。
 
@@ -4156,26 +4235,26 @@ UC Trace LocationはExperiment作成時にしか関連付けられず、後か�
 | 順序 | 主体 | 作業 | 完了証跡 |
 | --- | --- | --- | --- |
 | 1 | Workspace Admin | Production Monitoring BetaをPreviewsで許可し、SQL WarehouseとServerless Budget Policyを準備する | Preview状態、Warehouse ID、Policy ID |
-| 2 | UC Admin | Trace／Prompt／Dataset用Schema、Platform / Deploy Identityの必要な`CREATE TABLE`、Model Serviceの`EXECUTE`を付与する | UC Grant結果 |
+| 2 | UC Admin | Trace／Prompt／Dataset用Schema、Platform / Deploy Identityの必要な`CREATE TABLE`、Model Serviceの`EXECUTE`（対象Function／Model等を実行するSQL権限）を付与する | UC Grant結果 |
 | 3 | Platform / Deploy Identity | 3 Experimentを作成し、RealtimeへUC Trace Location、Monitoring Warehouse ID、Budget Policy Tagを設定する | 3 Experiment ID、4 UC Trace Table |
-| 4 | Platform IaC | 初期セットアップ出力IDを入力にExperiment ACLとUC Trace Tableの明示的`SELECT`／`MODIFY`を付与する | Terraform Plan／Apply、Grant結果 |
-| 5 | CI/CD | IDを`BUNDLE_VAR_realtime_experiment_id`等へ保存し、Quality／Realtime Bundleへ注入する | Deploy Log、Bundle Summary |
+| 4 | Platform IaC | 初期セットアップ出力IDを入力にExperiment ACLとUC Trace Tableの明示的`SELECT`（Table／Viewを読み取るSQL権限）／`MODIFY`（Delta Table等を変更するSQL権限）を付与する | Terraform Plan／Apply、Grant結果 |
+| 5 | CI/CD | IDを`BUNDLE_VAR_realtime_experiment_id`（Realtime Experiment IDをDABへ渡す環境変数）等へ保存し、Quality／Realtime Bundleへ注入する | Deploy Log、Bundle Summary |
 | 6 | Quality SP | Prompt、EvaluationDataset、Scorerを作成しSmoke Testを実行する | Smoke Test Run、Trace ID、Dataset件数 |
 
-`bundles/quality/src/bootstrap_production_mlflow.py`
+`bundles/quality/src/bootstrap_production_mlflow.py`（本番用Realtime・Evaluation・Labeling ExperimentとTrace保存先を初期作成する処理）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | このFileの責務 | 3 Experimentを作成し、Realtime ExperimentだけをUC Trace LocationとMonitoring前提へ関連付ける |
-| 呼出元／実行契機 | Platform初期構築完了後に`workspace_bootstrap_job`から実行。初回だけに限定せず、設定変更時は期待ID付きで再実行 |
+| 呼出元／実行契機 | Platform初期構築完了後に`workspace_bootstrap_job`（本番Workspace初期設定を検証するJob名）から実行。初回だけに限定せず、設定変更時は期待ID付きで再実行 |
 | 読取対象 | Experiment名、UC Catalog／Schema／Prefix、Warehouse ID、Budget Policy ID、既知のExperiment ID |
 | 更新対象 | MLflow Experiment、Realtime Experiment Tag、UC Trace Table |
 | 主な処理順序 | Backend固定→既存ID衝突検査→Realtime作成→Evaluation作成→Labeling作成→Warehouse／Policy設定→ID出力 |
 | 重要な判定 | Realtimeの同名Experimentを期待IDなしで再利用しない。UC Trace Locationを後付けしない |
 | Traceとの関係 | 初期セットアップ自身は業務Traceを作らず、後続App Traceの保存先を作る |
 | 正常終了時 | 3 IDをJSONで出力し、Realtime用4 UC Tableが作成される |
-| 失敗／再試行 | 途中結果を削除しない。出力済みIDを次回の`--expected-*-id`へ渡し、一致するResourceだけ再利用する |
-| 後続処理 | `production_mlflow_permissions.tf`、Bundle Deploy、`smoke_test_production_workspace.py` |
+| 失敗／再試行 | 途中結果を削除しない。出力済みIDを次回の`--expected-*-id`（実行時設定をPythonへ渡すCLI引数）へ渡し、一致するResourceだけ再利用する |
+| 後続処理 | `production_mlflow_permissions.tf`（対象Resource／ソースを指す物理パス）、Bundle Deploy、`smoke_test_production_workspace.py`（本番開始前にExperiment・Trace・Prompt・Dataset・AI Search・監視設定等を横断疎通確認する処理） |
 
 ```python
 """本番MLflow ExperimentとUC Trace Locationを重複なく初期セットアップする。"""
@@ -4298,12 +4377,12 @@ if __name__ == "__main__":
 {"evaluation_experiment_id":"2849001122334455","labeling_experiment_id":"2849001122334466","realtime_experiment_id":"2849001122334477","trace_location":"main.llmops_trace.internal_rag_prod"}
 ```
 
-`bundles/quality/resources/workspace_bootstrap_job.yml`
+`bundles/quality/resources/workspace_bootstrap_job.yml`（本番WorkspaceのMLflow初期セットアップと必須Resource作成を実行するJob定義）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | このFileの責務 | 初期セットアップ用Sourceへ管理済みResource IDを渡し、実行Identityと依存Packageを固定する |
-| 実行契機／変数解決 | Platform IaC後に手動またはCIがRun。`${var.*}`は環境別CI変数、Warehouse IDはTerraform Output |
+| 実行契機／変数解決 | Platform IaC後に手動またはCIがRun。`${var.*}`（DAB変数から設定値を解決する参照式）は環境別CI変数、Warehouse IDはTerraform Output |
 | DeployとRunの差 | DeployはJob定義だけを作成し、Experimentは作らない。Run時にPythonがExperimentを作る |
 | 正常／失敗／再試行 | Job出力JSONをCI Variable Storeへ保存。再Runは保存済み期待IDを渡す |
 | 後続処理 | Terraform ACL第2段、Quality／Realtime Bundle Deploy |
@@ -4351,9 +4430,9 @@ resources:
               - "mlflow[databricks]>=3.14,<4"
 ```
 
-初回Runでは`--expected-*-id`を省略する。CI/CDは出力JSONを環境別の保護Variable Storeへ保存し、2回目以降は3つの期待IDを追加Parameterとして渡す。後続Bundleには`realtime_experiment_id`、`evaluation_experiment_id`、`labeling_experiment_id`を必須変数として注入し、Source内でExperiment名を再検索しない。
+初回Runでは`--expected-*-id`（実行時設定をPythonへ渡すCLI引数）を省略する。CI/CDは出力JSONを環境別の保護Variable Storeへ保存し、2回目以降は3つの期待IDを追加Parameterとして渡す。後続Bundleには`realtime_experiment_id`（Realtime・Experiment・IDを表す識別子）、`evaluation_experiment_id`（Evaluation・Experiment・IDを表す識別子）、`labeling_experiment_id`（Labeling・Experiment・IDを表す識別子）を必須変数として注入し、Source内でExperiment名を再検索しない。
 
-`infra/databricks/production_mlflow_permissions.tf`
+`infra/databricks/production_mlflow_permissions.tf`（対象Resource／ソースを指す物理パス）
 
 | ロジック概要 | 内容 |
 | --- | --- |
@@ -4449,31 +4528,31 @@ resource "databricks_grant" "reviewer_trace_tables" {
 }
 ```
 
-UC Trace Tableには`ALL PRIVILEGES`だけで済ませず、`<prefix>_otel_spans`、`_otel_annotations`、`_otel_logs`、`_otel_metrics`の各表へRealtime App SPとMonitoring Identityの`SELECT, MODIFY`を明示付与する。Reviewerは必要な表の`SELECT`だけ、Monitoring SQL WarehouseにはMonitoring Identityの`CAN USE`、Realtime Experimentには同Identityの`CAN EDIT`が必要である。最初のScorer登録者がMonitoring Jobの実行Identityになるため、個人Userではなく退役手順を管理したQuality SPを使う。
+UC Trace Tableには`ALL PRIVILEGES`（対象Resourceの全権限をまとめて付与する権限指定）だけで済ませず、`<prefix>_otel_spans`（UC TraceのOTel Spanを保持するTable名Pattern）、`_otel_annotations`（UC TraceのOTel Annotationを保持するTable Suffix）、`_otel_logs`（UC TraceのOTel Logを保持するTable Suffix）、`_otel_metrics`（UC TraceのOTel Metricを保持するTable Suffix）の各表へRealtime App SPとMonitoring Identityの`SELECT, MODIFY`（読み取りと変更を許可するSQL権限の組合せ）を明示付与する。Reviewerは必要な表の`SELECT`（Table／Viewを読み取るSQL権限）だけ、Monitoring SQL WarehouseにはMonitoring Identityの`CAN USE`（SQL Warehouse等の利用を許可するDatabricks権限）、Realtime Experimentには同Identityの`CAN EDIT`（MLflow Experiment等の編集を許可するDatabricks権限）が必要である。最初のScorer登録者がMonitoring Jobの実行Identityになるため、個人Userではなく退役手順を管理したQuality SPを使う。
 
 **本番設定値の注入元**
 
 | 設定 | CI／DAB変数 | 実行環境名 | 利用先 |
 | --- | --- | --- | --- |
-| Realtime Experiment ID | `realtime_experiment_id` | `MLFLOW_EXPERIMENT_ID` | Agent Server／Realtime App |
-| Evaluation Experiment ID | `evaluation_experiment_id` | `MLFLOW_EVALUATION_EXPERIMENT_ID` | Evaluation、リリース判定 |
-| Labeling Experiment ID | `labeling_experiment_id` | `MLFLOW_LABELING_EXPERIMENT_ID` | レビュー待ちキュー、Assessment同期 |
-| Answer Model Service | `answer_model_service` | `RAG_ANSWER_MODEL_SERVICE` | `rag_release_manifest.model_service`、App |
-| Judge Model Service | `judge_model_service` | `RAG_JUDGE_MODEL_SERVICE` | Evaluation、Monitoring、Alignment検証 |
-| Prompt Optimization Reflection | `prompt_optimization_reflection_model` | `PROMPT_OPTIMIZATION_REFLECTION_MODEL` | `GepaPromptOptimizer`。`databricks:/<service>`形式 |
-| Judge Alignment Reflection | `judge_alignment_reflection_model` | `JUDGE_ALIGNMENT_REFLECTION_MODEL` | `MemAlignOptimizer`。`databricks:/<service>`形式 |
-| Monitoring Warehouse | `monitoring_sql_warehouse_id` | Experiment Tagへ永続化 | UC Trace検索、Production Monitoring |
-| Budget Policy | `serverless_budget_policy_id` | `mlflow.workload_creation_policy_id` | Monitoring Serverless Job |
+| Realtime Experiment ID | `realtime_experiment_id`（Realtime・Experiment・IDを表す識別子） | `MLFLOW_EXPERIMENT_ID`（Realtime Trace保存先Experiment IDを指定する環境変数） | Agent Server／Realtime App |
+| Evaluation Experiment ID | `evaluation_experiment_id`（Evaluation・Experiment・IDを表す識別子） | `MLFLOW_EVALUATION_EXPERIMENT_ID`（Evaluation Run保存先Experiment IDを指定する環境変数） | Evaluation、リリース判定 |
+| Labeling Experiment ID | `labeling_experiment_id`（Labeling・Experiment・IDを表す識別子） | `MLFLOW_LABELING_EXPERIMENT_ID`（Labeling／Review用Experiment IDを指定する環境変数） | レビュー待ちキュー、Assessment同期 |
+| Answer Model Service | `answer_model_service`（回答生成に利用するModel Service） | `RAG_ANSWER_MODEL_SERVICE`（回答Model Service名を指定する環境変数） | `rag_release_manifest.model_service`（RAGリリース構成台帳に固定した回答Model Service列）、App |
+| Judge Model Service | `judge_model_service`（品質判定に利用するJudge Model Service） | `RAG_JUDGE_MODEL_SERVICE`（Judge Model Service名を指定する環境変数） | Evaluation、Monitoring、Alignment検証 |
+| Prompt Optimization Reflection | `prompt_optimization_reflection_model`（Prompt Optimizationで候補生成・振り返りに使うModel設定） | `PROMPT_OPTIMIZATION_REFLECTION_MODEL`（Prompt・optimization・reflection・Modelを指定する設定値／環境変数） | `GepaPromptOptimizer`。`databricks:/<service>`（Databricks Model ServiceをJudge等から参照するModel URI形式）形式 |
+| Judge Alignment Reflection | `judge_alignment_reflection_model`（Judge Alignmentで振り返りに使うModel設定） | `JUDGE_ALIGNMENT_REFLECTION_MODEL`（Judge・alignment・reflection・Modelを指定する設定値／環境変数） | `MemAlignOptimizer`（Human Feedbackを使ってJudgeを調整するMLflow Optimizer）。`databricks:/<service>`（Databricks Model ServiceをJudge等から参照するModel URI形式）形式 |
+| Monitoring Warehouse | `monitoring_sql_warehouse_id`（監視・SQL・Warehouse・IDを表す識別子） | Experiment Tagへ永続化 | UC Trace検索、Production Monitoring |
+| Budget Policy | `serverless_budget_policy_id`（Serverless Workloadへ適用するBudget Policy ID） | `mlflow.workload_creation_policy_id`（MLflowで利用する設定・Resource名） | Monitoring Serverless Job |
 
-`bundles/quality/src/smoke_test_production_workspace.py`は次を1つでも満たさなければPilotを開始しない。Model Serviceの最小推論、3 Experiment ID一致、Promptバージョン読取、EvaluationDataset Record照合、Realtime Traceの作成、4 UC Trace Tableの`SELECT`、Feedback／MLflow Expectation登録、AI Search Golden Query、AI Gateway Usage参照、Monitoring Warehouse／Budget Policy Tag、登録Scorer数上限未満を検証する。Inference LoggingはSmoke Testで無条件に有効化せず、採用時だけ専用Schema、Masking、Retention、`SELECT`権限を別審査する。
+`bundles/quality/src/smoke_test_production_workspace.py`（本番開始前にExperiment・Trace・Prompt・Dataset・AI Search・監視設定等を横断疎通確認する処理）は次を1つでも満たさなければPilotを開始しない。Model Serviceの最小推論、3 Experiment ID一致、Promptバージョン読取、EvaluationDataset Record照合、Realtime Traceの作成、4 UC Trace Tableの`SELECT`（Table／Viewを読み取るSQL権限）、Feedback／MLflow Expectation登録、AI Search Golden Query、AI Gateway Usage参照、Monitoring Warehouse／Budget Policy Tag、登録Scorer数上限未満を検証する。Inference LoggingはSmoke Testで無条件に有効化せず、採用時だけ専用Schema、Masking、Retention、`SELECT`（Table／Viewを読み取るSQL権限）権限を別審査する。
 
 | 検証 | 理由 | 失敗時 |
 | --- | --- | --- |
-| Answer／Judge Model Service推論 | `EXECUTE`とRouteを実Requestで確認する | App／自動評価開始不可 |
+| Answer／Judge Model Service推論 | `EXECUTE`（対象Function／Model等を実行するSQL権限）とRouteを実Requestで確認する | App／自動評価開始不可 |
 | Realtime TraceとUC 4表 | Experiment名だけでなく物理保存とGrantを確認する | Pilot開始不可 |
 | Prompt／Dataset | 固定バージョンと固定Caseがリリース判定から読めることを確認する | RAG／評価開始不可 |
 | Feedback／MLflow Expectation | Reviewer ワークフローがAssessmentを書けることを確認する | Review開始不可 |
-| Monitoring前提 | Preview、Warehouse Tag、Policy、Scorer上限、Judge権限を確認する | `register()`／`start()`禁止 |
+| Monitoring前提 | Preview、Warehouse Tag、Policy、Scorer上限、Judge権限を確認する | `register()`（Scorer等を本番利用向けに登録する処理）／`start()`（登録済みScorerの本番Sampling評価を開始する処理）禁止 |
 | AI Gateway | 推論、429方針、Usage権限、Route Tagを確認する | 利用範囲拡大不可 |
 
 意思決定記録は、採用、却下、Risk受容、Release、Close等の人間判断を証跡IDとともに残す追記型記録であり、MLflow標準Resourceではない。実行ログや監査ログと役割を混同しない。
@@ -4486,12 +4565,12 @@ UC Trace Tableには`ALL PRIVILEGES`だけで済ませず、`<prefix>_otel_spans
 
 Smoke Testは検査専用Traceへ`bootstrap.smoke_test=true`を付け、業務品質集計から除外する。UC Traceは個別Trace削除APIを前提にせず、保持期限に基づくTable Lifecycleで削除する。Smoke TestのRun ID、Trace ID、Git Commit、3 Experiment ID、実行SP、実行時刻、成否はRun Logへ残し、Resource／権限の変更操作はAudit Logで確認する。PilotのGo／No-Go判断と理由、未解決Riskの受容条件は関連するRun IDやTrace IDとともに意思決定記録へ保存する。
 
-`bundles/quality/src/smoke_test_production_workspace.py`
+`bundles/quality/src/smoke_test_production_workspace.py`（本番開始前にExperiment・Trace・Prompt・Dataset・AI Search・監視設定等を横断疎通確認する処理）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | このFileの責務 | Pilot開始前に本番Resourceの最小Read／Write／InferenceとID接続を検証する |
-| 呼出元／実行契機 | ACL第2段と全Bundle Deploy後、`production_preflight_job`から実行 |
+| 呼出元／実行契機 | ACL第2段と全Bundle Deploy後、`production_preflight_job`（本番利用前のResource・権限・最小推論を検証するJob名）から実行 |
 | 読取対象 | 3 Experiment、Prompt、EvaluationDataset、Model Service、AI Search、UC Trace 4表、Monitoring Tag |
 | 更新対象 | Realtime ExperimentのSmoke TraceとAssessment、Preflight Job Run Log |
 | 主な処理順序 | ID一致→Tag確認→Prompt／Dataset→Index→Answer／Judge推論→Smoke Trace→Assessment→UC 4表参照 |
@@ -4649,7 +4728,7 @@ if __name__ == "__main__":
     main()
 ```
 
-`bundles/quality/resources/production_preflight_job.yml`
+`bundles/quality/resources/production_preflight_job.yml`（Pilot開始前に本番Resource・権限・Trace・検索・監視の疎通を検査するJob定義）
 
 | ロジック概要 | 内容 |
 | --- | --- |
@@ -4709,25 +4788,25 @@ resources:
               - databricks-ai-search
 ```
 
-SQL Warehouseの`CAN USE`、Production Monitoring Beta、AI Gateway Usage反映はWorkspace／System Table側の後続Taskで検証し、全Task成功後だけ`register_monitoring.py`を実行可能にする。Usage Tableは反映遅延があるため、Request ID付きで上限時間を設けてPollし、即時0件だけをGateway障害と誤判定しない。
+SQL Warehouseの`CAN USE`（SQL Warehouse等の利用を許可するDatabricks権限）、Production Monitoring Beta、AI Gateway Usage反映はWorkspace／System Table側の後続Taskで検証し、全Task成功後だけ`register_monitoring.py`（Production Monitoring用Scorerを登録・開始するPythonファイル）を実行可能にする。Usage Tableは反映遅延があるため、Request ID付きで上限時間を設けてPollし、即時0件だけをGateway障害と誤判定しない。
 
 ##### 4.3.3.2 Unity AI Gatewayの事前設定
 
-Unity AI GatewayはModel ServiceをUnity Catalog Securableとして公開し、複数DestinationへのRoute、Fallback、Rate Limit、Usage／コスト配賦を統制する。新規実装ではOpenAI互換`/ai-gateway/mlflow/v1`とModel Service FQNを利用する。Legacy Model Serving Endpoint向けAI Gateway設定やDAB `model_serving_endpoints`の旧Endpoint設定を同じResourceとして扱わない。
+Unity AI GatewayはModel ServiceをUnity Catalog Securableとして公開し、複数DestinationへのRoute、Fallback、Rate Limit、Usage／コスト配賦を統制する。新規実装ではOpenAI互換`/ai-gateway/mlflow/v1`（対象Resource／ソースを指す物理パス）とModel Service FQNを利用する。Legacy Model Serving Endpoint向けAI Gateway設定やDAB `model_serving_endpoints`（Legacy Model Serving Endpoint Resourceを定義するDAB項目）の旧Endpoint設定を同じResourceとして扱わない。
 
 | 設定 | 実体 | 作成主体 | 本システムの方針 | 確認証跡 |
 | --- | --- | --- | --- | --- |
-| Model Service | UCの`catalog.schema.service` Securable | Platform管理者 | Answer、Judge、Reflectionを用途別Serviceへ分離 | Catalog Explorer、最小推論 |
+| Model Service | UCの`catalog.schema.service`（Unity Catalog上のModel Service FQN形式） Securable | Platform管理者 | Answer、Judge、Reflectionを用途別Serviceへ分離 | Catalog Explorer、最小推論 |
 | Destination／Traffic | Model Service内のDestinationとWeight | Platform管理者、Model Risk Owner | 最大5 Destination以内。Pilot前は単一Route、カナリアリリース時だけSession Affinity付きSplit | Gateway設定Export、Trace Route Tag |
 | Fallback | Model Serviceの優先Route | Platform管理者 | Model品質が異なるFallbackは自動許可せず、事前Holdout合格した組だけ設定 | 障害訓練結果 |
 | Rate Limit | Service単位QPM／TPMと必要最小限のGroup上限 | Platform管理者 | 429を返し、Applicationは指数Backoffと上限回数を使用 | Rate Limit設定、429 Smoke Test |
-| Usage Tracking | `system.ai_gateway.usage` System Table | Databricksが生成 | Request、Token、Route、Tagをコスト／利用量集計に使用 | System Table Query、Dashboard |
-| コスト配賦 | Request Tag、Budget、Billing Tag | App／Platform | `rag_release_id`、Application、EnvironmentをPayloadではなくTagで付与 | Usage／Billing結合 |
+| Usage Tracking | `system.ai_gateway.usage`（AI Gatewayの利用量・Token・Model経路等を確認するSystem Table） System Table | Databricksが生成 | Request、Token、Route、Tagをコスト／利用量集計に使用 | System Table Query、Dashboard |
+| コスト配賦 | Request Tag、Budget、Billing Tag | App／Platform | `rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID）、Application、EnvironmentをPayloadではなくTagで付与 | Usage／Billing結合 |
 | Inference Logging | 任意の専用UC Inference Table | Model Risk／セキュリティ承認後だけ | **Default無効**。Prompt／Response保存が必要な限定用途だけ有効化 | DPIA、Schema Grant、Retention Job |
 | Payload Masking | App前処理＋許可List | セキュリティ、Application Owner | Logging前にToken、個人情報、署名URL、Raw ACLを除去。Trace Maskingと別に検証 | Masking Golden Test |
-| System Table権限 | `USE CATALOG`等の参照Grant | Account／Metastore Admin | Dashboard SPに必要なViewの`SELECT`だけ付与 | Grant一覧 |
+| System Table権限 | `USE CATALOG`（Catalogを利用するSQL権限）等の参照Grant | Account／Metastore Admin | Dashboard SPに必要なViewの`SELECT`（Table／Viewを読み取るSQL権限）だけ付与 | Grant一覧 |
 
-`system.ai_gateway.usage`はGatewayを経由したRequestから生成される課金対象のSystem Tableであり、Queryを書くだけではデータは増えない。AppはModel Service FQNを`model`へ指定し、Workspace認証でGatewayを経由する。DashboardはRaw System Tableを一般利用者へ開放せず、Environment、Service、Release、日付で集約した管理Viewを参照する。
+`system.ai_gateway.usage`（AI Gatewayの利用量・Token・Model経路等を確認するSystem Table）はGatewayを経由したRequestから生成される課金対象のSystem Tableであり、Queryを書くだけではデータは増えない。AppはModel Service FQNを`model`（Modelに関する分類・設定値）へ指定し、Workspace認証でGatewayを経由する。DashboardはRaw System Tableを一般利用者へ開放せず、Environment、Service、Release、日付で集約した管理Viewを参照する。
 
 Inference Loggingを採用する場合も、MLflow UC Trace Tableと同じものではない。前者はGateway推論Payloadの任意Log、後者はApplication／AgentのSpanとAssessmentである。金融機関向けDefaultはUC TraceへMask済みの最小証跡を残し、Inference Loggingは無効とする。例外的に有効化する場合は専用Schema、列Mask、Row Filter、保持期限、削除Job、閲覧承認、Incident時の保全手順をRelease前に定義する。
 
@@ -4735,10 +4814,10 @@ Inference Loggingを採用する場合も、MLflow UC Trace Tableと同じもの
 
 1. Platform管理者がSystem-provided Model APIまたは外部Model Destinationを確認する。
 2. Answer／Judge用Model ServiceをUIまたはUnity Catalog REST APIで作成する。現行DABに存在しないModel Service Resourceを架空定義しない。
-3. App SP／Quality SPへ`USE CATALOG`、`USE SCHEMA`、対象Serviceの`EXECUTE`を付与する。
+3. App SP／Quality SPへ`USE CATALOG`（Catalogを利用するSQL権限）、`USE SCHEMA`（Schemaを利用するSQL権限）、対象Serviceの`EXECUTE`（対象Function／Model等を実行するSQL権限）を付与する。
 4. QPM／TPM、Fallback、Traffic Routeを承認済み設定へ固定する。
 5. App SPで最小推論、Quality SPでJudge最小推論を実行する。
-6. `system.ai_gateway.usage`へRequestが現れ、Request TagとRouteを照合できることを確認する。
+6. `system.ai_gateway.usage`（AI Gatewayの利用量・Token・Model経路等を確認するSystem Table）へRequestが現れ、Request TagとRouteを照合できることを確認する。
 7. 429、Primary Destination障害、Fallback、コスト上限のDry Runを行う。
 
 #### 4.3.4 本番ソースファイル
@@ -4759,23 +4838,23 @@ Inference Loggingを採用する場合も、MLflow UC Trace Tableと同じもの
 
 ##### 4.3.4.1 共通のRAG入出力契約
 
-この実装では、検索結果、出典、Search Attempt、十分性判定、回答検証、Agent State、最終結果を共通Packageへ定義する。`document_id`は文書台帳が付与する版をまたいで不変な論理ID、`document_version_id`は内容から生成する不変バージョン、`chunk_logical_id`は文書内位置、`chunk_version_id`は文書・版・位置を組み合わせたAI Search Primary Keyである。`citation_id`も検索順位ではなくChunkバージョンから安定生成する。
+この実装では、検索結果、出典、Search Attempt、十分性判定、回答検証、Agent State、最終結果を共通Packageへ定義する。`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）は文書台帳が付与する版をまたいで不変な論理ID、`document_version_id`（文書内容ごとの不変バージョンID）は内容から生成する不変バージョン、`chunk_logical_id`（文書内で同じ論理Chunk位置を識別するID）は文書内位置、`chunk_version_id`（検索Chunkの内容・版を一意に識別するID）は文書・版・位置を組み合わせたAI Search Primary Keyである。`citation_id`（回答中の根拠を安定して参照する出典ID）も検索順位ではなくChunkバージョンから安定生成する。
 
 各用語とソースコード上のクラスの対応は次のとおりである。
 
 | 用語 | 意味 | 該当クラス | 主な役割 |
 | --- | --- | --- | --- |
-| 検索結果 | AI Searchから取得し、ACL、文書版、Current状態、Scoreなどを付与した1件の検索証跡 | `RetrievedDocument` | SDK固有の検索Responseを共通形式へ正規化する。検索後ACL検査、Snapshot検査、回答Context作成、出典生成、評価で同じ情報を利用できるようにする。 |
-| 出典 | 回答中の主張と、その根拠となった文書バージョン／Chunkを結び付ける構造化引用情報 | `Citation` | 安定した`citation_id`、文書ID、文書バージョン、Chunkバージョン、Title、Page、認可付き参照用`source_ref`をUIや評価へ返す。検索順位が変わっても同じChunkを追跡できるようにする。 |
-| Search Attempt | 1回の検索試行と、その検索語、取得したChunk、採用したChunk、十分性判定理由をまとめた履歴 | `SearchAttempt` | Query Rewriteを含む複数回の検索経路を失わずに記録する。Query重複、検索回数、各Attemptで新しい証跡を取得できたかを監査・評価する。 |
-| 十分性判定 | 現在の証跡だけで回答可能か、不足観点は何か、次に回答・再検索・拒否・人手確認のどれを行うかを示す判断 | `SearchDecision` | 十分性Judgeの自由文出力を構造化し、LangGraphの次Nodeを決定する。`sufficient`だけでなく、`missing_aspects`、判断理由、推奨Actionを保持する。 |
-| 回答検証 | 生成回答の主張が証跡に支持され、未引用の主張や証跡との矛盾がないかを示す検証結果 | `AnswerValidation` | 決定論的な出典・禁止情報検査を通過した回答について、意味的なGroundednessと矛盾をJudgeで確認する。失敗時は回答をそのまま表示せず、人手確認または拒否へ分岐させる。 |
-| Agent State | 1 Requestの開始から終了まで、LangGraphの各Nodeが共有・更新する処理途中の状態 | `RagState` | 元質問、現在の検索語、Identity／ACL、固定したRAGリリース、累積証跡、検索履歴、回答、拒否理由、検証エラーなどを保持し、Node間のデータ受け渡しと状態遷移を管理する。 |
-| 最終結果 | Graph終了後にAgent Server、Streamlit、Evaluationへ返す安定したRAG実行結果 | `RagResult` | 内部Stateをすべて公開せず、回答、利用文書／Chunk、出典、実検索回数、ACL・Current違反件数、拒否理由、Release ID、検証失敗など、APIと監査に必要な情報だけを返す。 |
+| 検索結果 | AI Searchから取得し、ACL、文書版、Current状態、Scoreなどを付与した1件の検索証跡 | `RetrievedDocument`（AI Searchから取得して検証済みの根拠文書を表す型） | SDK固有の検索Responseを共通形式へ正規化する。検索後ACL検査、Snapshot検査、回答Context作成、出典生成、評価で同じ情報を利用できるようにする。 |
+| 出典 | 回答中の主張と、その根拠となった文書バージョン／Chunkを結び付ける構造化引用情報 | `Citation`（回答へ返す出典情報を表す型） | 安定した`citation_id`（回答中の根拠を安定して参照する出典ID）、文書ID、文書バージョン、Chunkバージョン、Title、Page、認可付き参照用`source_ref`（取得根拠をTrace・回答から参照する識別子）をUIや評価へ返す。検索順位が変わっても同じChunkを追跡できるようにする。 |
+| Search Attempt | 1回の検索試行と、その検索語、取得したChunk、採用したChunk、十分性判定理由をまとめた履歴 | `SearchAttempt`（1回の検索Queryと取得結果・判定を保持する型） | Query Rewriteを含む複数回の検索経路を失わずに記録する。Query重複、検索回数、各Attemptで新しい証跡を取得できたかを監査・評価する。 |
+| 十分性判定 | 現在の証跡だけで回答可能か、不足観点は何か、次に回答・再検索・拒否・人手確認のどれを行うかを示す判断 | `SearchDecision`（取得根拠が十分かと次処理を表す判定型） | 十分性Judgeの自由文出力を構造化し、LangGraphの次Nodeを決定する。`sufficient`（取得根拠が回答に十分であることを表す判定値）だけでなく、`missing_aspects`（検索根拠で不足している観点の一覧）、判断理由、推奨Actionを保持する。 |
+| 回答検証 | 生成回答の主張が証跡に支持され、未引用の主張や証跡との矛盾がないかを示す検証結果 | `AnswerValidation`（生成回答のGrounding等の検証結果を表す型） | 決定論的な出典・禁止情報検査を通過した回答について、意味的なGroundednessと矛盾をJudgeで確認する。失敗時は回答をそのまま表示せず、人手確認または拒否へ分岐させる。 |
+| Agent State | 1 Requestの開始から終了まで、LangGraphの各Nodeが共有・更新する処理途中の状態 | `RagState`（LangGraph Node間で引き継ぐRAG実行状態の型） | 元質問、現在の検索語、Identity／ACL、固定したRAGリリース、累積証跡、検索履歴、回答、拒否理由、検証エラーなどを保持し、Node間のデータ受け渡しと状態遷移を管理する。 |
+| 最終結果 | Graph終了後にAgent Server、Streamlit、Evaluationへ返す安定したRAG実行結果 | `RagResult`（Agent Server・UI・Evaluationへ返すRAG実行結果の型） | 内部Stateをすべて公開せず、回答、利用文書／Chunk、出典、実検索回数、ACL・Current違反件数、拒否理由、Release ID、検証失敗など、APIと監査に必要な情報だけを返す。 |
 
-`RagState`は処理中の内部状態、`RagResult`は処理完了後に外部へ返す結果であり、用途が異なる。`RetrievedDocument`と`SearchAttempt`は検索経路、`Citation`は回答と根拠の対応、`SearchDecision`と`AnswerValidation`は判断結果を表す。このように役割別の型へ分けることで、LangGraph、Agent Server、Streamlit、Evaluation Jobが同じデータ契約を利用できる。
+`RagState`（LangGraph Node間で引き継ぐRAG実行状態の型）は処理中の内部状態、`RagResult`（Agent Server・UI・Evaluationへ返すRAG実行結果の型）は処理完了後に外部へ返す結果であり、用途が異なる。`RetrievedDocument`（AI Searchから取得して検証済みの根拠文書を表す型）と`SearchAttempt`（1回の検索Queryと取得結果・判定を保持する型）は検索経路、`Citation`（回答へ返す出典情報を表す型）は回答と根拠の対応、`SearchDecision`（取得根拠が十分かと次処理を表す判定型）と`AnswerValidation`（生成回答のGrounding等の検証結果を表す型）は判断結果を表す。このように役割別の型へ分けることで、LangGraph、Agent Server、Streamlit、Evaluation Jobが同じデータ契約を利用できる。
 
-`packages/internal-rag-common/src/internal_rag_common/rag_contracts.py`
+`packages/internal-rag-common/src/internal_rag_common/rag_contracts.py`（RAGのState・検索結果・出典・最終Resultなど、RealtimeとEvaluationで共有するデータ契約を定義する共通Module）
 
 **実装概要**
 
@@ -5103,7 +5182,7 @@ class RagResult(BaseModel):
     validation_failures: list[str]
 ```
 
-**想定出力サンプル（共通契約の`RagResult`）**
+**想定出力サンプル（共通契約の`RagResult`（Agent Server・UI・Evaluationへ返すRAG実行結果の型））**
 
 ```json
 {
@@ -5140,13 +5219,13 @@ class RagResult(BaseModel):
 }
 ```
 
-`RagState`は途中の検索語、累積証跡、`next_step`なども持つが、Agent Serverは機密な内部状態を落として`RagResult`だけを外部契約として返す。
+`RagState`（LangGraph Node間で引き継ぐRAG実行状態の型）は途中の検索語、累積証跡、`next_step`（LangGraphで次に進む処理Nodeを表す状態項目）なども持つが、Agent Serverは機密な内部状態を落として`RagResult`（Agent Server・UI・Evaluationへ返すRAG実行結果の型）だけを外部契約として返す。
 
-改名・移動は台帳上の同じ`document_id`へ新しい`source_uri`を登録し、内容が同一なら同じ`document_version_id`を維持する。内容訂正は同じ`document_id`の新しい`document_version_id`となり、旧版は履歴へ残るがCurrentから外れる。同一内容を別の論理文書として登録する場合は異なる`document_id`を付与する。旧版参照が必要な監査処理はSilver履歴を直接利用し、Realtime検索はCurrent Indexだけを使う。
+改名・移動は台帳上の同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）へ新しい`source_uri`（原文または取得元を特定するURI）を登録し、内容が同一なら同じ`document_version_id`（文書内容ごとの不変バージョンID）を維持する。内容訂正は同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）の新しい`document_version_id`（文書内容ごとの不変バージョンID）となり、旧版は履歴へ残るがCurrentから外れる。同一内容を別の論理文書として登録する場合は異なる`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）を付与する。旧版参照が必要な監査処理はSilver履歴を直接利用し、Realtime検索はCurrent Indexだけを使う。
 
 ##### 4.3.4.2 Prompt
 
-本番導入以降は、十分性判定、検索語言い換え、回答生成、回答検証のPrompt本文をPythonから分離し、Git管理のMarkdownを編集・Review用の原本とする。PoCの`poc/src/register_poc_prompt.py`は教材としての簡潔さを優先し、短いPrompt TemplateのPython直書きを維持する。
+本番導入以降は、十分性判定、検索語言い換え、回答生成、回答検証のPrompt本文をPythonから分離し、Git管理のMarkdownを編集・Review用の原本とする。PoCの`poc/src/register_poc_prompt.py`（PoC PromptをPrompt Registryへ登録するPythonファイル）は教材としての簡潔さを優先し、短いPrompt TemplateのPython直書きを維持する。
 
 ```text
 Git管理 prompts/*.md
@@ -5164,20 +5243,20 @@ RAG Runtime
 | --- | --- | --- |
 | Git Markdown | Prompt本文の編集、Git diff、Pull Request Review、Application Codeとの分離 | Markdown変更だけで本番を切り替えない |
 | MLflow Prompt Registry | 不変Prompt Version、Evaluation対象、Alias、Runtime配布、Trace上の解決済みVersion | Gitの人間Reviewを代替しない |
-| RAG Runtime | リリース構成台帳の`prompts:/<name>/<version>`または承認済みAliasから読み込む | `Path("prompts/answer.md").read_text()`のようにMarkdownを直接読まない |
+| RAG Runtime | リリース構成台帳の`prompts:/<name>/<version>`（不変なMLflow Prompt Versionを指すURI形式）または承認済みAliasから読み込む | `Path("prompts/answer.md").read_text()`のようにMarkdownを直接読まない |
 
-後方互換性と原因分析のため、1回の変更で不要に複数Promptを変更しない。初期登録Scriptは`development`と`production`を含むいずれのAliasも変更せず、候補Versionだけを出力する。本番昇格はHoldoutとリリース判定後に`release_gate.py`と`publish_rag_release.py`が別の承認済み処理として行う。
+後方互換性と原因分析のため、1回の変更で不要に複数Promptを変更しない。初期登録Scriptは`development`（開発用の可変参照先を表すAlias）と`production`（本番で現在利用する参照先を表すAlias）を含むいずれのAliasも変更せず、候補Versionだけを出力する。本番昇格はHoldoutとリリース判定後に`release_gate.py`（Holdout・Security・SLO・Costからリリース判定材料を作るPythonファイル）と`publish_rag_release.py`（承認済みRAGリリース構成を公開するPythonファイル）が別の承認済み処理として行う。
 
 ###### 4.3.4.2.1 Git管理するPrompt Markdown
 
 | MLflow Prompt名 | Markdown | 必須Template変数 |
 | --- | --- | --- |
-| `main.llmops.internal_rag_sufficiency` | `bundles/quality/prompts/sufficiency.md` | `question`, `context` |
-| `main.llmops.internal_rag_rewrite` | `bundles/quality/prompts/query_rewrite.md` | `question`, `search_query`, `missing_aspects`, `executed_queries` |
-| `main.llmops.internal_rag_answer` | `bundles/quality/prompts/answer.md` | `question`, `context` |
-| `main.llmops.internal_rag_answer_validation` | `bundles/quality/prompts/answer_validation.md` | `question`, `context`, `answer` |
+| `main.llmops.internal_rag_sufficiency`（Unity Catalog上の物理Resource名） | `bundles/quality/prompts/sufficiency.md`（取得した根拠が質問へ回答するのに十分か、不足観点と次のActionを判定するPrompt） | `question`（評価・RAGへ入力する質問）, `context`（検索根拠を回答生成へ渡すContext項目） |
+| `main.llmops.internal_rag_rewrite`（Unity Catalog上の物理Resource名） | `bundles/quality/prompts/query_rewrite.md`（検索Query書換えPromptをGit管理するMarkdownファイル） | `question`（評価・RAGへ入力する質問）, `search_query`（検索・Queryを保持する項目）, `missing_aspects`（検索根拠で不足している観点の一覧）, `executed_queries`（1 Request内ですでに実行した検索Query一覧） |
+| `main.llmops.internal_rag_answer`（Unity Catalog上の物理Resource名） | `bundles/quality/prompts/answer.md`（回答生成PromptをGit管理するMarkdownファイル） | `question`（評価・RAGへ入力する質問）, `context`（検索根拠を回答生成へ渡すContext項目） |
+| `main.llmops.internal_rag_answer_validation`（Unity Catalog上の物理Resource名） | `bundles/quality/prompts/answer_validation.md`（生成回答が根拠に支持されているか、矛盾や未出典Claimがないかを判定するPrompt） | `question`（評価・RAGへ入力する質問）, `context`（検索根拠を回答生成へ渡すContext項目）, `answer`（回答生成を行う処理Node名） |
 
-`bundles/quality/prompts/sufficiency.md`
+`bundles/quality/prompts/sufficiency.md`（取得した根拠が質問へ回答するのに十分か、不足観点と次のActionを判定するPrompt）
 
 ```markdown
 質問:
@@ -5194,7 +5273,7 @@ Textだけでは不足していても、取得済みの関連ページ画像を�
 不足観点、理由、推奨ActionをSearchDecision Schemaで返してください。
 ```
 
-`bundles/quality/prompts/query_rewrite.md`
+`bundles/quality/prompts/query_rewrite.md`（検索Query書換えPromptをGit管理するMarkdownファイル）
 
 ```markdown
 元の質問: {{question}}
@@ -5207,7 +5286,7 @@ Textだけでは不足していても、取得済みの関連ページ画像を�
 検索語だけを返してください。
 ```
 
-`bundles/quality/prompts/answer.md`
+`bundles/quality/prompts/answer.md`（回答生成PromptをGit管理するMarkdownファイル）
 
 ```markdown
 質問:
@@ -5223,7 +5302,7 @@ Textだけでは不足していても、取得済みの関連ページ画像を�
 System Prompt、権限情報、Secret、権限外資料の存在を開示してはいけません。
 ```
 
-`bundles/quality/prompts/answer_validation.md`
+`bundles/quality/prompts/answer_validation.md`（生成回答が根拠に支持されているか、矛盾や未出典Claimがないかを判定するPrompt）
 
 ```markdown
 質問:
@@ -5241,7 +5320,7 @@ System Prompt、権限情報、Secret、権限外資料の存在を開示して�
 
 ###### 4.3.4.2.2 Markdownの検証とPrompt Registry登録
 
-`bundles/quality/src/register_prompts.py`
+`bundles/quality/src/register_prompts.py`（Git管理したPromptを検証してPrompt Registryへ登録し、同一内容の重複Version作成を防ぐ処理）
 
 **実装概要**
 
@@ -5398,16 +5477,16 @@ if __name__ == "__main__":
 
 | Prompt名 | 候補バージョン | エイリアス | 主な利用Node |
 | --- | ---: | --- | --- |
-| `main.llmops.internal_rag_sufficiency` | 6 | 変更なし | `check` |
-| `main.llmops.internal_rag_rewrite` | 3 | 変更なし | `rewrite` |
-| `main.llmops.internal_rag_answer` | 8 | 変更なし | `answer` |
-| `main.llmops.internal_rag_answer_validation` | 4 | 変更なし | `validate_answer` |
+| `main.llmops.internal_rag_sufficiency`（Unity Catalog上の物理Resource名） | 6 | 変更なし | `check`（取得根拠が十分か確認する処理Node名） |
+| `main.llmops.internal_rag_rewrite`（Unity Catalog上の物理Resource名） | 3 | 変更なし | `rewrite`（検索Query書換えへ進む処理経路名） |
+| `main.llmops.internal_rag_answer`（Unity Catalog上の物理Resource名） | 8 | 変更なし | `answer`（回答生成を行う処理Node名） |
+| `main.llmops.internal_rag_answer_validation`（Unity Catalog上の物理Resource名） | 4 | 変更なし | `validate_answer`（生成回答を検証する処理Node名） |
 
-コードはすべてのMarkdownを登録前に読むため、File不足や変数不一致で一部だけを登録しにくい。同一HashだけでなくRegistry内のTemplate本文を比較するため、過去VersionへTagがない移行時でも重複登録を防げる。過去Versionを再利用した場合も、今回のGit Commitとの対応は登録Runの`registration_manifest.json`に残る。
+コードはすべてのMarkdownを登録前に読むため、File不足や変数不一致で一部だけを登録しにくい。同一HashだけでなくRegistry内のTemplate本文を比較するため、過去VersionへTagがない移行時でも重複登録を防げる。過去Versionを再利用した場合も、今回のGit Commitとの対応は登録Runの`registration_manifest.json`（今回のPrompt登録で利用・再利用したVersionとGit Commitの対応を記録する登録結果Manifest）に残る。
 
 ###### 4.3.4.2.3 DABによる配置と登録Job
 
-`bundles/quality`自体をBundle Rootとし、明示的な`sync.include`で`prompts/*.md`をDeploy Artifactに含める。これによりDatabricks Job上でも、`src/register_prompts.py`の`__file__`から`../prompts`を解決できる。
+`bundles/quality`（対象Resource／ソースを指す物理パス）自体をBundle Rootとし、明示的な`sync.include`（DAB Deploy Artifactへ追加Fileを含める設定）で`prompts/*.md`をDeploy Artifactに含める。これによりDatabricks Job上でも、`src/register_prompts.py`（Git管理したPromptを検証してPrompt Registryへ登録し、同一内容の重複Version作成を防ぐ処理）の`__file__`（実行中Pythonファイル自身のPathを示す組込変数）から`../prompts`を解決できる。
 
 `bundles/quality/databricks.yml`（抜粋）
 
@@ -5454,37 +5533,37 @@ Prompt OptimizationはGit MarkdownのBaseline VersionからRegistry内に候補V
 
 ##### 4.3.4.3 文書登録・文書マニフェスト・Bronze／Silver／Gold
 
-この実装では、文書管理台帳`document_source_manifest`を論理ID・ACL・有効状態の正本とし、Auto Loaderは原文書バージョンの追加だけを検知する。BronzeとSilverは追記型履歴、Gold Currentは有効・承認済みのバージョンだけを公開する。JOIN、Filter、列変換、`variant_explode`、Window関数、成功・失敗の分岐はLakeflow Spark Declarative PipelinesのSQLへ移し、SQLに同等のKey指定Streaming重複排除がない処理と、後続の命令的なDelta操作はPythonへ残す。
+この実装では、文書管理台帳`document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable）を論理ID・ACL・有効状態の正本とし、Auto Loaderは原文書バージョンの追加だけを検知する。BronzeとSilverは追記型履歴、Gold Currentは有効・承認済みのバージョンだけを公開する。JOIN、Filter、列変換、`variant_explode`（ai_parse_documentのVariant結果を行へ展開する処理）、Window関数、成功・失敗の分岐はLakeflow Spark Declarative PipelinesのSQLへ移し、SQLに同等のKey指定Streaming重複排除がない処理と、後続の命令的なDelta操作はPythonへ残す。
 
-本資料のSQL Coding Conventionとして、Databricks SQLでWindow関数の結果だけをFilterする場合は原則として`QUALIFY`を使用し、Window結果をFilterするためだけのCTE／Subqueryは作らない。一方、データ粒度の変換、処理段階の明示、複数参照などCTE自体に意味がある場合はCTEを残す。`QUALIFY`はDatabricks SQLの公式機能であるが、この使い分けは本資料のConventionである。また、Batch SQL／Materialized Viewの順位FilterとStreaming DataFrameの状態付き重複排除は区別し、後者はBatch SQLで`QUALIFY`を記述できることを理由に`dropDuplicates()`から置き換えない。
+本資料のSQL Coding Conventionとして、Databricks SQLでWindow関数の結果だけをFilterする場合は原則として`QUALIFY`（qualifyを指定する設定値／環境変数）を使用し、Window結果をFilterするためだけのCTE／Subqueryは作らない。一方、データ粒度の変換、処理段階の明示、複数参照などCTE自体に意味がある場合はCTEを残す。`QUALIFY`（qualifyを指定する設定値／環境変数）はDatabricks SQLの公式機能であるが、この使い分けは本資料のConventionである。また、Batch SQL／Materialized Viewの順位FilterとStreaming DataFrameの状態付き重複排除は区別し、後者はBatch SQLで`QUALIFY`（qualifyを指定する設定値／環境変数）を記述できることを理由に`dropDuplicates()`（Spark DataFrameの重複行を除外するAPI）から置き換えない。
 
 Lakeflowは同一PipelineにSQLとPythonのソースファイルを混在でき、Dataset定義を全Fileから収集して依存Graphを構築する。したがって、Fileの記載順へ依存せずDataset参照で順序を表す。`CREATE OR REFRESH LIVE TABLE`は使用せず、現行構文の`CREATE OR REFRESH STREAMING TABLE`、`CREATE OR REFRESH PRIVATE STREAMING TABLE`、`CREATE OR REFRESH MATERIALIZED VIEW`を使用する。
 
 | 処理 | 実装言語 | Dataset種別と理由 |
 | --- | --- | --- |
-| 文書マニフェスト／文書バージョン管理台帳初期化 | SQL＋Terraform | SQLはUnity Catalog管理Delta TableのDDL、TerraformはApplication IDを使う`databricks_grant`を段階適用する。 |
-| 文書管理UI、承認後File Move、人が選んだ公開Pointerの反映 | Python | 認証Context、File操作、業務入力検証、楽観Lock、命令的`MERGE`を伴う。 |
+| 文書マニフェスト／文書バージョン管理台帳初期化 | SQL＋Terraform | SQLはUnity Catalog管理Delta TableのDDL、TerraformはApplication IDを使う`databricks_grant`（Unity Catalog権限を管理するTerraform Resource Type）を段階適用する。 |
+| 文書管理UI、承認後File Move、人が選んだ公開Pointerの反映 | Python | 認証Context、File操作、業務入力検証、楽観Lock、命令的`MERGE`（MERGE操作を表すSQLキーワード）を伴う。 |
 | Bronze取込、文書マニフェスト JOIN、Preflight | SQL | 追記型の`STREAMING TABLE`。表から表への宣言的変換である。 |
-| 文書バージョン重複排除 | Python | Streaming DataFrameの`dropDuplicates()`でKeyを指定する。SQLの`DISTINCT`では全列比較となり、同じバージョンの再通知を確実に抑止しにくい。 |
-| Parse／Prep Attempt | SQL | Pipeline内だけで使う物理化済み`PRIVATE STREAMING TABLE`。AI Function結果を一度保存してから成功表とエラー表へ分岐する。 |
-| Parse／Prep成功・失敗分岐 | SQL | 試行結果データセットの`error_status`を条件に、相互排他的な表へ振り分ける。AI Functionは再実行しない。 |
-| Chunk展開とID生成 | SQL | `LATERAL variant_explode`と列変換による追記型Silver履歴である。 |
+| 文書バージョン重複排除 | Python | Streaming DataFrameの`dropDuplicates()`（Spark DataFrameの重複行を除外するAPI）でKeyを指定する。SQLの`DISTINCT`（distinctを指定する設定値／環境変数）では全列比較となり、同じバージョンの再通知を確実に抑止しにくい。 |
+| Parse／Prep Attempt | SQL | Pipeline内だけで使う物理化済み`PRIVATE STREAMING TABLE`（Pipeline内だけで参照する物理化済みStreaming Table）。AI Function結果を一度保存してから成功表とエラー表へ分岐する。 |
+| Parse／Prep成功・失敗分岐 | SQL | 試行結果データセットの`error_status`（処理エラーの分類・状態）を条件に、相互排他的な表へ振り分ける。AI Functionは再実行しない。 |
+| Chunk展開とID生成 | SQL | `LATERAL variant_explode`（Variant配列を行へ展開するDatabricks SQL構文）と列変換による追記型Silver履歴である。 |
 | 文書マニフェスト公開条件とGold Current | SQL | Batch semanticsで最新台帳状態を反映する`MATERIALIZED VIEW`である。 |
-| Search Sync、Snapshot、Index操作 | Python | `DeltaTable.merge()`、Delete、SDK、外部状態確認、条件分岐を伴う命令的処理である。整合性差分確認は本番導入後の高度化に限る。 |
+| Search Sync、Snapshot、Index操作 | Python | `DeltaTable.merge()`（Delta Tableへ条件付きUpsertを行うAPI）、Delete、SDK、外部状態確認、条件分岐を伴う命令的処理である。整合性差分確認は本番導入後の高度化に限る。 |
 
-`VIEW`や旧称Temporary Datasetではなく`PRIVATE STREAMING TABLE`を試行結果データセットに採用する。Private TableはCatalogへ公開されないがPipelineの存続期間中は物理的に保持されるため、複数の下流Datasetから参照しても`ai_parse_document`または`ai_prep_search`を下流ごとに再計算しない。通常更新では新規行だけを処理し、Full Refreshでは履歴を再構築するため各バージョンを再実行する。
+`VIEW`（viewを指定する設定値／環境変数）や旧称Temporary Datasetではなく`PRIVATE STREAMING TABLE`（Pipeline内だけで参照する物理化済みStreaming Table）を試行結果データセットに採用する。Private TableはCatalogへ公開されないがPipelineの存続期間中は物理的に保持されるため、複数の下流Datasetから参照しても`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）または`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）を下流ごとに再計算しない。通常更新では新規行だけを処理し、Full Refreshでは履歴を再構築するため各バージョンを再実行する。
 
-Pipelineの`configuration`には、`internal_docs.source_path`、`internal_docs.image_output_path`、`internal_docs.ai_parse_document_version`、`internal_docs.ai_prep_search_version`、`internal_docs.chunk_schema_version`、`internal_docs.ingestion_run_id`を設定する。SQLは`${key}`、Pythonは`spark.conf.get("key")`で同じ値を解決する。
+Pipelineの`configuration`（DAB／Runtimeへ渡す構成情報）には、`internal_docs.source_path`（Pipelineが監視する原文Volume Path設定）、`internal_docs.image_output_path`（Parseで生成するページ画像の保存先設定）、`internal_docs.ai_parse_document_version`（Pipelineへ渡す文書解析AI Function Version設定）、`internal_docs.ai_prep_search_version`（Pipelineへ渡す検索用整形AI Function Version設定）、`internal_docs.chunk_schema_version`（Pipelineへ渡すChunk Schema Version設定）、`internal_docs.ingestion_run_id`（Pipeline取込Runを識別する設定）を設定する。SQLは`${key}`、Pythonは`spark.conf.get("key")`で同じ値を解決する。
 
 ###### 4.3.4.3.1 文書管理台帳の準備と文書登録ワークフロー
 
-`document_source_manifest`という名前であるが、JSONやYAMLの文書マニフェスト Fileではない。Unity Catalogの`main.llmops` Schemaで管理するDelta Tableであり、人が決定した論理文書の有効状態、ACL／Title／公開範囲、現在公開する文書バージョンへの参照を保持する薄い管理台帳である。マニフェストは文書内容の正しさや最新Versionを判定しない。Pipelineは`SELECT`だけを行い、利用者、ブラウザSession、Realtime Agentから直接更新させない。
+`document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable）という名前であるが、JSONやYAMLの文書マニフェスト Fileではない。Unity Catalogの`main.llmops`（Unity Catalog上の物理Resource名） Schemaで管理するDelta Tableであり、人が決定した論理文書の有効状態、ACL／Title／公開範囲、現在公開する文書バージョンへの参照を保持する薄い管理台帳である。マニフェストは文書内容の正しさや最新Versionを判定しない。Pipelineは`SELECT`（Table／Viewを読み取るSQL権限）だけを行い、利用者、ブラウザSession、Realtime Agentから直接更新させない。
 
-文書バージョン管理台帳も独立したDatabricks Serviceではない。Delta Table`main.llmops.document_version_registry`として、実在するVersionごとの`source_uri`、`content_hash`、登録時刻、Parse、Prep、Chunkの技術状態と、必要最小限の人間Review状態を保持する。文書マニフェストが「現在公開する版」を示すのに対し、文書バージョン管理台帳は公開されていない版を含む技術履歴である。技術状態と現在の公開Pointerを混在させない。
+文書バージョン管理台帳も独立したDatabricks Serviceではない。Delta Table`main.llmops.document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）として、実在するVersionごとの`source_uri`（原文または取得元を特定するURI）、`content_hash`（原文内容の同一性を確認するHash）、登録時刻、Parse、Prep、Chunkの技術状態と、必要最小限の人間Review状態を保持する。文書マニフェストが「現在公開する版」を示すのに対し、文書バージョン管理台帳は公開されていない版を含む技術履歴である。技術状態と現在の公開Pointerを混在させない。
 
-`approved_document_version_id`は広範なDDL、SQL、Python、Testとの互換性のため列名を維持する。ただし、この列の実際の意味は「審査に合格したVersion一覧」ではなく、`published_document_version_id`と同じ「人が選択した現在公開VersionへのPointer」である。
+`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）は広範なDDL、SQL、Python、Testとの互換性のため列名を維持する。ただし、この列の実際の意味は「審査に合格したVersion一覧」ではなく、`published_document_version_id`（現在公開中の文書Versionを指す参照）と同じ「人が選択した現在公開VersionへのPointer」である。
 
-同様に既存の`approval_status`列も互換性のため維持するが、この列は論理文書全体の公開有効／停止状態として扱う。個々のVersionの技術状態とReview結果は`document_version_registry`の`parse_status`、`prep_status`、`review_status`に保持する。
+同様に既存の`approval_status`（承認Workflowの現在状態）列も互換性のため維持するが、この列は論理文書全体の公開有効／停止状態として扱う。個々のVersionの技術状態とReview結果は`document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）の`parse_status`（Parse・状態を表す状態項目）、`prep_status`（検索用整形処理の現在状態）、`review_status`（文書またはレビューの現在状態）に保持する。
 
 ```mermaid
 flowchart TD
@@ -5534,13 +5613,13 @@ flowchart TD
 | Service Principalの作成 | Databricks Accountまたは組織のIdPへ実行Identityを登録する | Account-level Service Principal |
 | Workspaceへの割当 | 作成済みService Principalを対象Workspaceで利用可能にする | Workspace Assignment／Entitlement |
 | DAB変数の設定 | 環境ごとのApplication IDをBundleへ渡す | Bundleの環境依存値 |
-| `run_as` | 作成済みService PrincipalをJob／Pipelineの実行主体にする | Resourceの実行Identity設定 |
-| Unity Catalogの`GRANT` | 作成済みService Principalへデータ権限を付与する | SecurableのPrivilege |
+| `run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定） | 作成済みService PrincipalをJob／Pipelineの実行主体にする | Resourceの実行Identity設定 |
+| Unity Catalogの`GRANT`（GRANT操作を表すSQLキーワード） | 作成済みService Principalへデータ権限を付与する | SecurableのPrivilege |
 | OAuth／Workload Identity Federation | CI/CDや外部ScannerがDatabricksへ認証する | 短期Access Token。SP自体は作成しない |
 
-したがって、`run_as`、SQLの`GRANT`、DAB変数宣言はいずれもService Principalを作成しない。`service_principal_name`とUnity CatalogのPrincipalには、表示名ではなくService Principalの**Application ID**を指定する。Terraformの`databricks_service_principal.id`はAccount SCIM ID、`.application_id`はApplication IDであり、Azure EntraのObject ID／Principal IDとも別物である。`Client ID`という語がApplication IDを指す製品画面もあるため、変数名は`*_sp_application_id`へ統一する。
+したがって、`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）、SQLの`GRANT`（GRANT操作を表すSQLキーワード）、DAB変数宣言はいずれもService Principalを作成しない。`service_principal_name`（Service・権限主体・名称を保持する項目）とUnity CatalogのPrincipalには、表示名ではなくService Principalの**Application ID**を指定する。Terraformの`databricks_service_principal.id`（Terraform Providerが返すService PrincipalのAccount SCIM ID）はAccount SCIM ID、`.application_id`はApplication IDであり、Azure EntraのObject ID／Principal IDとも別物である。`Client ID`という語がApplication IDを指す製品画面もあるため、変数名は`*_sp_application_id`へ統一する。
 
-Client SecretはMarkdown、Git、Terraform変数File、DAB YAMLへ保存しない。CI/CDは可能ならWorkload Identity Federationを使い、Secretが必要な場合も組織のSecret Managerから実行時に注入する。BundleをDeployするIdentityと、Resourceの`run_as` Identityは別であり、Deploy Identityには対象Service Principalを使用するための`roles/servicePrincipal.user`が必要である。
+Client SecretはMarkdown、Git、Terraform変数File、DAB YAMLへ保存しない。CI/CDは可能ならWorkload Identity Federationを使い、Secretが必要な場合も組織のSecret Managerから実行時に注入する。BundleをDeployするIdentityと、Resourceの`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定） Identityは別であり、Deploy Identityには対象Service Principalを使用するための`roles/servicePrincipal.user`（Service PrincipalへWorkspace利用Roleを割り当てるAzure／Databricks権限Scope）が必要である。
 
 ```mermaid
 flowchart TD
@@ -5574,16 +5653,16 @@ flowchart TD
 
 **本番導入時の標準構成**
 
-| 論理名 | 表示名の例 | 作成元・Workspace割当 | 実行対象 | `run_as`／参照方法 | 主なUnity Catalog権限 |
+| 論理名 | 表示名の例 | 作成元・Workspace割当 | 実行対象 | `run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）／参照方法 | 主なUnity Catalog権限 |
 | --- | --- | --- | --- | --- | --- |
-| Platform / Deploy Identity | 組織CI/CD用Identity | Platform管理者がWorkload Identity Federation付きで別管理 | Terraform、DAB Validate／Deploy、初期構築、Schema Migration | `run_as`ではなくCI/CD認証。`platform_deploy_sp_application_id`は初期化Jobへ明示的に使う場合だけ参照 | 必要なDDLとResource作成。業務処理とRealtime実行は禁止 |
-| Document Workflow SP | `sp-internal-docs-document-workflow` | Account／IdP管理者がIaCで作成・割当 | 文書管理UI Backend、RAG投入審査、公開Version選択のWorkflow Request作成 | `${var.document_workflow_sp_application_id}` | 単一Workflow Table、認証Actor View、必要なStaging／Registry参照。Base Manifest更新は禁止 |
-| Manifest Executor SP | `sp-internal-docs-manifest-executor` | Account／IdP管理者がIaCで作成・割当 | 検証済みWorkflow RequestのManifest反映と承認後File Move | `${var.manifest_executor_sp_application_id}` | 文書マニフェスト／Registry／監査表／Volumeの条件付き更新。UIや人間に直接実行権限を付けない |
-| Data Pipeline SP | `sp-internal-docs-data-pipeline` | Account／IdP管理者がIaCで作成・割当 | Lakeflow Pipeline、Gold、Search Sync／Index Publish | `${var.data_pipeline_sp_application_id}` | 文書マニフェスト参照、Bronze／Silver／Gold、Registry技術状態、Sync／Indexの必要権限。整合性差分確認権限は高度化時に追加 |
-| Quality SP | `sp-internal-docs-quality` | Account／IdP管理者がQuality Bundle用に作成・割当 | Evaluation、Optimization、Review同期、リリース判定 | Quality Bundleの`${var.quality_sp_application_id}` | EvaluationDataset、Experiment、Prompt／Release管理。文書マニフェスト公開参照は禁止 |
-| Realtime App SP | Databricks Appsが生成する専用名 | App作成時に自動作成・関連付け | Streamlit／Agent Server | `${resources.apps.internal_rag_app.service_principal_client_id}`でGrant先を参照し、Jobの`run_as`には使わない | Gold参照、AI Search Query、Model Service`EXECUTE`、必要なPrompt Readだけ |
+| Platform / Deploy Identity | 組織CI/CD用Identity | Platform管理者がWorkload Identity Federation付きで別管理 | Terraform、DAB Validate／Deploy、初期構築、Schema Migration | `run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）ではなくCI/CD認証。`platform_deploy_sp_application_id`（Platform／Deploy IdentityのService Principal Application ID）は初期化Jobへ明示的に使う場合だけ参照 | 必要なDDLとResource作成。業務処理とRealtime実行は禁止 |
+| Document Workflow SP | `sp-internal-docs-document-workflow` | Account／IdP管理者がIaCで作成・割当 | 文書管理UI Backend、RAG投入審査、公開Version選択のWorkflow Request作成 | `${var.document_workflow_sp_application_id}`（DAB変数から設定値を解決する参照式） | 単一Workflow Table、認証Actor View、必要なStaging／Registry参照。Base Manifest更新は禁止 |
+| Manifest Executor SP | `sp-internal-docs-manifest-executor` | Account／IdP管理者がIaCで作成・割当 | 検証済みWorkflow RequestのManifest反映と承認後File Move | `${var.manifest_executor_sp_application_id}`（DAB変数から設定値を解決する参照式） | 文書マニフェスト／Registry／監査表／Volumeの条件付き更新。UIや人間に直接実行権限を付けない |
+| Data Pipeline SP | `sp-internal-docs-data-pipeline` | Account／IdP管理者がIaCで作成・割当 | Lakeflow Pipeline、Gold、Search Sync／Index Publish | `${var.data_pipeline_sp_application_id}`（DAB変数から設定値を解決する参照式） | 文書マニフェスト参照、Bronze／Silver／Gold、Registry技術状態、Sync／Indexの必要権限。整合性差分確認権限は高度化時に追加 |
+| Quality SP | `sp-internal-docs-quality` | Account／IdP管理者がQuality Bundle用に作成・割当 | Evaluation、Optimization、Review同期、リリース判定 | Quality Bundleの`${var.quality_sp_application_id}`（DAB変数から設定値を解決する参照式） | EvaluationDataset、Experiment、Prompt／Release管理。文書マニフェスト公開参照は禁止 |
+| Realtime App SP | Databricks Appsが生成する専用名 | App作成時に自動作成・関連付け | Streamlit／Agent Server | `${resources.apps.internal_rag_app.service_principal_client_id}`（DAB Resourceから実体ID／値を解決する参照式）でGrant先を参照し、Jobの`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）には使わない | Gold参照、AI Search Query、Model Service`EXECUTE`（対象Function／Model等を実行するSQL権限）、必要なPrompt Readだけ |
 
-外部Malware Scannerを実際に利用する環境だけ、Scanner所有部門が専用の外部Service Identityを追加する。その場合もStaging ReadとScan Result Writeだけを付与し、標準の`workload_service_principals`には含めない。外部Scannerを使わない構成は、登録Policyと代替検証の根拠を記録し、文書バージョン管理台帳へ`malware_scan_status=not_required`を設定する。未知Policyや`unknown`状態のまま承認しない。
+外部Malware Scannerを実際に利用する環境だけ、Scanner所有部門が専用の外部Service Identityを追加する。その場合もStaging ReadとScan Result Writeだけを付与し、標準の`workload_service_principals`（Workload用Service Principal一覧を保持するTerraform変数）には含めない。外部Scannerを使わない構成は、登録Policyと代替検証の根拠を記録し、文書バージョン管理台帳へ`malware_scan_status=not_required`を設定する。未知Policyや`unknown`（未確定・不明を表す状態値）状態のまま承認しない。
 
 **人間の職務分離とCredential分割の違い**
 
@@ -5606,15 +5685,15 @@ flowchart TD
 
 Data Pipeline SPを統合しても、無制限なData権限を付与するわけではない。個々のTable、Volume、Indexに必要なGrantだけを列挙する。Quality SPはData生成と品質評価・リリース判定を分けるため、Data Pipeline SPへ統合しない。Realtime App SPにはBronze／Silver更新、文書マニフェスト更新、DDL、Prompt管理、EvaluationDataset更新、Search Index管理、Deploy権限を付与しない。
 
-この簡素化で廃止するのは不要なCredentialとCommand Tableの細分化であり、人間の登録・承認分離、Workflow Validation、Protected Branch、Job ACL、Git Commit記録、Audit Log、Unity Catalog Grant、非対話Manifest Executor、Realtime最小権限は維持する。
+この簡素化で廃止するのは不要なCredentialと処理指示テーブルの細分化であり、人間の登録・承認分離、Workflow Validation、Protected Branch、Job ACL、Git Commit記録、Audit Log、Unity Catalog Grant、非対話Manifest Executor、Realtime最小権限は維持する。
 
 Realtime AppのService PrincipalはDatabricks AppsがAppごとに自動作成するため、Terraformで重複作成しない。App Resourceを再作成した場合はApplication IDの変化を前提に、Bundle Resource参照からGrantを再適用する。
 
 **クラウド非依存のIdentity IaC**
 
-`infra/identity`はアプリケーションDABより先にAccount管理者が適用する。次はDatabricks Terraform ProviderのAccount-level `databricks_service_principal`を使う例であり、`application_id`を指定しなければDatabricks-managed Service Principalを作成する。Azure EntraなどIdP管理Identityを使う場合は、IdP管理者が先にApplicationを作成し、そのApplication IDを`external_application_ids`へ渡す。IdP Object IDやSecretは渡さない。
+`infra/identity`（対象Resource／ソースを指す物理パス）はアプリケーションDABより先にAccount管理者が適用する。次はDatabricks Terraform ProviderのAccount-level `databricks_service_principal`（TerraformでDatabricks Service Principalを管理するResource Type）を使う例であり、`application_id`（Service PrincipalのApplication IDを保持する項目）を指定しなければDatabricks-managed Service Principalを作成する。Azure EntraなどIdP管理Identityを使う場合は、IdP管理者が先にApplicationを作成し、そのApplication IDを`external_application_ids`（Service Principalへ紐付く外部Application IDの集合）へ渡す。IdP Object IDやSecretは渡さない。
 
-`infra/identity/main.tf`
+`infra/identity/main.tf`（対象Resource／ソースを指す物理パス）
 
 **実装概要**
 
@@ -5682,7 +5761,7 @@ resource "databricks_service_principal" "workload" {
 }
 ```
 
-`infra/identity/variables.tf`
+`infra/identity/variables.tf`（対象Resource／ソースを指す物理パス）
 
 **実装概要**
 
@@ -5729,7 +5808,7 @@ variable "external_application_ids" {
 }
 ```
 
-`infra/identity/outputs.tf`
+`infra/identity/outputs.tf`（対象Resource／ソースを指す物理パス）
 
 **実装概要**
 
@@ -5768,18 +5847,18 @@ output "service_principal_scim_ids" {
 | 作成方式 | 管理者が先に行うこと | Terraformの入力 | 本番導入時の判断 |
 | --- | --- | --- | --- |
 | Databricks Accountで直接作成 | Account管理者がAccount-level Service Principal作成権限をIaC Deploy Identityへ委譲する | `external_application_ids={}`とし、ProviderがApplication IDを生成する | Databricks内で完結するWorkload Identityに向く |
-| Azure Entra IDなどIdPで作成 | IdP管理者がApplication／Enterprise Applicationを作成し、Databricks AccountへProvisionする | 論理名ごとのApplication IDだけを`external_application_ids`へ渡す | 組織のIdP Lifecycle、条件付きAccess、所有者Policyを優先する場合に選ぶ |
+| Azure Entra IDなどIdPで作成 | IdP管理者がApplication／Enterprise Applicationを作成し、Databricks AccountへProvisionする | 論理名ごとのApplication IDだけを`external_application_ids`（Service Principalへ紐付く外部Application IDの集合）へ渡す | 組織のIdP Lifecycle、条件付きAccess、所有者Policyを優先する場合に選ぶ |
 | 既存Service Principalを採用 | Account管理者が用途、所有者、既存Grant、Credentialを棚卸しする | 既存Application IDを渡し、Terraform Import後に管理する | 職務分離を壊す共有Identityは採用しない |
 
 対象クラウド、Account Federation、IdP Provisioning方式は資料だけでは確定できないため、Azure／AWS／GCP固有のIdentity Resourceを断定しない。いずれの方式でもDatabricks側ではApplication ID、Account SCIM ID、Workspace Assignmentを別々に扱い、Client SecretをTerraform Stateへ出力しない。
 
-Service Principalを削除すると、所有Resource、Jobの`run_as`、Grant、外部認証が同時に壊れる。最初にJob停止と後継Identityへの所有権・Grant移行を行い、DAB変数を切り替え、監査確認後に`active=false`で無効化する。即時削除ではなく無効化期間を設け、`disable_as_user_deletion=true`のAccount-level動作と組織の退役Policyを確認する。
+Service Principalを削除すると、所有Resource、Jobの`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）、Grant、外部認証が同時に壊れる。最初にJob停止と後継Identityへの所有権・Grant移行を行い、DAB変数を切り替え、監査確認後に`active=false`で無効化する。即時削除ではなく無効化期間を設け、`disable_as_user_deletion=true`のAccount-level動作と組織の退役Policyを確認する。
 
 **Workspace割当と初期セットアップ権限**
 
-`infra/databricks`はIdentity作成後にPlatform管理者が環境ごとに適用する。ここでは前段のOutputをCI/CDが`TF_VAR_service_principal_application_ids`と`TF_VAR_service_principal_scim_ids`へ渡す。Terraform State間連携を使う場合も、Remote StateへのRead権限を最小化する。
+`infra/databricks`（対象Resource／ソースを指す物理パス）はIdentity作成後にPlatform管理者が環境ごとに適用する。ここでは前段のOutputをCI/CDが`TF_VAR_service_principal_application_ids`（TerraformへService Principal Application ID一覧を渡す環境変数）と`TF_VAR_service_principal_scim_ids`（TerraformへService Principal SCIM ID一覧を渡す環境変数）へ渡す。Terraform State間連携を使う場合も、Remote StateへのRead権限を最小化する。
 
-`infra/databricks/versions.tf`
+`infra/databricks/versions.tf`（対象Resource／ソースを指す物理パス）
 
 **実装概要**
 
@@ -5787,7 +5866,7 @@ Service Principalを削除すると、所有Resource、Jobの`run_as`、Grant、
 | --- | --- |
 | 目的 | Workspace初期セットアップ用TerraformとProviderのバージョン境界を固定する。 呼出元はPlatform CI/CD。 |
 | 入力 | Terraform CLIとProvider Registry。 実行契機は初回の初期セットアップとProvider更新時。 |
-| 処理 | `required_version`と`required_providers`を宣言する。未検証のメジャー更新を避ける。Trace更新なし。 |
+| 処理 | `required_version`（Terraform Provider等に要求するVersion条件）と`required_providers`（Terraformで必要なProviderを宣言するBlock）を宣言する。未検証のメジャー更新を避ける。Trace更新なし。 |
 | 出力 | Lock Fileで固定されるProvider。 再現可能なバージョンでPlanする。 後続はvariables.tfとWorkspace Resource。 |
 | 失敗・再実行 | 不一致ならinit／planを停止する。 Lock Fileを再利用する。 |
 
@@ -5828,7 +5907,7 @@ provider "databricks" {
 }
 ```
 
-`infra/databricks/variables.tf`
+`infra/databricks/variables.tf`（対象Resource／ソースを指す物理パス）
 
 **実装概要**
 
@@ -5870,7 +5949,7 @@ variable "enable_pipeline_grants" {
 }
 ```
 
-`infra/databricks/workspace_assignments.tf`
+`infra/databricks/workspace_assignments.tf`（対象Resource／ソースを指す物理パス）
 
 **実装概要**
 
@@ -5942,11 +6021,11 @@ resource "databricks_access_control_rule_set" "bundle_deployer_can_use_run_ident
 }
 ```
 
-`databricks_entitlements`で全SPへSQL Accessを付けるのが組織Policy上広すぎる場合は、SQL Warehouseを使うIdentityだけへ`for_each`を限定する。Platform / Deploy IdentityのWorkspace割当はCI/CD基盤側で別管理し、このWorkload Mapと重複管理しない。Serverless Job／Pipelineの利用可否とCompute PolicyはWorkspace Policy側でも制限する。
+`databricks_entitlements`（Workspace Entitlementを管理するTerraform Resource Type）で全SPへSQL Accessを付けるのが組織Policy上広すぎる場合は、SQL Warehouseを使うIdentityだけへ`for_each`（Terraform Resourceを対象集合ごとに展開するMeta Argument）を限定する。Platform / Deploy IdentityのWorkspace割当はCI/CD基盤側で別管理し、このWorkload Mapと重複管理しない。Serverless Job／Pipelineの利用可否とCompute PolicyはWorkspace Policy側でも制限する。
 
-この例はWorkspace Providerの`databricks_permission_assignment`を使う。Account Console側でWorkspace Assignmentを中央管理する対応クラウドでは`databricks_mws_permission_assignment`も選択肢だが、両Resourceで同じAssignmentを二重管理しない。採用Resourceは対象クラウドとAccount構成で決め、Import済みStateを正本にする。
+この例はWorkspace Providerの`databricks_permission_assignment`（Workspace権限割当を管理するTerraform Resource Type）を使う。Account Console側でWorkspace Assignmentを中央管理する対応クラウドでは`databricks_mws_permission_assignment`（Account側Workspace権限割当を管理するTerraform Resource Type）も選択肢だが、両Resourceで同じAssignmentを二重管理しない。採用Resourceは対象クラウドとAccount構成で決め、Import済みStateを正本にする。
 
-`infra/databricks/bootstrap_permissions.tf`
+`infra/databricks/bootstrap_permissions.tf`（対象Resource／ソースを指す物理パス）
 
 **実装概要**
 
@@ -6000,11 +6079,11 @@ resource "databricks_permissions" "platform_deploy_warehouse" {
 }
 ```
 
-`databricks_permissions`は対象ObjectのACLをAuthoritativeに管理するため、既存Warehouse利用者がいる場合は同じResourceへ全Access Controlを列挙するか、組織の中央IaCへ統合する。Platform / Deploy IdentityにMetastore Adminや無制限の`MANAGE`を付与せず、運用PrincipalへのGrantは同じPlatform IaCが`runtime_grants.tf`で宣言的に適用する。組織規則によりDeploy IdentityにDDLを付与できない、Migrationの所有者が別、またはDatabase Change Managementの独立統制がある場合だけSchema Migration SPを追加する。
+`databricks_permissions`（Databricks Object ACLをAuthoritativeに管理するTerraform Resource）は対象ObjectのACLをAuthoritativeに管理するため、既存Warehouse利用者がいる場合は同じResourceへ全Access Controlを列挙するか、組織の中央IaCへ統合する。Platform / Deploy IdentityにMetastore Adminや無制限の`MANAGE`（対象Resourceを管理する権限）を付与せず、運用PrincipalへのGrantは同じPlatform IaCが`runtime_grants.tf`（Realtime AppのUnity Catalog権限を定義するTerraformファイル）で宣言的に適用する。組織規則によりDeploy IdentityにDDLを付与できない、Migrationの所有者が別、またはDatabase Change Managementの独立統制がある場合だけSchema Migration SPを追加する。
 
 **DAB変数と環境別Deploy**
 
-`bundles/ingestion/databricks.yml`
+`bundles/ingestion/databricks.yml`（文書取込・検索公開・Index同期に必要なResourceとJobを束ねるDAB Bundle設定）
 
 **実装概要**
 
@@ -6091,7 +6170,7 @@ targets:
             pause_status: UNPAUSED
 ```
 
-Application IDは秘密ではないが環境依存値なのでGitへ固定しない。CI/CDはTerraform Outputを承認済みEnvironment Variableへ登録し、`BUNDLE_VAR_<Bundle変数名>`として対象環境のDeploy Stepだけへ注入する。CLIの`--var`はShell履歴へ残るため、CI/CD環境変数を優先する。Secretは`BUNDLE_VAR_*`へ入れず、FederationまたはSecret Managerを使用する。
+Application IDは秘密ではないが環境依存値なのでGitへ固定しない。CI/CDはTerraform Outputを承認済みEnvironment Variableへ登録し、`BUNDLE_VAR_<Bundle変数名>`として対象環境のDeploy Stepだけへ注入する。CLIの`--var`（実行時設定をPythonへ渡すCLI引数）はShell履歴へ残るため、CI/CD環境変数を優先する。Secretは`BUNDLE_VAR_*`（DAB Bundleへ環境別値を渡す変数名Pattern）へ入れず、FederationまたはSecret Managerを使用する。
 
 ```bash
 # CI/CDは対象EnvironmentのTerraform Stateだけを読み、Application IDをBundle変数へ写す。
@@ -6107,11 +6186,11 @@ databricks bundle validate -t "$DEPLOY_ENV"
 databricks bundle deploy -t "$DEPLOY_ENV"
 ```
 
-`dev`、`stg`、`prod`は別Terraform Stateと別CI/CD Environmentを使用する。同じShell Stepでも読み込むStateが異なるため、Application IDは環境ごとに自然に切り替わる。`SP_IDS`はApplication IDだけを含み、OAuth SecretやFederation Tokenを含めない。
+`dev`（Development環境を表す短縮名）、`stg`（Staging環境を表す短縮名）、`prod`（Production環境を表す短縮名）は別Terraform Stateと別CI/CD Environmentを使用する。同じShell Stepでも読み込むStateが異なるため、Application IDは環境ごとに自然に切り替わる。`SP_IDS`（環境内Workload Service PrincipalのApplication ID一覧を渡す設定）はApplication IDだけを含み、OAuth SecretやFederation Tokenを含めない。
 
-Quality Bundleは`quality_sp_application_id`を自身の`databricks.yml`へ宣言し、Prompt登録／Evaluation／Optimization／Review／Monitoring／Release Jobへ同じTrust Boundaryの`run_as`を設定する。Platform / Deploy Identity、Data Pipeline SP、Quality SP、Realtime App SPは相互に流用しない。
+Quality Bundleは`quality_sp_application_id`（Quality Job用Service PrincipalのApplication ID）を自身の`databricks.yml`（DAB BundleのResource・変数・Targetを定義する設定ファイル）へ宣言し、Prompt登録／Evaluation／Optimization／Review／Monitoring／Release Jobへ同じTrust Boundaryの`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）を設定する。Platform / Deploy Identity、Data Pipeline SP、Quality SP、Realtime App SPは相互に流用しない。
 
-`bundles/quality/databricks.yml`
+`bundles/quality/databricks.yml`（Quality BundleのResourceとJobを定義するDAB設定ファイル）
 
 **実装概要**
 
@@ -6224,7 +6303,7 @@ targets:
       host: https://<prod-workspace-host>
 ```
 
-Realtime BundleはAppsが作成したIdentityを`${resources.apps.internal_rag_app.service_principal_client_id}`で参照するため、`realtime_sp_application_id`を手入力変数にはしない。
+Realtime BundleはAppsが作成したIdentityを`${resources.apps.internal_rag_app.service_principal_client_id}`（DAB Resourceから実体ID／値を解決する参照式）で参照するため、`realtime_sp_application_id`（Realtime App用Service PrincipalのApplication ID）を手入力変数にはしない。
 
 環境別の順序は、`terraform fmt -check`、`terraform validate`、Identity作成、Workspace割当／初期セットアップ、Terraform OutputのCI/CD登録、`databricks bundle validate -t <target>`、Deploy、Migration Job、実行環境 Grant用Terraform Apply、Pipeline、Pipeline Grant用Terraform Apply、Search Publish／Indexの順とする。認証情報のないローカル環境では`terraform plan`やBundleのRemote Validationができないため、CI/CDで実Workspaceに対する検証を必須Gateにする。
 
@@ -6234,12 +6313,12 @@ Realtime BundleはAppsが作成したIdentityを`${resources.apps.internal_rag_a
 | --- | --- | --- | --- |
 | 1 | Platform / Deploy Identity | IaCとMigrationで文書マニフェスト、バージョン管理台帳、単一Workflow Request、Audit Eventを作成し、IaCが運用Grantを適用する | System構築時に1回、以後は承認済みMigrationで変更 |
 | 2 | 文書登録者／自動事前検査 | 監視対象外StagingへUploadし、形式、Size、空File、読取可能性、Hash、重複候補、必要時のMalware結果をUIへ表示する | まだAuto Loaderから見えない |
-| 3 | 文書承認者／Document Workflow SP | 登録者とは別の人が、RAGへ投入してよいか、内容の正当性、公開範囲、ACLをUIで判断し、`INTAKE_APPROVE`または`REJECT`を保存する | 人の業務判断。UIはBase Tableを直接更新しない |
-| 4 | Manifest Executor SP | 検証済み`INTAKE_APPROVE`を反映し、論理文書を無効／未公開状態で登録して監視対象VolumeへMoveする | 公開Pointerは`NULL`。RAG投入承認と本番公開は別 |
-| 5 | Data Pipeline SP | Source Eventを取得し、Bronzeで`document_version_id`を生成する | 論理IDと内容バージョンIDを分離 |
+| 3 | 文書承認者／Document Workflow SP | 登録者とは別の人が、RAGへ投入してよいか、内容の正当性、公開範囲、ACLをUIで判断し、`INTAKE_APPROVE`（intake・approveを指定する設定値／環境変数）または`REJECT`（rejectを指定する設定値／環境変数）を保存する | 人の業務判断。UIはBase Tableを直接更新しない |
+| 4 | Manifest Executor SP | 検証済み`INTAKE_APPROVE`（intake・approveを指定する設定値／環境変数）を反映し、論理文書を無効／未公開状態で登録して監視対象VolumeへMoveする | 公開Pointerは`NULL`（SQLで値がないことを表す値）。RAG投入承認と本番公開は別 |
+| 5 | Data Pipeline SP | Source Eventを取得し、Bronzeで`document_version_id`（文書内容ごとの不変バージョンID）を生成する | 論理IDと内容バージョンIDを分離 |
 | 6 | Data Pipeline SP | Parse、Prep、Chunkを作り、エラーを隔離する | Bronze／Silverは追記型履歴 |
-| 7 | Data Pipeline SP | Version単位の技術状態をRegistryへ同期する | `review_status='pending'`または`not_ready` |
-| 8 | ドメイン審査者／Document Workflow SP | Version一覧と技術処理状態を確認し、現在の本番公開VersionをUIで選択する。公開停止と過去Versionへの切戻しも同じ経路を使う | `PUBLISH_VERSION`、`SUSPEND`、`ROLLBACK_VERSION`のWorkflow Request |
+| 7 | Data Pipeline SP | Version単位の技術状態をRegistryへ同期する | `review_status='pending'`または`not_ready`（後続公開へ進めないことを表す状態値） |
+| 8 | ドメイン審査者／Document Workflow SP | Version一覧と技術処理状態を確認し、現在の本番公開VersionをUIで選択する。公開停止と過去Versionへの切戻しも同じ経路を使う | `PUBLISH_VERSION`（publish・Versionを指定する設定値／環境変数）、`SUSPEND`（suspendを指定する設定値／環境変数）、`ROLLBACK_VERSION`（rollback・Versionを指定する設定値／環境変数）のWorkflow Request |
 | 9 | Manifest Executor SP | 承認者、自己承認禁止、Version存在、Parse／Prep／Chunk成功、Review状態、ACL、楽観Lockを検証して公開Pointerを更新する | 人が選んだVersionだけを反映。最新Versionを自動選定しない |
 | 10 | Data Pipeline SP | Gold Current、Search Sync、AI Searchを順に更新する | Manifest Pointerに一致するVersionの全Chunkだけが検索可能 |
 
@@ -6249,7 +6328,7 @@ Realtime BundleはAppsが作成したIdentityを`${resources.apps.internal_rag_a
 
 | 画面 | 表示 | 許可する操作 |
 | --- | --- | --- |
-| Document List | `document_id`、Title、現在の公開Version、有効／停止状態 | 詳細表示、新VersionのStaging Upload |
+| Document List | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）、Title、現在の公開Version、有効／停止状態 | 詳細表示、新VersionのStaging Upload |
 | Version List | Version、登録時刻、Parse／Prep／Chunk状態、Review状態、現在公開中か | Review開始 |
 | Review | 事前検査、内容Preview、公開範囲、ACL、理由 | RAG投入承認／却下 |
 | Publish Version | 公開可能な処理済みVersionと現在Pointer | 公開Version選択、公開停止、過去Versionへ切戻し |
@@ -6342,11 +6421,11 @@ def submit_request(
     return request_id
 ```
 
-UI Backendは人間Identityを自由入力から受け取らず、Databricks Appsの認証Contextまたは保護されたActor Viewから解決する。Manifest Executorは選択Versionが存在し、技術処理が成功し、Review状態とACL必須条件を満たし、`manifest_version`が一致する場合だけPointerを更新する。公開停止はPointerを`NULL`へ、ロールバックは人がUIで選んだ過去Versionへ更新する。
+UI Backendは人間Identityを自由入力から受け取らず、Databricks Appsの認証Contextまたは保護されたActor Viewから解決する。Manifest Executorは選択Versionが存在し、技術処理が成功し、Review状態とACL必須条件を満たし、`manifest_version`（文書マニフェスト更新時の競合検知に使うVersion）が一致する場合だけPointerを更新する。公開停止はPointerを`NULL`（SQLで値がないことを表す値）へ、ロールバックは人がUIで選んだ過去Versionへ更新する。
 
 **1. システム構築時の台帳作成**
 
-`bundles/ingestion/src/00_create_document_manifest.sql`
+`bundles/ingestion/src/00_create_document_manifest.sql`（文書公開状態とVersion管理の正本になる文書マニフェスト関連Tableを初期作成するSQL）
 
 **実装概要**
 
@@ -6557,23 +6636,23 @@ TBLPROPERTIES (
 
 `CREATE TABLE IF NOT EXISTS`は新規環境の初期セットアップ用であり、既存TableのSchemaを自動更新しない。本番で列を追加する場合は、Platform / Deploy IdentityがGit管理した`ALTER TABLE ... ADD COLUMNS`を環境ごと1回適用し、既存行のBackfill、Invariant Query、承認後に`NOT NULL`相当のGateを有効化する。専用Schema Migration SPを追加した組織では同じMigration ArtifactだけをそのIdentityへ移管する。
 
-`document_id`や有効な`source_uri`へPRIMARY KEY／UNIQUEを宣言しても、DatabricksのKey Constraintは強制されない。存在しない強制力を前提にせず、Manifest Executor Jobを`max_concurrent_runs: 1`にし、Command状態遷移、条件付き`MERGE`、Serializable Isolation、Invariant Queryを組み合わせる。`allowed_principals`は表示名ではなく`user:<SCIM ID>`または`group:<SCIM ID>`とし、空配列、解決不能ID、重複IDは登録ワークフローでFail Closedにする。
+`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）や有効な`source_uri`（原文または取得元を特定するURI）へPRIMARY KEY／UNIQUEを宣言しても、DatabricksのKey Constraintは強制されない。存在しない強制力を前提にせず、Manifest Executor Jobを`max_concurrent_runs: 1`（同じJobの同時実行数を1に制限する設定）にし、処理指示の状態遷移、条件付き`MERGE`（MERGE操作を表すSQLキーワード）、Serializable Isolation、Invariant Queryを組み合わせる。`allowed_principals`（この文書を検索できるUser／Group識別子の一覧）は表示名ではなく`user:<SCIM ID>`または`group:<SCIM ID>`とし、空配列、解決不能ID、重複IDは登録ワークフローでFail Closedにする。
 
 **2. 厳格構成用DAB Resource（本番導入時は任意）**
 
-`bundles/ingestion/advanced/strict_workflow/document_manifest_job.yml`
+`bundles/ingestion/advanced/strict_workflow/document_manifest_job.yml`（厳格運用で登録・承認の処理指示を個別Jobとして実行する文書管理Job定義）
 
-以下の登録Command、承認Command、個別Job、包括Executorは、Credential単位の追加分離が必要な組織向けの厳格構成参照である。標準構成のDeploy必須Sourceではない。標準構成は、4.3.4.3.1.2の文書管理UI、`document_workflow_requests`、`apply_manifest_request.py`だけを使う。
+以下の登録処理指示、承認処理指示、個別Job、包括Executorは、Credential単位の追加分離が必要な組織向けの厳格構成参照である。標準構成のDeploy必須Sourceではない。標準構成は、4.3.4.3.1.2の文書管理UI、`document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）、`apply_manifest_request.py`（承認済み文書Workflow Requestを検証し、文書マニフェストと監査履歴へ反映する処理）だけを使う。
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 台帳DDL、Command適用、Registry同期、整合性検査をJob化する。 呼出元はDAB Deploy後のSchedule／手動Run。 |
-| 入力 | Bundle変数、文書マニフェスト Python／SQL Source。 実行契機は初期化、Command到着、定期同期。 |
-| 処理 | Migration、Executor、Registry Sync、Invariant Testを順序付ける。登録／承認Jobは同じDocument Workflow SPを使うが人間GroupとJob ACLを分け、Base更新は独立Manifest Executor SPだけにする。Command IDとRun IDをAuditへ残す。 |
+| 目的 | 台帳DDL、処理指示適用、Registry同期、整合性検査をJob化する。 呼出元はDAB Deploy後のSchedule／手動Run。 |
+| 入力 | Bundle変数、文書マニフェスト Python／SQL Source。 実行契機は初期化、処理指示受付、定期同期。 |
+| 処理 | Migration、Executor、Registry Sync、Invariant Testを順序付ける。登録／承認Jobは同じDocument Workflow SPを使うが人間GroupとJob ACLを分け、Base更新は独立Manifest Executor SPだけにする。処理指示IDとRun IDをAuditへ残す。 |
 | 出力 | Lakeflow JobとTask Run。 文書マニフェストとRegistryが整合する。 後続はPipelineと整合性差分確認。 |
-| 失敗・再実行 | 失敗後は公開参照を変えない。 Command IDで再適用を防ぐ。 |
+| 失敗・再実行 | 失敗後は公開参照を変えない。 処理指示IDで再適用を防ぐ。 |
 
 ```yaml
 resources:
@@ -6818,7 +6897,7 @@ resources:
             dependencies: []
 ```
 
-`bundles/ingestion/resources/document_pipeline.yml`
+`bundles/ingestion/resources/document_pipeline.yml`（本番の文書取込からCurrent Gold生成までを実行するLakeflow Pipeline定義）
 
 **実装概要**
 
@@ -6872,7 +6951,7 @@ resources:
         internal_docs.chunk_schema_version: chunk-v1
 ```
 
-`bundles/ingestion/resources/search_publish_job.yml`
+`bundles/ingestion/resources/search_publish_job.yml`（公開確定したGold Currentを検索同期Tableへ反映するJob定義）
 
 **実装概要**
 
@@ -6922,7 +7001,7 @@ resources:
             dependencies: []
 ```
 
-`bundles/ingestion/resources/search_index_job.yml`
+`bundles/ingestion/resources/search_index_job.yml`（AI Search Indexの作成・同期・Ready確認を実行するJob定義）
 
 **実装概要**
 
@@ -6974,7 +7053,7 @@ resources:
               - databricks-vectorsearch
 ```
 
-`infra/databricks/runtime_grants.tf`
+`infra/databricks/runtime_grants.tf`（対象Resource／ソースを指す物理パス）
 
 **実装概要**
 
@@ -7305,41 +7384,41 @@ resource "databricks_grant" "pipeline_table" {
 }
 ```
 
-GrantもService Principalを作成しない。Terraformは`.application_id`のMapを`principal`へ渡すため、SQLへ表示名やPrincipal文字列を埋め込まない。初回は`enable_runtime_grants=false`、`enable_pipeline_grants=false`でWorkspace割当と初期セットアップだけを適用する。文書マニフェスト初期化Jobの成功後に前者だけを`true`にしてBase Table／Volume権限を付与し、Pipeline初回成功後に後者も`true`にする。この2段階Flagにより、まだ存在しないSilver／Gold DatasetへのGrantでTerraform全体を失敗させない。
+GrantもService Principalを作成しない。Terraformは`.application_id`のMapを`principal`（権限判定に使うUserまたはGroup識別子）へ渡すため、SQLへ表示名やPrincipal文字列を埋め込まない。初回は`enable_runtime_grants=false`、`enable_pipeline_grants=false`でWorkspace割当と初期セットアップだけを適用する。文書マニフェスト初期化Jobの成功後に前者だけを`true`（真を表すBoolean値）にしてBase Table／Volume権限を付与し、Pipeline初回成功後に後者も`true`（真を表すBoolean値）にする。この2段階Flagにより、まだ存在しないSilver／Gold DatasetへのGrantでTerraform全体を失敗させない。
 
 Deploy後の順序は、文書マニフェスト初期化Job、`enable_runtime_grants=true`のTerraform Apply、Pipeline初回更新、`enable_pipeline_grants=true`のTerraform Apply、Search Sync Publish Job、Index Jobとする。Index Object自体の管理権限はAI Search作成後にPlatform IaCがData Pipeline SPのApplication IDへ設定し、Realtime App SPにはQuery／参照に必要な権限だけを付与する。外部Scannerを有効化する場合は、ScannerのApplication IDを標準Mapへ追加せず、別のOptional Terraform ModuleからStaging ReadとScan Result Writeだけを付与する。
 
-Jobの`run_as`はJob単位である。登録Jobと承認JobはDocument Workflow SPを共有する一方、別Job ACLで登録者Groupと承認者Groupを分ける。人が起動できるJobはCommand表への要求保存までとし、Base 文書マニフェストを更新するManifest Executor JobはScheduleまたは管理されたCI/CDだけが起動する。Productionでは`pause_status`を環境Overrideで`UNPAUSED`にし、一般Groupへ`CAN_MANAGE_RUN`を付与しない。
+Jobの`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）はJob単位である。登録Jobと承認JobはDocument Workflow SPを共有する一方、別Job ACLで登録者Groupと承認者Groupを分ける。人が起動できるJobは処理指示テーブルへの要求保存までとし、Base 文書マニフェストを更新するManifest Executor JobはScheduleまたは管理されたCI/CDだけが起動する。Productionでは`pause_status`（Lakeflow Job Scheduleを有効／停止する設定）を環境Overrideで`UNPAUSED`（unpausedを指定する設定値／環境変数）にし、一般Groupへ`CAN_MANAGE_RUN`（can・manage・Runを指定する設定値／環境変数）を付与しない。
 
-`current_user()`が返すのは`run_as`のService Principalであり、Jobを開始した人間ではない。登録者・承認者は、Job Run IDから監査Logを照会するIdentity Resolver、または署名済みRequest IDを検証する外部承認Systemから取得する。利用者がJob Parameterへ入力した`created_by`、`requested_by`、`approved_by`は採用しない。Command ExecutorはService Principalを`executed_by_service_principal`へ、人間を`requested_by`／`approved_by`へ分け、Git Commit、Bundleバージョン、ワークフロー Run ID、変更前後の`manifest_version`とともに`document_manifest_audit_events`へ記録する。
+`current_user()`（認証済み現在Userを取得するWorkspace API）が返すのは`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）のService Principalであり、Jobを開始した人間ではない。登録者・承認者は、Job Run IDから監査Logを照会するIdentity Resolver、または署名済みRequest IDを検証する外部承認Systemから取得する。利用者がJob Parameterへ入力した`created_by`（作成・実行者を保持する項目）、`requested_by`（申請を行ったActorを記録する項目）、`approved_by`（承認を行ったActorを記録する項目）は採用しない。処理指示実行処理はService Principalを`executed_by_service_principal`（処理指示を実際に実行したService Principalを示す項目）へ、人間を`requested_by`（申請を行ったActorを記録する項目）／`approved_by`（承認を行ったActorを記録する項目）へ分け、Git Commit、Bundleバージョン、ワークフロー Run ID、変更前後の`manifest_version`（文書マニフェスト更新時の競合検知に使うVersion）とともに`document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable）へ記録する。
 
 | 主体 | Unity CatalogとJobの権限 | 更新可能範囲 |
 | --- | --- | --- |
-| Platform / Deploy Identity | Catalog・Schema利用とDDL Job実行 | Table作成、Schema変更、運用SPへの宣言済み`GRANT`。Runtime処理は禁止 |
-| Document Workflow SP | 登録／承認Jobの実行、両Command表の`SELECT, MODIFY` | 要求作成だけ。Base 文書マニフェストと公開参照は更新不可 |
-| Manifest Executor SP | Command表、文書マニフェスト、Registry、監査表の条件付き更新 | 固定Codeで検証済みCommandだけを適用。人間の直接起動は禁止 |
-| Data Pipeline SP | 文書マニフェスト参照、Registry技術状態、Bronze／Silver／Gold、差分候補、Sync／Indexの必要Grant | 文書マニフェストのauthoritative stateと承認Commandは更新不可 |
+| Platform / Deploy Identity | Catalog・Schema利用とDDL Job実行 | Table作成、Schema変更、運用SPへの宣言済み`GRANT`（GRANT操作を表すSQLキーワード）。Runtime処理は禁止 |
+| Document Workflow SP | 登録／承認Jobの実行、両処理指示テーブルの`SELECT, MODIFY`（読み取りと変更を許可するSQL権限の組合せ） | 要求作成だけ。Base 文書マニフェストと公開参照は更新不可 |
+| Manifest Executor SP | 処理指示テーブル、文書マニフェスト、Registry、監査表の条件付き更新 | 固定Codeで検証済み処理指示だけを適用。人間の直接起動は禁止 |
+| Data Pipeline SP | 文書マニフェスト参照、Registry技術状態、Bronze／Silver／Gold、差分候補、Sync／Indexの必要Grant | 文書マニフェストのauthoritative stateと承認処理指示は更新不可 |
 | Quality SP | EvaluationDataset、Experiment、Prompt Registry、Review／Monitoring／Releaseの必要Grant | Data生成と文書マニフェスト更新は不可 |
-| Realtime App SP | Gold、AI Search Query、Model Service`EXECUTE`、Prompt Read | DDL、Deploy、Index管理、Prompt管理、Dataset更新は不可 |
+| Realtime App SP | Gold、AI Search Query、Model Service`EXECUTE`（対象Function／Model等を実行するSQL権限）、Prompt Read | DDL、Deploy、Index管理、Prompt管理、Dataset更新は不可 |
 
-Unity CatalogのTable権限は列ごとの`MODIFY`を分離できないため、Document Workflow SPへBase Tableの`MODIFY`を付与しない。Manifest ExecutorはStored Procedure相当の固定ワークフローとして、Command種別ごとに許可列、前提状態、楽観Lockを検査する。この方式ではDocument Workflow SPのCredentialが侵害されても、単独で`approved_document_version_id`を更新できない。Manifest Executor自体は両経路を反映できるため、非対話Identity、固定Artifact、Protected Branch、Job ACL、単一同時実行、監査表、Delta CDFで統制する。さらに強い分離が必要な組織では、登録反映Executorと承認反映Executorも別Service Principalへ分割する。
+Unity CatalogのTable権限は列ごとの`MODIFY`（Delta Table等を変更するSQL権限）を分離できないため、Document Workflow SPへBase Tableの`MODIFY`（Delta Table等を変更するSQL権限）を付与しない。Manifest ExecutorはStored Procedure相当の固定ワークフローとして、処理指示種別ごとに許可列、前提状態、楽観Lockを検査する。この方式ではDocument Workflow SPのCredentialが侵害されても、単独で`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）を更新できない。Manifest Executor自体は両経路を反映できるため、非対話Identity、固定Artifact、Protected Branch、Job ACL、単一同時実行、監査表、Delta CDFで統制する。さらに強い分離が必要な組織では、登録反映Executorと承認反映Executorも別Service Principalへ分割する。
 
-**3. 厳格構成用の登録Command分割（本番導入時は任意）**
+**3. 厳格構成用の登録処理指示分割（本番導入時は任意）**
 
-`bundles/ingestion/advanced/strict_workflow/submit_document_registration.py`
+`bundles/ingestion/advanced/strict_workflow/submit_document_registration.py`（文書登録要求を検証して登録処理指示として受け付け、後続の登録処理へ渡す処理）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 認証済み登録要求をCommand Tableへ追加しBase更新をExecutorへ委譲する。 呼出元はDocument Registration Job。 |
-| 入力 | Actor View、Path、Hash、Metadata、既存Command。 実行契機は担当者の登録申請時。 |
-| 処理 | 入力を正規化しActor権限と重複Keyを検証してpending CommandをMERGEする。 Client申告Actorを信用せず承認参照を変更しない。 Command IDを監査証跡にする。 |
-| 出力 | document_registration_commands。 一意なCommand IDを返す。 後続はapply_manifest_commands.py。 |
+| 目的 | 認証済み登録要求を処理指示テーブルへ追加しBase更新をExecutorへ委譲する。 呼出元はDocument Registration Job。 |
+| 入力 | Actor View、Path、Hash、Metadata、既存処理指示。 実行契機は担当者の登録申請時。 |
+| 処理 | 入力を正規化しActor権限と重複Keyを検証してpending（未処理・確認待ち状態）の処理指示をMERGEする。 Client申告Actorを信用せず承認参照を変更しない。 処理指示IDを監査証跡にする。 |
+| 出力 | document_registration_commands。 一意な処理指示IDを返す。 後続はapply_manifest_commands.py。 |
 | 失敗・再実行 | 文書マニフェストを変更せず拒否する。 idempotency_keyで二重登録を防ぐ。 |
 
 ```python
-"""認証済み登録者の文書登録要求をCommand Tableへ保存するModule。Document Workflow SPの登録Jobから実行し、Base 文書マニフェスト、公開参照、監視対象Volumeは更新しない。
+"""認証済み登録者の文書登録要求を処理指示テーブルへ保存するModule。Document Workflow SPの登録Jobから実行し、Base 文書マニフェスト、公開参照、監視対象Volumeは更新しない。
 
 主な入出力と更新対象は直前の実装情報表に従う。失敗時は部分結果を公開せず、永続状態を再読して安全に再実行する。
 """
@@ -7468,7 +7547,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """認証済みActorを解決して登録Commandを一意に作成する。
+    """認証済みActorを解決して登録処理指示を一意に作成する。
 
     Returns:
         なし。
@@ -7484,32 +7563,32 @@ if __name__ == "__main__":
     main()
 ```
 
-`main.security.authenticated_workflow_actors`は本資料のアプリケーションSPが書き込む表ではなく、Platform／セキュリティ部門がSystem Tableの監査Eventまたは外部申請Systemの署名済みEventから作る保護Viewである。Document Workflow SPには登録／承認の該当Actionの`SELECT`だけを付与する。利用者名をJob Parameterで受ける代替実装は認めない。
+`main.security.authenticated_workflow_actors`（Unity Catalog上の物理Resource名）は本資料のアプリケーションSPが書き込む表ではなく、Platform／セキュリティ部門がSystem Tableの監査Eventまたは外部申請Systemの署名済みEventから作る保護Viewである。Document Workflow SPには登録／承認の該当Actionの`SELECT`（Table／Viewを読み取るSQL権限）だけを付与する。利用者名をJob Parameterで受ける代替実装は認めない。
 
-次の`register_document.py`は文書マニフェスト Command ExecutorだけがImportして実行する登録Handlerであり、一般利用者が起動するDAB Jobから直接呼ばない。
+次の`register_document.py`（文書登録申請を処理するPythonファイル）は文書マニフェスト 処理指示実行処理だけがImportして実行する登録Handlerであり、一般利用者が起動するDAB Jobから直接呼ばない。
 
-`bundles/ingestion/advanced/strict_workflow/register_document.py`
+`bundles/ingestion/advanced/strict_workflow/register_document.py`（登録処理指示を実行し、文書Versionを管理対象へ登録する処理）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 登録CommandとScan結果から未公開文書バージョンを文書マニフェストへ反映する。 呼出元はCommand Executorの登録Handler。 |
-| 入力 | Command、Staging File、Scan結果、文書マニフェスト、Registry。 実行契機はpending CommandのClaim時。 |
-| 処理 | 再検証しHashからバージョン IDを作り安全なPathへ配置してdraftをMERGEする。 承認参照は更新しない。 Command／Audit IDで監査する。 |
+| 目的 | 登録処理指示とScan結果から未公開文書バージョンを文書マニフェストへ反映する。 呼出元は処理指示実行処理の登録Handler。 |
+| 入力 | 登録処理指示、Staging File、Scan結果、文書マニフェスト、Registry。 実行契機はpending（未処理・確認待ち状態）の登録処理指示を取得した時。 |
+| 処理 | 再検証しHashからバージョン IDを作り安全なPathへ配置してdraftをMERGEする。 承認参照は更新しない。 処理指示ID／監査IDで監査する。 |
 | 出力 | 監視Volume、文書マニフェスト、Registry、Audit Event。 draft バージョンを作成する。 後続はBronze取込と承認ワークフロー。 |
 | 失敗・再実行 | File配置とTable更新を確定しない。 既存バージョンと配置先を再利用する。 |
 
 ```python
-"""検証済み文書登録Commandを文書マニフェストと監視対象Volumeへ反映するModule。
+"""検証済み文書登録処理指示を文書マニフェストと監視対象Volumeへ反映するModule。
 
-文書マニフェスト Command Executor Jobが非対話Service Principalで実行する。登録Command、
+文書マニフェスト 処理指示実行Jobが非対話Service Principalで実行する。登録処理指示、
 Staging File、登録Policyが要求する場合の外部Scan結果を入力とし、`document_source_manifest`の未公開draft行と
 Auto Loader監視対象Volumeの原文書を出力する。
 
 `document_version_id`生成、Parse、Prep、Chunk生成、バージョン承認、公開参照更新、
 Gold CurrentおよびAI Searchへの公開は行わない。失敗時は公開参照を`NULL`のまま
-維持し、同一Commandの登録済みdraftまたはMove済み状態から冪等に再開する。
+維持し、同一処理指示の登録済みdraftまたはMove済み状態から冪等に再開する。
 """
 
 from __future__ import annotations
@@ -7726,12 +7805,12 @@ def existing_draft_matches(
     request: RegistrationRequest,
     document_id: str,
 ) -> bool:
-    """既存文書マニフェスト行が同じCommandから作られた同一内容のdraftか検証する。
+    """既存文書マニフェスト行が同じ処理指示から作られた同一内容のdraftか検証する。
 
     Args:
         spark: 文書マニフェストを読み取るSpark Session。
         request: 検証済みの文書登録要求。
-        document_id: Command IDから決定的に生成した論理文書ID。
+        document_id: 処理指示IDから決定的に生成した論理文書ID。
 
     Returns:
         同じ内容のdraftが既に存在する場合は`True`、未登録なら`False`。
@@ -7788,7 +7867,7 @@ def register_draft(
     Args:
         spark: 文書マニフェストを更新するSpark Session。
         request: 検証済みの文書登録要求。
-        document_id: Command IDから決定的に生成した論理文書ID。
+        document_id: 処理指示IDから決定的に生成した論理文書ID。
 
     Returns:
         なし。
@@ -7804,7 +7883,7 @@ def register_draft(
         公開参照は`NULL`のままとし、別文書の`source_uri`競合はFail Closedとする。
 
     再試行:
-        同一Command由来の同一内容draftが存在する場合は成功扱いとし、重複Insertしない。
+        同一処理指示由来の同一内容draftが存在する場合は成功扱いとし、重複Insertしない。
     """
     if existing_draft_matches(spark, request, document_id):
         return
@@ -7891,7 +7970,7 @@ def move_to_monitored_volume(request: RegistrationRequest) -> None:
 
 
 def apply_registration_command(spark: SparkSession, command: Row) -> str:
-    """登録Commandを再検証し、draft登録またはMove再開を実行する。
+    """登録処理指示を再検証し、draft登録またはMove再開を実行する。
 
     Args:
         spark: 処理に使用する`spark`。
@@ -7903,7 +7982,7 @@ def apply_registration_command(spark: SparkSession, command: Row) -> str:
 
 
     """
-    # 再実行しても同じ論理文書を参照できるよう、Command IDから決定的に採番する。
+    # 再実行しても同じ論理文書を参照できるよう、処理指示IDから決定的に採番する。
     document_id = f"DOC-{uuid5(NAMESPACE_URL, command.command_id)}"
     request = RegistrationRequest(
         staging_uri=command.staging_uri,
@@ -7941,13 +8020,13 @@ def apply_registration_command(spark: SparkSession, command: Row) -> str:
     return document_id
 ```
 
-実運用では、保護された`policy_version`が外部検査を要求する場合だけStaging Upload後にMalware／署名Scannerを実行し、成功したScan Request IDを登録Jobへ渡す。外部検査を要求しない承認済みPolicyではRequest IDを空にし、文書バージョン管理台帳へ`not_required`を残す。`assert_staging_file()`が存在とSize、`assert_intake_scan_policy()`がPolicyとScan結果の整合を検査し、未知PolicyはFail Closedにする。文書マニフェスト登録に失敗した場合はFileをStagingへ残す。文書マニフェスト登録後のMoveに失敗した場合は`draft`行を残し、同じCommandから決定した`document_id`と登録内容が完全一致するときだけ既存draftを再利用してMoveから再開する。別文書が同じ`source_uri`を使用している場合、または登録内容が異なる場合はFail Closedとする。Move完了後にExecutorが停止した場合も、配置先が存在しStagingが消失していれば適用済みとして再開できる。公開参照は`NULL`なので、どの途中状態でもGoldへは出ない。
+実運用では、保護された`policy_version`（適用した権限・公開ポリシーのVersion）が外部検査を要求する場合だけStaging Upload後にMalware／署名Scannerを実行し、成功したScan Request IDを登録Jobへ渡す。外部検査を要求しない承認済みPolicyではRequest IDを空にし、文書バージョン管理台帳へ`not_required`（外部検査が不要だったことを表す状態値）を残す。`assert_staging_file()`（Staging Fileの存在・Size等を検証する関数）が存在とSize、`assert_intake_scan_policy()`（投入Policyと外部Scan結果の整合を検証する関数）がPolicyとScan結果の整合を検査し、未知PolicyはFail Closedにする。文書マニフェスト登録に失敗した場合はFileをStagingへ残す。文書マニフェスト登録後のMoveに失敗した場合は`draft`（文書マニフェスト反映途中の未公開状態を表す値）行を残し、同じ処理指示から決定した`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）と登録内容が完全一致するときだけ既存draftを再利用してMoveから再開する。別文書が同じ`source_uri`（原文または取得元を特定するURI）を使用している場合、または登録内容が異なる場合はFail Closedとする。Move完了後にExecutorが停止した場合も、配置先が存在しStagingが消失していれば適用済みとして再開できる。公開参照は`NULL`（SQLで値がないことを表す値）なので、どの途中状態でもGoldへは出ない。
 
 **4. 台帳未登録Fileの隔離と明示再実行**
 
-監視対象Volumeへ誤ってFileが先に配置された場合、Streaming TableとStatic 文書マニフェストのJOINは、後から文書マニフェストを追加しても処理済みSource Eventを自動再計算しない。そのため、次節のBronzeではSource Eventを一度だけPrivate Streaming Tableへ物理保持し、登録済み行と未登録行へ分岐する。未登録行は`internal_docs_unregistered_sources`へ保存する。
+監視対象Volumeへ誤ってFileが先に配置された場合、Streaming TableとStatic 文書マニフェストのJOINは、後から文書マニフェストを追加しても処理済みSource Eventを自動再計算しない。そのため、次節のBronzeではSource Eventを一度だけPrivate Streaming Tableへ物理保持し、登録済み行と未登録行へ分岐する。未登録行は`internal_docs_unregistered_sources`（文書マニフェスト未登録のSourceを隔離するTable）へ保存する。
 
-`bundles/ingestion/src/replay_unregistered_source.py`
+`bundles/ingestion/src/replay_unregistered_source.py`（取込済みだがRegistryへ未登録の原文を検出し、登録処理を再実行できる状態へ戻す処理）
 
 **実装概要**
 
@@ -8023,13 +8102,13 @@ def main(source_uri: str) -> None:
     print({"staging_uri": staging_uri, "source_uri": new_source_uri})
 ```
 
-再実行は同じPathの上書きやAuto Loaderの偶然の再検知に依存しない。Fileを監視対象外Stagingへ戻し、新しい一意Pathを採番して、通常のScanner→登録Command→文書マニフェスト draft登録→Moveを再実行する。既存の論理文書へ紐付ける場合は新しい`document_id`を発行せず、文書マニフェスト Command Executorが承認済みLifecycle Commandに基づき、同じ`document_id`の`source_uri`を楽観Lock付きで更新する。
+再実行は同じPathの上書きやAuto Loaderの偶然の再検知に依存しない。Fileを監視対象外Stagingへ戻し、新しい一意Pathを採番して、通常のScanner→登録処理指示→文書マニフェスト draft登録→Moveを再実行する。既存の論理文書へ紐付ける場合は新しい`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）を発行せず、文書マニフェスト 処理指示実行処理が承認済みライフサイクル処理指示に基づき、同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）の`source_uri`（原文または取得元を特定するURI）を楽観Lock付きで更新する。
 
 **5. 文書バージョン管理台帳同期と審査対象作成**
 
-`document_source_manifest`は「現在の論理文書」を1行で表し、`document_version_registry`は「各内容バージョンの技術処理と審査履歴」を表す。v1公開中にv2を審査する状態を文書マニフェストの`approval_status`だけで表すと、v1まで審査中に見えるか、v2を指すために公開参照を早く切り替えることになるため、資産を分ける。
+`document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable）は「現在の論理文書」を1行で表し、`document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）は「各内容バージョンの技術処理と審査履歴」を表す。v1公開中にv2を審査する状態を文書マニフェストの`approval_status`（承認Workflowの現在状態）だけで表すと、v1まで審査中に見えるか、v2を指すために公開参照を早く切り替えることになるため、資産を分ける。
 
-`bundles/ingestion/src/sync_document_version_registry.py`
+`bundles/ingestion/src/sync_document_version_registry.py`（取込結果と文書Version Registryを照合し、Version管理情報を同期する処理）
 
 **実装概要**
 
@@ -8038,8 +8117,8 @@ def main(source_uri: str) -> None:
 | 目的 | Pipeline各層の結果を文書バージョン管理台帳へ集約する。 呼出元はRegistry Sync Task。 |
 | 入力 | Bronze、エラー、Silver、Scan、Registry。 実行契機はPipeline Update後。 |
 | 処理 | バージョンごとに各層到達状況を集約し状態をMERGEする。 技術成功を承認とみなさない。 Run IDとエラー参照を保持する。 |
-| 出力 | `document_version_registry`。最新技術状態を確認できる。後続は承認HandlerとDashboard。 |
-| 失敗・再実行 | 公開バージョン参照を維持する。`document_version_id`で同じ状態へ収束する。 |
+| 出力 | `document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）。最新技術状態を確認できる。後続は承認HandlerとDashboard。 |
+| 失敗・再実行 | 公開バージョン参照を維持する。`document_version_id`（文書内容ごとの不変バージョンID）で同じ状態へ収束する。 |
 
 ```python
 """Bronze、Parse／Prep、Chunk、Scan結果からバージョン単位の技術状態を文書バージョン管理台帳へ同期するModule。公開バージョン参照は更新しない。
@@ -8237,24 +8316,24 @@ if __name__ == "__main__":
     main()
 ```
 
-文書バージョン管理台帳 Sync Jobは、`intake_scan_request_id`がある場合は信頼済みScan結果を引き継ぎ、ない場合は登録時に検証済みのPolicyに基づき`not_required`を設定する。`malware_scan_status IN ('clean','not_required')`、`signature_check_status IN ('verified','not_required')`のバージョンだけを承認可能にする。Legacy移行行や照合不整合は`unknown`とし、`unknown`のまま承認しない。
+文書バージョン管理台帳 Sync Jobは、`intake_scan_request_id`（文書投入時の外部Scanner Requestを識別するID）がある場合は信頼済みScan結果を引き継ぎ、ない場合は登録時に検証済みのPolicyに基づき`not_required`（外部検査が不要だったことを表す状態値）を設定する。`malware_scan_status IN ('clean','not_required')`、`signature_check_status IN ('verified','not_required')`のバージョンだけを承認可能にする。Legacy移行行や照合不整合は`unknown`（未確定・不明を表す状態値）とし、`unknown`（未確定・不明を表す状態値）のまま承認しない。
 
-**6. 厳格構成用の承認Command分割（本番導入時は任意）**
+**6. 厳格構成用の承認処理指示分割（本番導入時は任意）**
 
-`bundles/ingestion/advanced/strict_workflow/submit_document_approval.py`
+`bundles/ingestion/advanced/strict_workflow/submit_document_approval.py`（文書Versionの公開承認要求を受け付け、承認処理指示として後続処理へ渡す処理）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 審査結果をApproval Commandとして保存する。 呼出元はDocument Approval Job。 |
+| 目的 | 審査結果をApproval 処理指示として保存する。 呼出元はDocument Approval Job。 |
 | 入力 | Actor View、文書／バージョン ID、判断、理由。 実行契機は承認／却下時。 |
-| 処理 | Actor権限と対象バージョンを検証しpending Commandを作る。 登録者と承認者を分離し参照を直接変更しない。 Command IDを監査証跡にする。 |
+| 処理 | Actor権限と対象バージョンを検証しpending（未処理・確認待ち状態）の処理指示を作る。 登録者と承認者を分離し参照を直接変更しない。 処理指示IDを監査証跡にする。 |
 | 出力 | document_approval_commands。 Executor処理可能なIDを返す。 後続はapply_manifest_commands.py。 |
 | 失敗・再実行 | 文書マニフェストを変更せず拒否する。 同じ判断Keyを再利用する。 |
 
 ```python
-"""認証済み承認者の審査結果をApproval Command Tableへ保存するModule。Document Workflow SPの承認Jobで実行し、Base 文書マニフェストを直接更新しない。
+"""認証済み承認者の審査結果を承認処理指示テーブルへ保存するModule。Document Workflow SPの承認Jobで実行し、Base 文書マニフェストを直接更新しない。
 
 主な入出力と更新対象は直前の実装情報表に従う。失敗時は部分結果を公開せず、永続状態を再読して安全に再実行する。
 """
@@ -8312,7 +8391,7 @@ def append_approval_command(
     spark: SparkSession,
     args: argparse.Namespace,
 ) -> str:
-    """承認結果をCommand表へ追記し、承認SP自身は文書マニフェストの公開バージョン参照を変更しない。
+    """承認結果を処理指示テーブルへ追記し、承認SP自身は文書マニフェストの公開バージョン参照を変更しない。
 
     Args:
         spark: 処理に使用する`spark`。
@@ -8380,7 +8459,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """認証済み承認者を解決して承認Commandを一意に作成する。
+    """認証済み承認者を解決して承認処理指示を一意に作成する。
 
     Returns:
         なし。
@@ -8396,24 +8475,24 @@ if __name__ == "__main__":
     main()
 ```
 
-次の`approve_document_version.py`は文書マニフェスト Command ExecutorだけがImportする承認Handlerである。`reviewed_by`には物理更新を実行したService Principalを記録し、人間の承認者は監査表の`approved_by`へ別に記録する。
+次の`approve_document_version.py`（承認済み文書Versionを公開対象へ切り替え、旧VersionとのCurrent状態を整合させる処理）は文書マニフェスト 処理指示実行処理だけがImportする承認Handlerである。`reviewed_by`（文書審査を行った担当者を示す項目）には物理更新を実行したService Principalを記録し、人間の承認者は監査表の`approved_by`（承認を行ったActorを記録する項目）へ別に記録する。
 
-`bundles/ingestion/advanced/strict_workflow/approve_document_version.py`
+`bundles/ingestion/advanced/strict_workflow/approve_document_version.py`（承認済み文書Versionを公開対象へ切り替え、旧VersionとのCurrent状態を整合させる処理）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 承認Commandを技術状態と照合し公開参照を原子的に切り替える。 呼出元はCommand Executorの承認Handler。 |
-| 入力 | Command、Registry、Silver、エラー、文書マニフェスト。 実行契機はpending承認CommandのClaim時。 |
+| 目的 | 承認処理指示を技術状態と照合し公開参照を原子的に切り替える。 呼出元は処理指示実行処理の承認Handler。 |
+| 入力 | 承認処理指示、Registry、Silver、エラー、文書マニフェスト。 実行契機はpending（未処理・確認待ち状態）の承認処理指示を取得した時。 |
 | 処理 | バージョン存在と技術成功を検証し承認時だけ参照を切り替える。 Parse／Prep失敗と職務分離違反はFail Closedする。 Approval／Audit IDを保持する。 |
 | 出力 | Registry審査状態、文書マニフェストの公開バージョン参照、Audit Event。 次回Gold Refreshで承認版を公開する。 後続はGold Current。 |
 | 失敗・再実行 | 旧参照を維持する。 適用履歴を再読し二重切替を防ぐ。 |
 
 ```python
-"""検証済み承認Commandを文書バージョン管理台帳と文書マニフェストへ反映するModule。
+"""検証済み承認処理指示を文書バージョン管理台帳と文書マニフェストへ反映するModule。
 
-文書マニフェスト Command Executor Jobが非対話Service Principalで実行する。承認Command、
+文書マニフェスト 処理指示実行Jobが非対話Service Principalで実行する。承認処理指示、
 Silver Chunk、Parse／Prepエラー、文書バージョン管理台帳を入力とし、審査状態と文書マニフェストの
 `approved_document_version_id`を楽観ロック付きで更新する。
 
@@ -8436,7 +8515,7 @@ PREP_ERROR_TABLE = "main.llmops.internal_docs_prep_errors"
 
 
 def execution_identity(spark: SparkSession) -> str:
-    """自由入力された承認者名ではなく、Command Executorの認証済みRun Identityを返す。
+    """自由入力された承認者名ではなく、処理指示実行処理の認証済みRun Identityを返す。
 
     Args:
         spark: 処理に使用する`spark`。
@@ -8652,8 +8731,8 @@ def publish_manifest_pointer(
 
 
 def apply_approval_command(spark: SparkSession, command: Row) -> None:
-    # ExecutorがCommandを再検証し、バージョン承認と公開参照切替を順番に適用する。
-    """承認Commandを再検証し、Registry承認と参照切替を順番に適用する。
+    # Executorが処理指示を再検証し、バージョン承認と公開参照切替を順番に適用する。
+    """承認処理指示を再検証し、Registry承認と参照切替を順番に適用する。
 
     Args:
         spark: 処理に使用する`spark`。
@@ -8685,20 +8764,20 @@ def apply_approval_command(spark: SparkSession, command: Row) -> None:
     )
 ```
 
-`bundles/ingestion/advanced/strict_workflow/apply_manifest_commands.py`
+`bundles/ingestion/advanced/strict_workflow/apply_manifest_commands.py`（登録・承認の処理指示を順に検証し、文書マニフェストと監査履歴へ反映する処理）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 登録・承認CommandをClaimし固定Handlerで正本へ反映する。 呼出元は文書マニフェスト Command Executor Job。 |
-| 入力 | pending Command、Actor View、Handler設定、Audit。 実行契機はSchedule／手動Run。 |
-| 処理 | Claimし型別Handlerを呼び成功／再試行／恒久失敗へ遷移する。 任意SQLと任意Actorを受け付けない。 Command IDと変更前後Hashを残す。 |
-| 出力 | Command状態、文書マニフェスト／Registry、Audit Event。 各Commandを一度だけappliedにする。 後続は登録・承認HandlerとInvariant Test。 |
-| 失敗・再実行 | 失敗分類と再試行回数を記録する。 Claim leaseとCommand IDで多重実行を防ぐ。 |
+| 目的 | 登録・承認処理指示をClaimし固定Handlerで正本へ反映する。 呼出元は文書マニフェスト 処理指示実行Job。 |
+| 入力 | pending（未処理・確認待ち状態）の処理指示、Actor View、Handler設定、Audit。 実行契機はSchedule／手動Run。 |
+| 処理 | Claimし型別Handlerを呼び成功／再試行／恒久失敗へ遷移する。 任意SQLと任意Actorを受け付けない。 処理指示IDと変更前後Hashを残す。 |
+| 出力 | 処理指示状態、文書マニフェスト／Registry、Audit Event。 各処理指示を一度だけappliedにする。 後続は登録・承認HandlerとInvariant Test。 |
+| 失敗・再実行 | 失敗分類と再試行回数を記録する。 Claim leaseと処理指示IDで多重実行を防ぐ。 |
 
 ```python
-"""登録・承認CommandをClaimし、固定HandlerでBase Tableへ反映して監査Eventを残すModule。非対話Executor Jobだけが実行し、人間の自由入力値を監査Actorとして採用しない。
+"""登録・承認処理指示をClaimし、固定HandlerでBase Tableへ反映して監査Eventを残すModule。非対話Executor Jobだけが実行し、人間の自由入力値を監査Actorとして採用しない。
 
 主な入出力と更新対象は直前の実装情報表に従う。失敗時は部分結果を公開せず、永続状態を再読して安全に再実行する。
 """
@@ -8745,8 +8824,8 @@ def update_command_status(
     to_status: str,
     failure_reason: str | None = None,
 ) -> bool:
-    # 状態遷移を条件付きMERGEにし、同じCommandの二重適用を防ぐ。
-    """Command状態を条件付きMERGEで遷移させ、二重適用を防ぐ。
+    # 状態遷移を条件付きMERGEにし、同じ処理指示の二重適用を防ぐ。
+    """処理指示状態を条件付きMERGEで遷移させ、二重適用を防ぐ。
 
     Args:
         spark: 処理に使用する`spark`。
@@ -8882,7 +8961,7 @@ def process_registration_commands(
     spark: SparkSession,
     args: argparse.Namespace,
 ) -> None:
-    """登録CommandをClaimし、冪等Handlerで順番に処理する。
+    """登録処理指示をClaimし、冪等Handlerで順番に処理する。
 
     Args:
         spark: 処理に使用する`spark`。
@@ -8957,7 +9036,7 @@ def process_approval_commands(
     spark: SparkSession,
     args: argparse.Namespace,
 ) -> None:
-    """承認CommandをClaimし、公開条件を再検証して処理する。
+    """承認処理指示をClaimし、公開条件を再検証して処理する。
 
     Args:
         spark: 処理に使用する`spark`。
@@ -9044,7 +9123,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """単一同時実行Jobで登録と承認のCommand Queueを順番に処理する。
+    """単一同時実行Jobで登録と承認の処理指示キューを順番に処理する。
 
     Returns:
         なし。
@@ -9061,9 +9140,9 @@ if __name__ == "__main__":
     main()
 ```
 
-バージョン存在確認と文書マニフェスト更新は別Tableにまたがるため、単一Delta Transactionにはできない。本例はRegistryを先に`approved`へ更新し、その後文書マニフェストの公開バージョン参照を条件付き更新する。参照更新に失敗した場合、バージョンは「承認済みだが未公開」となり、Goldは旧参照を維持するため安全側である。承認Jobは自動再試行せず、最新`manifest_version`を再読し、競合した承認内容を人が確認してから再実行する。
+バージョン存在確認と文書マニフェスト更新は別Tableにまたがるため、単一Delta Transactionにはできない。本例はRegistryを先に`approved`（承認済みを表す状態値）へ更新し、その後文書マニフェストの公開バージョン参照を条件付き更新する。参照更新に失敗した場合、バージョンは「承認済みだが未公開」となり、Goldは旧参照を維持するため安全側である。承認Jobは自動再試行せず、最新`manifest_version`（文書マニフェスト更新時の競合検知に使うVersion）を再読し、競合した承認内容を人が確認してから再実行する。
 
-Command Executorは`processed_at`を30分の処理Leaseとして使う。Process停止により`processing`のまま残ったCommandは、`max_concurrent_runs: 1`のExecutorが期限切れ後に再Claimする。例外を捕捉して`failed`になったCommandは無条件に自動再試行せず、運用担当者が配置先、Staging、既存draft、失敗理由を確認し、承認済み再実行操作で`pending`へ戻す。登録Handlerは同じCommand由来の同一内容draftならMoveから再開し、Move済みなら成功扱いにできる。将来Executorを並列化する場合は、`processed_at`だけでなくLease TokenをSchemaへ追加し、Claimと完了更新を同じTokenで条件付ける。
+処理指示実行処理は`processed_at`（処理を完了した時刻）を30分の処理Leaseとして使う。Process停止により`processing`（処理中を表す状態値）のまま残った処理指示は、`max_concurrent_runs: 1`（同じJobの同時実行数を1に制限する設定）のExecutorが期限切れ後に再Claimする。例外を捕捉して`failed`（失敗を表す状態値）になった処理指示は無条件に自動再試行せず、運用担当者が配置先、Staging、既存draft、失敗理由を確認し、承認済み再実行操作で`pending`（未処理・確認待ちを表す状態値）へ戻す。登録Handlerは同じCommand由来の同一内容draftならMoveから再開し、Move済みなら成功扱いにできる。将来Executorを並列化する場合は、`processed_at`（処理を完了した時刻）だけでなくLease TokenをSchemaへ追加し、Claimと完了更新を同じTokenで条件付ける。
 
 **7. v1公開中にv2を審査する状態**
 
@@ -9075,35 +9154,35 @@ Command Executorは`processed_at`を30分の処理Leaseとして使う。Process
 | Silver | v1とv2のChunk履歴を保持 | v1とv2のChunk履歴を保持 |
 | Gold／Index | v1だけ公開 | Goldがv2へ切替後、Search Syncがv2をInsert／Updateし、v1をDelete |
 
-新バージョンがSilverへ到達しただけでは文書マニフェストを`draft`へ戻さない。論理文書はv1を公開中なので`approval_status='approved'`を維持し、文書バージョン管理台帳だけでv2の審査中を表現する。これにより、v2審査中もv1を継続公開できる。
+新バージョンがSilverへ到達しただけでは文書マニフェストを`draft`（文書マニフェスト反映途中の未公開状態を表す値）へ戻さない。論理文書はv1を公開中なので`approval_status='approved'`を維持し、文書バージョン管理台帳だけでv2の審査中を表現する。これにより、v2審査中もv1を継続公開できる。
 
 **8. 継続運用時の文書マニフェスト更新**
 
 | 操作 | 文書マニフェスト更新 | 文書バージョン管理台帳／履歴 | Gold／Indexへの影響 |
 | --- | --- | --- | --- |
-| ACL変更 | `allowed_principals`、`policy_version`、`manifest_version`を更新 | バージョン内容は変更しない | Gold再計算後に最新ACLへ差替え、Syncする |
-| Title変更 | `source_title`を更新 | バージョン内容は変更しない | GoldとIndex表示Titleを更新する |
-| 公開範囲変更 | `publication_scope`、必要ならACLを更新 | 変更Requestを監査 | Goldへ即時反映する |
-| 有効期間変更 | `valid_from`／`valid_to`を更新 | バージョン履歴は保持 | 期間外ならGold／Indexから除外する |
+| ACL変更 | `allowed_principals`（この文書を検索できるUser／Group識別子の一覧）、`policy_version`（適用した権限・公開ポリシーのVersion）、`manifest_version`（文書マニフェスト更新時の競合検知に使うVersion）を更新 | バージョン内容は変更しない | Gold再計算後に最新ACLへ差替え、Syncする |
+| Title変更 | `source_title`（取得元文書のTitleを保持する項目）を更新 | バージョン内容は変更しない | GoldとIndex表示Titleを更新する |
+| 公開範囲変更 | `publication_scope`（公開・範囲を保持する項目）、必要ならACLを更新 | 変更Requestを監査 | Goldへ即時反映する |
+| 有効期間変更 | `valid_from`（そのVersionが有効になった開始時刻）／`valid_to`（そのVersionが有効だった終了時刻）を更新 | バージョン履歴は保持 | 期間外ならGold／Indexから除外する |
 | 一時公開停止 | `approval_status='suspended'` | 参照と承認履歴は保持 | Gold／Indexから除外する |
-| 論理削除 | `is_deleted=true`、`valid_to=現在時刻` | Bronze／Silverは保持Policyに従う | Gold／Indexから削除する |
+| 論理削除 | `is_deleted=true`（論理削除済みを表す状態）、`valid_to=現在時刻` | Bronze／Silverは保持Policyに従う | Gold／Indexから削除する |
 | 復活 | `is_deleted=false`、Status／期間／ACLを再承認 | 新しい状態遷移を監査 | Gate合格後に再公開する |
-| 同一文書の改名・移動 | 同じ`document_id`の`source_uri`とTitleを更新 | 内容が同じならバージョン IDを維持 | 旧PathをStagingへ退避し、新Pathを登録後にMove。整合性差分確認で旧Path不在を確認する |
+| 同一文書の改名・移動 | 同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）の`source_uri`（原文または取得元を特定するURI）とTitleを更新 | 内容が同じならバージョン IDを維持 | 旧PathをStagingへ退避し、新Pathを登録後にMove。整合性差分確認で旧Path不在を確認する |
 | 新バージョンへの訂正 | 文書マニフェストの公開バージョン参照は旧バージョンのまま | 新バージョンをRegistryで審査する | 承認後だけ参照を切り替える |
-| 別文書として登録 | 新しい`document_id`とdraft行を作る | 新しいバージョン系列 | 独立した文書として公開する |
+| 別文書として登録 | 新しい`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）とdraft行を作る | 新しいバージョン系列 | 独立した文書として公開する |
 
-改名・移動では、先に文書マニフェストだけを新Pathへ変えると旧PathのSource Eventと一致しなくなる。監視対象外Stagingへ旧FileをMoveし、楽観Lock付きで`source_uri`を変更してから、新PathへMoveする。Auto LoaderはPathを単位に新Fileとして検知し得るため、`internal_docs_unique_versions`が同じ`document_id`と内容Hashから生成した同一`document_version_id`を重複排除する。
+改名・移動では、先に文書マニフェストだけを新Pathへ変えると旧PathのSource Eventと一致しなくなる。監視対象外Stagingへ旧FileをMoveし、楽観Lock付きで`source_uri`（原文または取得元を特定するURI）を変更してから、新PathへMoveする。Auto LoaderはPathを単位に新Fileとして検知し得るため、`internal_docs_unique_versions`（AI Functionへ渡す一意な文書Versionを保持する中間Table）が同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）と内容Hashから生成した同一`document_version_id`（文書内容ごとの不変バージョンID）を重複排除する。
 
 **9. 文書マニフェストと文書バージョン管理台帳の検証Query**
 
-`bundles/ingestion/tests/manifest_invariants.sql`
+`bundles/ingestion/tests/manifest_invariants.sql`（文書マニフェストと文書Versionの整合性を検査し、不正な公開状態を検知するSQL）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 文書マニフェスト、Registry、Commandの不変条件違反を0行Queryで検出する。 呼出元は文書マニフェスト JobとCI。 |
-| 入力 | 文書マニフェスト、Registry、Command、Audit。 実行契機はMigration／Command適用後。 |
+| 目的 | 文書マニフェスト、Registry、処理指示の不変条件違反を0行Queryで検出する。 呼出元は文書マニフェスト JobとCI。 |
+| 入力 | 文書マニフェスト、Registry、処理指示、Audit。 実行契機はMigration／処理指示適用後。 |
 | 処理 | 重複ID、無効参照、承認不一致、未監査適用を列挙する。 情報制約へ依存せず実データを検査する。 違反種別とIDをRun証跡にする。 |
 | 出力 | 違反行Result。 全Queryが0行になる。 後続はPipeline起動。 |
 | 失敗・再実行 | Jobと公開を停止する。 読取専用で再実行できる。 |
@@ -9255,9 +9334,9 @@ SCIM Principalの存在確認はSQLだけでは完結しないため、登録時
 
 ###### 4.3.4.3.2 Bronze取込とPreflight検査
 
-本番メダリオンの想定出力も説明用であり、HashやBinaryは短縮する。重要なのは具体的な値そのものではなく、同じ`document_id`のバージョンがどの履歴表へ残り、どの条件でエラーまたはGoldへ分岐するかである。
+本番メダリオンの想定出力も説明用であり、HashやBinaryは短縮する。重要なのは具体的な値そのものではなく、同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）のバージョンがどの履歴表へ残り、どの条件でエラーまたはGoldへ分岐するかである。
 
-`bundles/ingestion/src/01_bronze_ingestion.sql`
+`bundles/ingestion/src/01_bronze_ingestion.sql`（原文と取込MetadataをBronze層へ受け入れ、後続処理の起点を作る取込処理）
 
 **実装概要**
 
@@ -9376,29 +9455,29 @@ INNER JOIN main.llmops.document_source_manifest AS manifest
 
 **想定出力サンプル（Bronze／隔離分岐）**
 
-| 出力Dataset | `source_uri` | `document_id` | `document_version_id`／`content_hash` | `preflight_error` | `reason` |
+| 出力Dataset | `source_uri`（原文または取得元を特定するURI） | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID）／`content_hash`（原文内容の同一性を確認するHash） | `preflight_error`（事前検査で検出したエラー内容） | `reason` |
 | --- | --- | --- | --- | --- | --- |
-| `internal_docs_source_events` | `/Volumes/prod/docs/rag-guide-v2.pdf` | なし | `hash-b72e...` | `NULL` | なし |
-| `internal_docs_bronze` | `/Volumes/prod/docs/rag-guide-v2.pdf` | `DOC-RAG-001` | `ver-b72e...` | `NULL` | なし |
-| `internal_docs_unregistered_sources` | `/Volumes/prod/docs/unregistered.pdf` | なし | `hash-91ac...` | `NULL` | `UNREGISTERED_SOURCE_URI` |
-| `internal_docs_bronze` | `/Volumes/prod/docs/empty.pdf` | `DOC-EMPTY-001` | `ver-001e...` | `EMPTY_FILE` | なし |
+| `internal_docs_source_events`（監視Volumeで検知した文書Source Eventを保持する中間Table） | `/Volumes/prod/docs/rag-guide-v2.pdf`（対象Resource／ソースを指す物理パス） | なし | `hash-b72e...` | `NULL`（SQLで値がないことを表す値） | なし |
+| `internal_docs_bronze`（本番原文Binaryと取込Metadataを追記保持するBronze Table） | `/Volumes/prod/docs/rag-guide-v2.pdf`（対象Resource／ソースを指す物理パス） | `DOC-RAG-001` | `ver-b72e...` | `NULL`（SQLで値がないことを表す値） | なし |
+| `internal_docs_unregistered_sources`（文書マニフェスト未登録のSourceを隔離するTable） | `/Volumes/prod/docs/unregistered.pdf`（対象Resource／ソースを指す物理パス） | なし | `hash-91ac...` | `NULL`（SQLで値がないことを表す値） | `UNREGISTERED_SOURCE_URI`（未登録・取得元・URIを指定する設定値／環境変数） |
+| `internal_docs_bronze`（本番原文Binaryと取込Metadataを追記保持するBronze Table） | `/Volumes/prod/docs/empty.pdf`（対象Resource／ソースを指す物理パス） | `DOC-EMPTY-001` | `ver-001e...` | `EMPTY_FILE`（empty・fileを指定する設定値／環境変数） | なし |
 
-登録済みでもPreflight失敗行はBronze履歴へ残るが、Parse Attemptの`WHERE preflight_error IS NULL`で停止する。未登録行は`document_id`を付与されず、明示再実行なしでは公開経路へ戻らない。
+登録済みでもPreflight失敗行はBronze履歴へ残るが、Parse Attemptの`WHERE preflight_error IS NULL`で停止する。未登録行は`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）を付与されず、明示再実行なしでは公開経路へ戻らない。
 
-PreflightはAI Functionを呼び出す前に判定できる拡張子、空File、100MB超過をSQLで記録する。Malware Scan、暗号化PDF、Digital Signatureなど外部Toolが必要な検査は、この宣言的変換へ埋め込まず取込前Jobまたは専用Scannerで実施する。`internal_docs_source_events`でFileを1回だけ読み、登録済みはBronze、未登録は隔離へ分岐する。後日の文書マニフェスト登録だけで過去Eventを公開せず、前節の明示再実行が新しいPathで通常経路へ戻す。
+PreflightはAI Functionを呼び出す前に判定できる拡張子、空File、100MB超過をSQLで記録する。Malware Scan、暗号化PDF、Digital Signatureなど外部Toolが必要な検査は、この宣言的変換へ埋め込まず取込前Jobまたは専用Scannerで実施する。`internal_docs_source_events`（監視Volumeで検知した文書Source Eventを保持する中間Table）でFileを1回だけ読み、登録済みはBronze、未登録は隔離へ分岐する。後日の文書マニフェスト登録だけで過去Eventを公開せず、前節の明示再実行が新しいPathで通常経路へ戻す。
 
 ###### 4.3.4.3.3 同一文書バージョンの重複排除
 
-`bundles/ingestion/src/01b_deduplicate_versions.py`
+`bundles/ingestion/src/01b_deduplicate_versions.py`（同一文書Versionの重複を排除し、文書Version単位の一意性を保証する前処理）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | 同じ`document_version_id`の代表Eventだけを下流へ渡す。呼出元はLakeflow Python Dataset。 |
+| 目的 | 同じ`document_version_id`（文書内容ごとの不変バージョンID）の代表Eventだけを下流へ渡す。呼出元はLakeflow Python Dataset。 |
 | 入力 | internal_docs_bronze。 実行契機はBronze Update時。 |
 | 処理 | Watermarkとバージョン IDでStreaming重複排除する。 document_idではなく内容バージョンをKeyにする。 Pipeline Metricで重複数を確認する。 |
-| 出力 | `internal_docs_unique_versions`。AI Parse対象がバージョンごとに1行になる。後続はParse Attempt。 |
+| 出力 | `internal_docs_unique_versions`（AI Functionへ渡す一意な文書Versionを保持する中間Table）。AI Parse対象がバージョンごとに1行になる。後続はParse Attempt。 |
 | 失敗・再実行 | 状態管理不能時はUpdateを失敗させる。 Checkpoint Stateで既処理バージョンを除外する。 |
 
 ```python
@@ -9432,30 +9511,30 @@ def internal_docs_unique_versions() -> DataFrame:
     )
 ```
 
-**想定出力サンプル（`internal_docs_unique_versions`）**
+**想定出力サンプル（`internal_docs_unique_versions`（AI Functionへ渡す一意な文書Versionを保持する中間Table））**
 
-| `document_id` | `document_version_id` | Bronze Event数 | 一意化後の出力数 | 説明 |
+| `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID） | Bronze Event数 | 一意化後の出力数 | 説明 |
 | --- | --- | ---: | ---: | --- |
 | `DOC-RAG-001` | `ver-b72e...` | 3 | 1 | 同じ論理文書・内容バージョンの再通知を1件へ集約 |
 | `DOC-RAG-001` | `ver-c83f...` | 1 | 1 | 改訂内容のため別バージョンとして保持 |
 | `DOC-OPS-010` | `ver-b72e...` | 1 | 1 | 内容Hashが同じでも論理文書IDが異なるため別文書として保持 |
 
-本番では`document_id`もKeyに含めるため、同じBinaryを別の論理文書として登録したケースを誤って消さない。
+本番では`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）もKeyに含めるため、同じBinaryを別の論理文書として登録したケースを誤って消さない。
 
-この処理だけはPythonへ残す。Streaming SQLの`DISTINCT`は全選択列を比較するため、`ingested_at`や`ingestion_run_id`が異なる同一バージョンを同一視できない。一方、`dropDuplicates(["document_id", "document_version_id"])`は必要なKeyを明示できる。Watermarkを付けると保持期限を超えた同一バージョンが再通過し得るため、本例は金融機関向けの重複課金・再現性を優先して無期限Stateを使用する。State量を監視し、AI Functionバージョン変更時の意図的な全件再処理は新Pipeline Releaseまたは計画したFull Refreshとして実施する。
+この処理だけはPythonへ残す。Streaming SQLの`DISTINCT`（distinctを指定する設定値／環境変数）は全選択列を比較するため、`ingested_at`（文書を取り込んだ時刻）や`ingestion_run_id`（文書取込Runを識別するID）が異なる同一バージョンを同一視できない。一方、`dropDuplicates(["document_id", "document_version_id"])`（文書IDとVersion IDをKeyにSpark上で重複除外する処理）は必要なKeyを明示できる。Watermarkを付けると保持期限を超えた同一バージョンが再通過し得るため、本例は金融機関向けの重複課金・再現性を優先して無期限Stateを使用する。State量を監視し、AI Functionバージョン変更時の意図的な全件再処理は新Pipeline Releaseまたは計画したFull Refreshとして実施する。
 
 ###### 4.3.4.3.4 Parse Attempt、成功、エラーの分離
 
-`bundles/ingestion/src/02_document_parse.sql`
+`bundles/ingestion/src/02_document_parse.sql`（文書本文・ページ・構造情報を解析し、後続の検索用整形へ渡す解析処理）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
 | 目的 | バージョンごとにai_parse_documentを一度実行し成功とエラーへ分ける。 呼出元はLakeflow SDP SQL。 |
-| 入力 | `internal_docs_unique_versions`。実行契機は一意化済みバージョンの到着時。 |
+| 入力 | `internal_docs_unique_versions`（AI Functionへ渡す一意な文書Versionを保持する中間Table）。実行契機は一意化済みバージョンの到着時。 |
 | 処理 | AI Function出力を物理保持し同じ結果から成功／失敗へ分岐する。 Temporary View再計算を避け相互排他にする。 Attemptとエラー列を証跡にする。 |
-| 出力 | `parse_attempts`、`parsed`、`parse_errors`。成功バージョンだけParsedへ進む。後続はSearch Prep。 |
+| 出力 | `parse_attempts`（文書解析AI Functionの試行結果を保持するDataset）、`parsed`、`parse_errors`（文書解析に失敗した文書Versionを保持するDataset）。成功バージョンだけParsedへ進む。後続はSearch Prep。 |
 | 失敗・再実行 | 失敗バージョンをPrep／Goldへ進めない。 Attempt TableとCheckpointで重複実行を防ぐ。 |
 
 ```sql
@@ -9607,20 +9686,20 @@ WHERE attempt.is_quarantined = true;
 
 **想定出力サンプル（Parse Attempt／成功／エラー）**
 
-| 出力Dataset | `document_id` | `document_version_id` | `page_count`／`error_code` | `ai_parse_document_version` | `error_class` |
+| 出力Dataset | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID） | `page_count`（ページ・件数を表す件数項目）／`error_code`（処理失敗の機械判定用コード） | `ai_parse_document_version`（文書解析AI FunctionのVersion） | `error_class`（エラー・区分を保持する項目） |
 | --- | --- | --- | --- | --- | --- |
-| `internal_docs_parse_attempts` | `DOC-RAG-001` | `ver-b72e...` | `parsed_document.pages=18` | `2.0` | なし |
-| `internal_docs_parsed` | `DOC-RAG-001` | `ver-b72e...` | `18` | `2.0` | なし |
-| `internal_docs_parse_errors` | `DOC-EMPTY-001` | `ver-001e...` | `EMPTY_FILE` | `2.0` | `PERMANENT` |
-| `internal_docs_parse_errors` | `DOC-SCAN-009` | `ver-ff12...` | `PARSE_ERROR_STATUS` | `2.0` | `TRANSIENT` |
+| `internal_docs_parse_attempts`（文書解析結果とエラーを一度だけ保持する試行結果Table） | `DOC-RAG-001` | `ver-b72e...` | `parsed_document.pages=18` | `2.0` | なし |
+| `internal_docs_parsed`（Parse成功結果を保持するTable） | `DOC-RAG-001` | `ver-b72e...` | `18` | `2.0` | なし |
+| `internal_docs_parse_errors`（Parse失敗結果を隔離して保持するTable） | `DOC-EMPTY-001` | `ver-001e...` | `EMPTY_FILE`（empty・fileを指定する設定値／環境変数） | `2.0` | `PERMANENT`（permanentを指定する設定値／環境変数） |
+| `internal_docs_parse_errors`（Parse失敗結果を隔離して保持するTable） | `DOC-SCAN-009` | `ver-ff12...` | `PARSE_ERROR_STATUS`（Parse・エラー・状態を指定する設定値／環境変数） | `2.0` | `TRANSIENT`（transientを指定する設定値／環境変数） |
 
-成功バージョンは`internal_docs_parsed`だけ、失敗バージョンは`internal_docs_parse_errors`だけへ出る。エラー行にも入力バージョンとFunctionバージョンが残るため、同じ条件での再現と計画再試行が可能になる。
+成功バージョンは`internal_docs_parsed`（Parse成功結果を保持するTable）だけ、失敗バージョンは`internal_docs_parse_errors`（Parse失敗結果を隔離して保持するTable）だけへ出る。エラー行にも入力バージョンとFunctionバージョンが残るため、同じ条件での再現と計画再試行が可能になる。
 
-`ai_parse_document` 2.xの`error_status`は配列であり、ページ数は`document.pages`から数える。旧実装のように`error_status`を`STRING`、`metadata.page_count`を`INT`として直接取得しない。`internal_docs_parse_errors`には監査可能なエラー JSONと処理バージョンを追加し、再試行対象を`document_id`と`document_version_id`で特定する。
+`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function） 2.xの`error_status`（処理エラーの分類・状態）は配列であり、ページ数は`document.pages`（ai_parse_document結果内のページ配列）から数える。旧実装のように`error_status`（処理エラーの分類・状態）を`STRING`（stringを指定する設定値／環境変数）、`metadata.page_count`（旧Parse Metadataでページ数を表すField）を`INT`（intを指定する設定値／環境変数）として直接取得しない。`internal_docs_parse_errors`（Parse失敗結果を隔離して保持するTable）には監査可能なエラー JSONと処理バージョンを追加し、再試行対象を`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）と`document_version_id`（文書内容ごとの不変バージョンID）で特定する。
 
 ###### 4.3.4.3.5 Prep Attempt、成功、エラーの分離
 
-`bundles/ingestion/src/03_search_prep.sql`
+`bundles/ingestion/src/03_search_prep.sql`（解析結果を検索向けに正規化・整形し、Chunk生成へ渡す検索前処理）
 
 **実装概要**
 
@@ -9629,7 +9708,7 @@ WHERE attempt.is_quarantined = true;
 | 目的 | Parse成功版へai_prep_searchを一度実行し成功とエラーへ分ける。 呼出元はLakeflow SDP SQL。 |
 | 入力 | internal_docs_parsed。 実行契機はParsed バージョン到着時。 |
 | 処理 | Prep出力を物理保持しエラー有無で分岐する。 同じParse結果の再評価を避け空Chunkも失敗扱いにする。 Attemptとエラーを証跡にする。 |
-| 出力 | `prep_attempts`、`prepared`、`prep_errors`。成功バージョンだけChunk展開へ進む。後続はSilver Chunk。 |
+| 出力 | `prep_attempts`（検索用整形AI Functionの試行結果を保持するDataset）、`prepared`、`prep_errors`（検索用整形に失敗した文書Versionを保持するDataset）。成功バージョンだけChunk展開へ進む。後続はSilver Chunk。 |
 | 失敗・再実行 | 失敗バージョンをGoldへ流さない。 バージョン KeyとCheckpointで重複を防ぐ。 |
 
 ```sql
@@ -9721,19 +9800,19 @@ WHERE attempt.is_quarantined = true;
 
 **想定出力サンプル（Prep Attempt／成功／エラー）**
 
-| 出力Dataset | `document_id` | `document_version_id` | Chunk数／`error_message` | `ai_prep_search_version` | `retry_count` |
+| 出力Dataset | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID） | Chunk数／`error_message`（処理失敗の理由を保持する項目） | `ai_prep_search_version`（検索用整形AI FunctionのVersion） | `retry_count`（再試行・件数を表す件数項目） |
 | --- | --- | --- | --- | --- | ---: |
-| `internal_docs_prep_attempts` | `DOC-RAG-001` | `ver-b72e...` | `document.contents=7` | `2.0` | なし |
-| `internal_docs_prepared` | `DOC-RAG-001` | `ver-b72e...` | 7 Chunk | `2.0` | なし |
-| `internal_docs_prep_errors` | `DOC-TABLE-004` | `ver-7a21...` | `{"error_code":"PREP_FAILED"}` | `2.0` | 0 |
+| `internal_docs_prep_attempts`（検索用整形結果とエラーを一度だけ保持する試行結果Table） | `DOC-RAG-001` | `ver-b72e...` | `document.contents=7` | `2.0` | なし |
+| `internal_docs_prepared`（Prep成功結果を保持するTable） | `DOC-RAG-001` | `ver-b72e...` | 7 Chunk | `2.0` | なし |
+| `internal_docs_prep_errors`（Prep失敗結果を隔離して保持するTable） | `DOC-TABLE-004` | `ver-7a21...` | `{"error_code":"PREP_FAILED"}` | `2.0` | 0 |
 
 Parse失敗バージョンはこの一覧へ現れない。Prep失敗バージョンもSilver Chunkへ展開されず、エラーテーブルで再試行対象として管理される。
 
-成功表とエラー表は物理化済み`internal_docs_prep_attempts`だけを参照するため、`ai_prep_search`をそれぞれで再実行しない。Parse失敗バージョンはPrep Attemptの入力にならず、Prep失敗バージョンはChunk Silverの入力にならない。
+成功表とエラー表は物理化済み`internal_docs_prep_attempts`（検索用整形結果とエラーを一度だけ保持する試行結果Table）だけを参照するため、`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）をそれぞれで再実行しない。Parse失敗バージョンはPrep Attemptの入力にならず、Prep失敗バージョンはChunk Silverの入力にならない。
 
 ###### 4.3.4.3.6 Parse／Prep隔離の調査・復旧Runbook
 
-本番では、`internal_docs_parse_errors`／`internal_docs_prep_errors`へ入った時点でそのVersionを**技術的に公開不可**として扱い、`document_version_registry.parse_status`／`prep_status`を`failed`へ同期する。隔離行を削除したり、公開バージョン参照を失敗Versionへ切り替えたりしない。
+本番では、`internal_docs_parse_errors`（Parse失敗結果を隔離して保持するTable）／`internal_docs_prep_errors`（Prep失敗結果を隔離して保持するTable）へ入った時点でそのVersionを**技術的に公開不可**として扱い、`document_version_registry.parse_status`（文書Version管理台帳上のParse処理状態列）／`prep_status`（検索用整形処理の現在状態）を`failed`（失敗を表す状態値）へ同期する。隔離行を削除したり、公開バージョン参照を失敗Versionへ切り替えたりしない。
 
 Primary OwnerはData Engineering担当者とする。原文書自体の修正が必要な場合だけ文書管理者／ドメイン担当者へ戻し、同じ時刻・同じProcessor Versionで多数発生する場合はPlatform／Databricks Service側の障害またはProcessor RegressionとしてService OwnerへEscalationする。
 
@@ -9826,18 +9905,18 @@ ORDER BY error_count DESC, last_seen_at DESC;
 
 | 原因区分 | 典型例 | 確認内容 | 次Action |
 | --- | --- | --- | --- |
-| `SOURCE_PERMANENT` | 空File、非対応形式、破損、暗号化、500ページ超過等 | Staging／Bronzeの原文、Preflight、Scanner結果、ページ数 | 同じVersionを自動再試行しない。原文書を修正・変換・分割し、必要な審査後に新Versionとして再登録 |
-| `PROCESSOR_TRANSIENT` | `PARSE_NULL_RESULT`、単発の`PARSE_ERROR_STATUS`、Prep NULL／Error | 同形式の他文書、同時間帯、Model／Service状態、同Processor Version | 原文が正常で単発なら、専用再試行Jobまたは計画した再処理で限定再試行 |
-| `PROCESSOR_REGRESSION` | Processor Version変更後に同種エラーが急増 | 変更前後Version、形式別エラー率、Staging再現 | 個別再試行を止める。新Processor Versionの利用停止／修正、新Pipeline Releaseで影響範囲を再処理 |
-| `PIPELINE_RULE` | 生Attemptは利用可能だが隔離条件・Schema解釈が誤り | Attempt出力、`is_quarantined`条件、Schema Version | 判定ロジックを修正し、保存済みAttemptから再分類。AI Functionを再呼出ししない |
+| `SOURCE_PERMANENT`（入力文書側の恒久的原因を表す分類値） | 空File、非対応形式、破損、暗号化、500ページ超過等 | Staging／Bronzeの原文、Preflight、Scanner結果、ページ数 | 同じVersionを自動再試行しない。原文書を修正・変換・分割し、必要な審査後に新Versionとして再登録 |
+| `PROCESSOR_TRANSIENT`（処理系の一時的障害を表す分類値） | `PARSE_NULL_RESULT`（Parse・null・結果を指定する設定値／環境変数）、単発の`PARSE_ERROR_STATUS`（Parse・エラー・状態を指定する設定値／環境変数）、Prep NULL／Error | 同形式の他文書、同時間帯、Model／Service状態、同Processor Version | 原文が正常で単発なら、専用再試行Jobまたは計画した再処理で限定再試行 |
+| `PROCESSOR_REGRESSION`（処理ロジックの退行を表す分類値） | Processor Version変更後に同種エラーが急増 | 変更前後Version、形式別エラー率、Staging再現 | 個別再試行を止める。新Processor Versionの利用停止／修正、新Pipeline Releaseで影響範囲を再処理 |
+| `PIPELINE_RULE`（Pipeline品質Rule違反を表す分類値） | 生Attemptは利用可能だが隔離条件・Schema解釈が誤り | Attempt出力、`is_quarantined`（正常処理経路から隔離するかを示す項目）条件、Schema Version | 判定ロジックを修正し、保存済みAttemptから再分類。AI Functionを再呼出ししない |
 
 ParseとPrepでは見る場所を分ける。
 
 | Stage | 最低限確認するもの | 判断ポイント |
 | --- | --- | --- |
-| Parse | 原文Binary、Preflight、`error_code`、`error_message`、`ai_parse_document_version`、ページ数 | 原文書を人が読めるのに失敗しているか。同形式の他文書でも同じ失敗が出るか |
-| Prep | 対応するParse成功状態、Parseページ数、`error_message`、`ai_prep_search_version` | Parse出力自体が不十分なのか、正常なParse出力をPrepだけ処理できないのか |
-| 共通 | `content_hash`、`source_uri`、`occurred_at`、同Versionの件数 | 同じ入力を何度も処理しているのか、特定Release／時間帯に集中しているのか |
+| Parse | 原文Binary、Preflight、`error_code`（処理失敗の機械判定用コード）、`error_message`（処理失敗の理由を保持する項目）、`ai_parse_document_version`（文書解析AI FunctionのVersion）、ページ数 | 原文書を人が読めるのに失敗しているか。同形式の他文書でも同じ失敗が出るか |
+| Prep | 対応するParse成功状態、Parseページ数、`error_message`（処理失敗の理由を保持する項目）、`ai_prep_search_version`（検索用整形AI FunctionのVersion） | Parse出力自体が不十分なのか、正常なParse出力をPrepだけ処理できないのか |
+| 共通 | `content_hash`（原文内容の同一性を確認するHash）、`source_uri`（原文または取得元を特定するURI）、`occurred_at`（監視・エラーイベントが発生した時刻）、同Versionの件数 | 同じ入力を何度も処理しているのか、特定Release／時間帯に集中しているのか |
 
 **3. 再分類、再試行、原文書修正を混同しない**
 
@@ -9862,17 +9941,17 @@ flowchart TD
 - **原文書修正**は、新しい内容Hashを持つ文書Versionとして通常のStaging→Scanner→文書審査→Volume→Pipeline経路へ戻す。失敗した旧Versionを上書きしない。
 - **Processor Regression**では、失敗文書を1件ずつ再試行しない。影響範囲を固定してProcessor／Pipelineを修正し、Staging検証後に計画した新Pipeline ReleaseまたはFull Refreshで再処理する。
 
-本資料のBaselineでは、Parse／Prepの**専用自動Retry Jobを必須機能にはしていない**。隔離件数が少ない間は人が一次分類し、原文書修正またはProcessor修正で解消する。専用Retry Jobを追加する場合も、対象を`document_id`＋`document_version_id`で固定し、最大試行回数、対象Processor Version、Job Run ID、前回エラー、結果をRun Logへ残し、無制限再試行を禁止する。
+本資料のBaselineでは、Parse／Prepの**専用自動Retry Jobを必須機能にはしていない**。隔離件数が少ない間は人が一次分類し、原文書修正またはProcessor修正で解消する。専用Retry Jobを追加する場合も、対象を`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）＋`document_version_id`（文書内容ごとの不変バージョンID）で固定し、最大試行回数、対象Processor Version、Job Run ID、前回エラー、結果をRun Logへ残し、無制限再試行を禁止する。
 
-`internal_docs_parse_errors.retry_count`／`internal_docs_prep_errors.retry_count`は現行Baseline SQLでは初回隔離時に`0`で作成される。Streaming隔離行を後から更新して履歴正本にする設計ではないため、**Baselineでは実際の再試行履歴の正本をLakeflow Job Run／Run Logとする**。将来専用Retry Jobを常設化する場合は、Retry Attempt専用の追記ログを追加するか、Registryへ集約値を同期し、隔離Tableの初回エラー履歴を上書きしない。
+`internal_docs_parse_errors.retry_count`（Parse失敗行に初期値として保持する再試行回数列）／`internal_docs_prep_errors.retry_count`（Prep失敗行に初期値として保持する再試行回数列）は現行Baseline SQLでは初回隔離時に`0`で作成される。Streaming隔離行を後から更新して履歴正本にする設計ではないため、**Baselineでは実際の再試行履歴の正本をLakeflow Job Run／Run Logとする**。将来専用Retry Jobを常設化する場合は、Retry Attempt専用の追記ログを追加するか、Registryへ集約値を同期し、隔離Tableの初回エラー履歴を上書きしない。
 
 **4. 調査結果として最低限残す情報**
 
 | 項目 | 保存先 | 例 |
 | --- | --- | --- |
-| 対象 | Run Log／Issue | `document_id`、`document_version_id`、Stage |
+| 対象 | Run Log／Issue | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID）、`document_version_id`（文書内容ごとの不変バージョンID）、Stage |
 | 再現条件 | Run Log | Source Hash、Processor Version、Pipeline Release、発生時刻 |
-| 原因分類 | Run Log／必要時品質改善課題 | `SOURCE_PERMANENT`、`PROCESSOR_TRANSIENT`、`PROCESSOR_REGRESSION`、`PIPELINE_RULE` |
+| 原因分類 | Run Log／必要時品質改善課題 | `SOURCE_PERMANENT`（入力文書側の恒久的原因を表す分類値）、`PROCESSOR_TRANSIENT`（処理系の一時的障害を表す分類値）、`PROCESSOR_REGRESSION`（処理ロジックの退行を表す分類値）、`PIPELINE_RULE`（Pipeline品質Rule違反を表す分類値） |
 | 処置 | Run Log／Workflow | 原文書修正、新Version登録、再分類、限定再試行、Processor修正 |
 | 再試行証跡 | Lakeflow Job Run／Run Log | Retry Job Run ID、試行番号、結果 |
 | 終了判断 | Registry／Workflow／Issue | 技術成功、Version却下、修正版待ち、Processor修正版待ち |
@@ -9881,7 +9960,7 @@ flowchart TD
 
 ###### 4.3.4.3.7 Chunk Silver履歴
 
-`bundles/ingestion/src/04_chunks_silver.sql`
+`bundles/ingestion/src/04_chunks_silver.sql`（検索・回答に使うChunkを生成し、Chunk本文・出典・Version MetadataをSilver層へ整える処理）
 
 **実装概要**
 
@@ -9889,9 +9968,9 @@ flowchart TD
 | --- | --- |
 | 目的 | Prep結果を検索・回答用途のChunk履歴へ展開する。 呼出元はLakeflow SDP SQL。 |
 | 入力 | internal_docs_prepared。 実行契機はPrepared バージョン到着時。 |
-| 処理 | `variant_explode`で行化し、論理Chunk IDとバージョン付きChunk IDを生成する。位置IDと文書バージョン＋位置Keyを分ける。Retriever Spanが`chunk_version_id`を参照する。 |
+| 処理 | `variant_explode`（ai_parse_documentのVariant結果を行へ展開する処理）で行化し、論理Chunk IDとバージョン付きChunk IDを生成する。位置IDと文書バージョン＋位置Keyを分ける。Retriever Spanが`chunk_version_id`（検索Chunkの内容・版を一意に識別するID）を参照する。 |
 | 出力 | internal_docs_chunks_silver。 未承認版を含む成功Chunk履歴を残す。 後続はGold Current。 |
-| 失敗・再実行 | 不正VARIANTをGoldへ出さない。`chunk_version_id`で重複排除する。 |
+| 失敗・再実行 | 不正VARIANTをGoldへ出さない。`chunk_version_id`（検索Chunkの内容・版を一意に識別するID）で重複排除する。 |
 
 ```sql
 -- Silver層。
@@ -9962,20 +10041,20 @@ SELECT
 FROM identified_chunks AS identified;
 ```
 
-**想定出力サンプル（`internal_docs_chunks_silver`）**
+**想定出力サンプル（`internal_docs_chunks_silver`（Version付き検索Chunk履歴を保持するSilver Table））**
 
-| `chunk_logical_id` | `chunk_version_id` | `document_id` | `document_version_id` | `chunk_to_embed` | `chunk_to_retrieve` | `allowed_principals` | `page_number` | `page_image_uri` |
+| `chunk_logical_id`（文書内で同じ論理Chunk位置を識別するID） | `chunk_version_id`（検索Chunkの内容・版を一意に識別するID） | `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | `document_version_id`（文書内容ごとの不変バージョンID） | `chunk_to_embed`（Embedding生成へ渡すChunk本文） | `chunk_to_retrieve`（検索後にLLMへ返すChunk本文） | `allowed_principals`（この文書を検索できるUser／Group識別子の一覧） | `page_number`（根拠情報が存在するページ番号） | `page_image_uri`（ページ画像の保存先を指すURI） |
 | --- | --- | --- | --- | --- | --- | --- | ---: | --- |
 | `POS-000000` | `chk-a110...` | `DOC-RAG-001` | `ver-b72e...` | `RAG アーキテクチャ AI Search...` | `検索にはDatabricks AI Searchを利用する。` | `[grp-rag-users]` | 2 | `/Volumes/main/llmops/internal_docs_images/.../page-2.png` |
 | `POS-000001` | `chk-b220...` | `DOC-RAG-001` | `ver-b72e...` | `ACL Filter entitlement...` | `検索前に利用者GroupからACL Filterを生成する。` | `[grp-rag-users]` | 3 | `/Volumes/main/llmops/internal_docs_images/.../page-3.png` |
 
-同じ`chunk_logical_id`でも文書バージョンが変われば`chunk_version_id`は変わる。ここにあるACLやTitleは取込時点の監査値であり、公開値はGoldで文書マニフェスト最新値へ置換される。
+同じ`chunk_logical_id`（文書内で同じ論理Chunk位置を識別するID）でも文書バージョンが変われば`chunk_version_id`（検索Chunkの内容・版を一意に識別するID）は変わる。ここにあるACLやTitleは取込時点の監査値であり、公開値はGoldで文書マニフェスト最新値へ置換される。
 
-`variant_explode`が返す配列位置だけに依存せず、`ai_prep_search`の`chunk_position`を優先し、欠損時だけ`variant_explode.pos`へFallbackする。`chunk_logical_id`は文書内位置、`chunk_version_id`は`document_id`、`document_version_id`、`chunk_logical_id`から決定論的に生成する。`page_image_uri`は`ai_prep_search`が引き継いだ`pages[].image_uri`の代表値であり、検索結果から必要なページ画像を特定するために使う。画像自体をEmbeddingへ直接入れる設計ではない。
+`variant_explode`（ai_parse_documentのVariant結果を行へ展開する処理）が返す配列位置だけに依存せず、`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）の`chunk_position`（文書内でのChunk位置を示す項目）を優先し、欠損時だけ`variant_explode.pos`（Variant展開後の要素位置を表すField）へFallbackする。`chunk_logical_id`（文書内で同じ論理Chunk位置を識別するID）は文書内位置、`chunk_version_id`（検索Chunkの内容・版を一意に識別するID）は`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）、`document_version_id`（文書内容ごとの不変バージョンID）、`chunk_logical_id`（文書内で同じ論理Chunk位置を識別するID）から決定論的に生成する。`page_image_uri`（ページ画像の保存先を指すURI）は`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）が引き継いだ`pages[].image_uri`（解析結果内のページ画像参照Field）の代表値であり、検索結果から必要なページ画像を特定するために使う。画像自体をEmbeddingへ直接入れる設計ではない。
 
 ###### 4.3.4.3.8 文書マニフェスト公開条件とGold Current
 
-`bundles/ingestion/src/05_gold_current.sql`
+`bundles/ingestion/src/05_gold_current.sql`（本番で現在検索対象にできる承認済み・現行・未削除ChunkだけをGold層へ確定する処理）
 
 **実装概要**
 
@@ -10088,47 +10167,47 @@ INNER JOIN active_manifest AS manifest
   ON chunks.document_id = manifest.document_id;
 ```
 
-**想定出力サンプル（`internal_docs_current_mv`）**
+**想定出力サンプル（`internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View））**
 
-| `document_id` | Silverのバージョン | 文書マニフェストの`approved_document_version_id` | Goldへ公開 | 最新ACL | 除外／公開理由 |
+| `document_id`（改訂をまたいで同じ論理文書を識別する不変ID） | Silverのバージョン | 文書マニフェストの`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照） | Goldへ公開 | 最新ACL | 除外／公開理由 |
 | --- | --- | --- | --- | --- | --- |
 | `DOC-RAG-001` | `ver-a81f...`、`ver-b72e...` | `ver-a81f...` | `ver-a81f...`の全Chunk | `[grp-rag-users, grp-audit]` | v2取込済みでも参照がv1のためv1を維持 |
 | `DOC-OPS-010` | `ver-c83f...` | `ver-c83f...` | なし | `[grp-ops]` | `approval_status='pending'`のため除外 |
-| `DOC-OLD-003` | `ver-d94a...` | `ver-d94a...` | なし | `[grp-legacy]` | `valid_to`経過のため除外 |
-| `DOC-DEL-007` | `ver-e05b...` | `ver-e05b...` | なし | `[grp-rag-users]` | `is_deleted=true`のため除外 |
+| `DOC-OLD-003` | `ver-d94a...` | `ver-d94a...` | なし | `[grp-legacy]` | `valid_to`（そのVersionが有効だった終了時刻）経過のため除外 |
+| `DOC-DEL-007` | `ver-e05b...` | `ver-e05b...` | なし | `[grp-rag-users]` | `is_deleted=true`（論理削除済みを表す状態）のため除外 |
 
 `DOC-RAG-001`のTitleやACLはSilver取込時値ではなく、Gold計算時の文書マニフェスト最新値になる。承認参照を`ver-b72e...`へ切り替えると、次回Materialized View更新でv2の全Chunkへ切り替わる。
 
-`QUALIFY ROW_NUMBER()`でDocument単位に、人が公開Pointerで選んだVersion候補を1件へ絞り、そのVersionの全ChunkへJoinして戻す。これはDocument単位で1 Versionを選択する処理であり、Document単位で1 Chunkを選択する処理ではない。Chunk行へ直接`ROW_NUMBER()`を付けると文書ごとに1 Chunkしか残らないため、Version候補の粒度を表す`latest_versions` CTEは残す。Gold生成時に文書マニフェストをBatch Readすることで、取込後に変更されたACL、Title、公開範囲、削除状態、有効期間を最新値へ差し替える。`approved_document_version_id`と一致しないバージョンは、技術処理やVersion審査に合格済みであっても現在の本番検索へ公開しない。
+`QUALIFY ROW_NUMBER()`（Window関数の順位で行を絞り込むSQLパターン）でDocument単位に、人が公開Pointerで選んだVersion候補を1件へ絞り、そのVersionの全ChunkへJoinして戻す。これはDocument単位で1 Versionを選択する処理であり、Document単位で1 Chunkを選択する処理ではない。Chunk行へ直接`ROW_NUMBER()`（行へ順序番号を付けるSQL Window関数）を付けると文書ごとに1 Chunkしか残らないため、Version候補の粒度を表す`latest_versions`（論理文書ごとの最新Version候補を保持する中間Dataset） CTEは残す。Gold生成時に文書マニフェストをBatch Readすることで、取込後に変更されたACL、Title、公開範囲、削除状態、有効期間を最新値へ差し替える。`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）と一致しないバージョンは、技術処理やVersion審査に合格済みであっても現在の本番検索へ公開しない。
 
-`ai_prep_search`の`chunk_to_embed`は検索精度向上用の文脈を含み、`chunk_to_retrieve`は回答コンテキストとして利用する原文Chunkである。回答生成へ`chunk_to_embed`をそのまま渡すと付加情報と原文の境界が曖昧になるため、検索と回答で列を分ける。
+`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）の`chunk_to_embed`（Embedding生成へ渡すChunk本文）は検索精度向上用の文脈を含み、`chunk_to_retrieve`（検索後にLLMへ返すChunk本文）は回答コンテキストとして利用する原文Chunkである。回答生成へ`chunk_to_embed`（Embedding生成へ渡すChunk本文）をそのまま渡すと付加情報と原文の境界が曖昧になるため、検索と回答で列を分ける。
 
-新しいファイルバージョンを取り込んだだけではCurrentへ公開しない。文書管理者／ドメイン担当者がUIで解析結果を確認し、現在公開するVersionを明示的に選択した後、Manifest Executorが`approved_document_version_id`を更新した時点でGold Currentが切り替わる。これにより、論理文書が公開中のままFileだけ差し替えられて未選択Versionが公開されることを防ぐ。
+新しいファイルバージョンを取り込んだだけではCurrentへ公開しない。文書管理者／ドメイン担当者がUIで解析結果を確認し、現在公開するVersionを明示的に選択した後、Manifest Executorが`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）を更新した時点でGold Currentが切り替わる。これにより、論理文書が公開中のままFileだけ差し替えられて未選択Versionが公開されることを防ぐ。
 
-`internal_docs.ai_parse_document_version`、`internal_docs.ai_prep_search_version`、`internal_docs.chunk_schema_version`は`ingestion` Bundleの`configuration`で固定する。Figure descriptionと`image_uri`を使う本資料のマルチモーダル経路では`ai_parse_document`を`2.0`へ固定する。現行要件では`ai_parse_document`はDatabricks Runtime 17.3以上、`ai_prep_search`はDatabricks Runtime 18.2以上、ServerlessはEnvironment Version 3以上を必要とするため、Pipeline Computeはより厳しい`ai_prep_search`側へ合わせる。`ai_parse_document`は最大500ページ・100MBの制約があるため、サイズは事前、ページ数は解析直後に検査する。
+`internal_docs.ai_parse_document_version`（Pipelineへ渡す文書解析AI Function Version設定）、`internal_docs.ai_prep_search_version`（Pipelineへ渡す検索用整形AI Function Version設定）、`internal_docs.chunk_schema_version`（Pipelineへ渡すChunk Schema Version設定）は`ingestion`（文書取込・解析・検索公開を配備するDAB Bundle名） Bundleの`configuration`（DAB／Runtimeへ渡す構成情報）で固定する。Figure descriptionと`image_uri`（画像・URIを表す参照先）を使う本資料のマルチモーダル経路では`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）を`2.0`へ固定する。現行要件では`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）はDatabricks Runtime 17.3以上、`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）はDatabricks Runtime 18.2以上、ServerlessはEnvironment Version 3以上を必要とするため、Pipeline Computeはより厳しい`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）側へ合わせる。`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）は最大500ページ・100MBの制約があるため、サイズは事前、ページ数は解析直後に検査する。
 
-対応形式、暗号化PDF、Digital Signature、Malware Scanも組織Policyで追加する。AI Functionが行結果として返す`error_status`は隔離へ保存できる一方、無効なBinaryなど関数自体が例外を送出する入力はStreaming Update全体を失敗させる可能性がある。これを行単位で隔離する必要がある組織では、AI Function前のScannerで不正Fileを除外する。一時エラーの再試行は同じ本番Pipelineへ行を再投入せず、エラーテーブルを入力に処理バージョン付きの専用再試行 Jobまたは計画した新Pipeline Releaseで実施し、重複課金と無制限再試行を防ぐ。
+対応形式、暗号化PDF、Digital Signature、Malware Scanも組織Policyで追加する。AI Functionが行結果として返す`error_status`（処理エラーの分類・状態）は隔離へ保存できる一方、無効なBinaryなど関数自体が例外を送出する入力はStreaming Update全体を失敗させる可能性がある。これを行単位で隔離する必要がある組織では、AI Function前のScannerで不正Fileを除外する。一時エラーの再試行は同じ本番Pipelineへ行を再投入せず、エラーテーブルを入力に処理バージョン付きの専用再試行 Jobまたは計画した新Pipeline Releaseで実施し、重複課金と無制限再試行を防ぐ。
 
-公開Table名と、`internal_docs_bronze`、`internal_docs_parsed`、`internal_docs_prepared`、`internal_docs_chunks_silver`、`internal_docs_current_mv`、`internal_docs_search_sync`の既存列は維持する。変更は次に限定する。
+公開Table名と、`internal_docs_bronze`（本番原文Binaryと取込Metadataを追記保持するBronze Table）、`internal_docs_parsed`（Parse成功結果を保持するTable）、`internal_docs_prepared`（Prep成功結果を保持するTable）、`internal_docs_chunks_silver`（Version付き検索Chunk履歴を保持するSilver Table）、`internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View）、`internal_docs_search_sync`（AI Searchへ同期する現在公開Chunkを保持するTable）の既存列は維持する。変更は次に限定する。
 
 | 対象 | 変更 | 理由と影響 |
 | --- | --- | --- |
-| `document_source_manifest` | Unity Catalog Delta TableのDDLを追加 | 人が決定した論理文書状態、ACL、公開バージョンPointerの正本。Goldの既存出力Schemaは変更しない。 |
-| `document_intake_scan_results` | Unity Catalog Delta Tableを追加 | 外部Malware Scannerを採用する場合だけ信頼済み結果を保持する。採用しない場合は`not_required`のPolicy根拠を保持する。 |
-| `document_version_registry` | Unity Catalog Delta Tableを追加 | バージョン単位の技術Statusと審査履歴を文書マニフェストから分離する。 |
-| `document_reconciliation_candidates` | 本番導入後の追加Migration | 5.2.4の開始条件を満たす場合だけ作成し、差分候補の記録に限定する。 |
-| `internal_docs_source_events` | Private Streaming Datasetを新規追加 | `read_files` を1回だけ実行し、登録済み／未登録分岐で再読しない。 |
-| `internal_docs_unregistered_sources` | 隔離 Streaming Tableを新規追加 | 文書マニフェスト未登録FileのPath、Hash、Size、検知時刻、Run、理由を監査・再実行用に保持する。 |
-| `internal_docs_unique_versions` | Private Datasetを新規追加 | AI Function前のバージョン重複排除専用。Pipeline外のConsumerには公開しない。 |
-| `internal_docs_parse_attempts` | Private Datasetを新規追加 | Parse結果を1回だけ物理保持する。Pipeline外のConsumerには公開しない。 |
-| `internal_docs_prep_attempts` | Private Datasetを新規追加 | Prep結果を1回だけ物理保持する。Pipeline外のConsumerには公開しない。 |
-| `internal_docs_parse_quality` | Private Streaming Datasetを新規追加 | 物理保持済みParse結果へ`valid_parse_result`を適用し、合否件数を計測しながら成功／隔離を同じ条件で分岐する。 |
-| `internal_docs_prep_quality` | Private Streaming Datasetを新規追加 | 物理保持済みPrep結果へ`valid_prep_result`を適用し、NULL・エラー・空Chunkを成功経路から隔離する。 |
-| `internal_docs_parsed` | `ai_parse_document_version`を追加 | 文書バージョン管理台帳がParse成功時のFunctionバージョンを監査できるようにする。既存列は削除しない。 |
-| `internal_docs_parse_errors` | `content_hash`、`error_message`、`ai_parse_document_version`を追加 | エラー再試行と監査で入力内容・詳細・処理バージョンを特定するため。既存列は削除しない。 |
-| `internal_docs_prep_errors` | `content_hash`、`ai_prep_search_version`を追加 | エラー再試行と監査で入力内容・処理バージョンを特定するため。既存列は削除しない。 |
+| `document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable） | Unity Catalog Delta TableのDDLを追加 | 人が決定した論理文書状態、ACL、公開バージョンPointerの正本。Goldの既存出力Schemaは変更しない。 |
+| `document_intake_scan_results`（外部Scannerを採用する場合の信頼済み検査結果Table） | Unity Catalog Delta Tableを追加 | 外部Malware Scannerを採用する場合だけ信頼済み結果を保持する。採用しない場合は`not_required`（外部検査が不要だったことを表す状態値）のPolicy根拠を保持する。 |
+| `document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table） | Unity Catalog Delta Tableを追加 | バージョン単位の技術Statusと審査履歴を文書マニフェストから分離する。 |
+| `document_reconciliation_candidates`（文書状態の差分確認候補を保持するTable） | 本番導入後の追加Migration | 5.2.4の開始条件を満たす場合だけ作成し、差分候補の記録に限定する。 |
+| `internal_docs_source_events`（監視Volumeで検知した文書Source Eventを保持する中間Table） | Private Streaming Datasetを新規追加 | `read_files`（DatabricksでVolume等からFileを読み込むStreaming Source） を1回だけ実行し、登録済み／未登録分岐で再読しない。 |
+| `internal_docs_unregistered_sources`（文書マニフェスト未登録のSourceを隔離するTable） | 隔離 Streaming Tableを新規追加 | 文書マニフェスト未登録FileのPath、Hash、Size、検知時刻、Run、理由を監査・再実行用に保持する。 |
+| `internal_docs_unique_versions`（AI Functionへ渡す一意な文書Versionを保持する中間Table） | Private Datasetを新規追加 | AI Function前のバージョン重複排除専用。Pipeline外のConsumerには公開しない。 |
+| `internal_docs_parse_attempts`（文書解析結果とエラーを一度だけ保持する試行結果Table） | Private Datasetを新規追加 | Parse結果を1回だけ物理保持する。Pipeline外のConsumerには公開しない。 |
+| `internal_docs_prep_attempts`（検索用整形結果とエラーを一度だけ保持する試行結果Table） | Private Datasetを新規追加 | Prep結果を1回だけ物理保持する。Pipeline外のConsumerには公開しない。 |
+| `internal_docs_parse_quality`（Parse結果に品質判定を付ける中間Table） | Private Streaming Datasetを新規追加 | 物理保持済みParse結果へ`valid_parse_result`（Parse結果が正常かを確認する品質条件）を適用し、合否件数を計測しながら成功／隔離を同じ条件で分岐する。 |
+| `internal_docs_prep_quality`（Prep結果に品質判定を付ける中間Table） | Private Streaming Datasetを新規追加 | 物理保持済みPrep結果へ`valid_prep_result`（Prep結果が正常かを確認する品質条件）を適用し、NULL・エラー・空Chunkを成功経路から隔離する。 |
+| `internal_docs_parsed`（Parse成功結果を保持するTable） | `ai_parse_document_version`（文書解析AI FunctionのVersion）を追加 | 文書バージョン管理台帳がParse成功時のFunctionバージョンを監査できるようにする。既存列は削除しない。 |
+| `internal_docs_parse_errors`（Parse失敗結果を隔離して保持するTable） | `content_hash`（原文内容の同一性を確認するHash）、`error_message`（処理失敗の理由を保持する項目）、`ai_parse_document_version`（文書解析AI FunctionのVersion）を追加 | エラー再試行と監査で入力内容・詳細・処理バージョンを特定するため。既存列は削除しない。 |
+| `internal_docs_prep_errors`（Prep失敗結果を隔離して保持するTable） | `content_hash`（原文内容の同一性を確認するHash）、`ai_prep_search_version`（検索用整形AI FunctionのVersion）を追加 | エラー再試行と監査で入力内容・処理バージョンを特定するため。既存列は削除しない。 |
 
-Search Syncが読む`internal_docs_current_mv`の列と`SEARCH_COLUMNS`は変更していないため、後続の物理Delta Table、AI Search Index、Realtime AgentへのSchema影響はない。
+Search Syncが読む`internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View）の列と`SEARCH_COLUMNS`（検索・columnsを指定する設定値／環境変数）は変更していないため、後続の物理Delta Table、AI Search Index、Realtime AgentへのSchema影響はない。
 
 ###### 4.3.4.3.9 Dataset依存関係と公開条件の検証
 
@@ -10153,7 +10232,7 @@ flowchart LR
     GOLD --> SYNC["Search Sync<br/>Pipeline成功後のみ"]
 ```
 
-`bundles/ingestion/tests/pipeline_invariants.sql`
+`bundles/ingestion/tests/pipeline_invariants.sql`（文書取込Pipeline全体の不変条件を検査し、重複・版不整合・公開状態の破綻を検知するSQL）
 
 **実装概要**
 
@@ -10251,11 +10330,11 @@ FROM main.llmops.internal_docs_current_mv
 LIMIT 0;
 ```
 
-Stagingでは、同一Fileを2回通知してAttemptが1 バージョンだけ増えること、未承認の新バージョンがSilverだけに残ること、`approved_document_version_id`切替後にGoldの全Chunkが新バージョンへ切り替わること、削除・失効・ACL変更後にGoldが文書マニフェスト最新値へ追随することをFixtureで確認する。ソースファイル上では`ai_parse_document`と`ai_prep_search`の呼出箇所を各1か所に限定し、Pipeline Event Logの入力行数とAI Functions課金Usageをバージョン件数と照合する。
+Stagingでは、同一Fileを2回通知してAttemptが1 バージョンだけ増えること、未承認の新バージョンがSilverだけに残ること、`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）切替後にGoldの全Chunkが新バージョンへ切り替わること、削除・失効・ACL変更後にGoldが文書マニフェスト最新値へ追随することをFixtureで確認する。ソースファイル上では`ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）と`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）の呼出箇所を各1か所に限定し、Pipeline Event Logの入力行数とAI Functions課金Usageをバージョン件数と照合する。
 
-AI Search公式資料はDelta Sync SourceをDelta Tableとして説明しており、Materialized Viewを直接Sourceにできることをすべての実行環境／Workspace組合せで保証しているとは確認できない。そのため本番参照構成は`internal_docs_current_mv`を、次のJobでCDF有効な物理Delta Tableへ`MERGE`／`DELETE`してからIndexへ同期する。
+AI Search公式資料はDelta Sync SourceをDelta Tableとして説明しており、Materialized Viewを直接Sourceにできることをすべての実行環境／Workspace組合せで保証しているとは確認できない。そのため本番参照構成は`internal_docs_current_mv`（文書マニフェストとChunk履歴から現在公開Chunkを作るMaterialized View）を、次のJobでCDF有効な物理Delta Tableへ`MERGE`（MERGE操作を表すSQLキーワード）／`DELETE`（DELETE操作を表すSQLキーワード）してからIndexへ同期する。
 
-`bundles/ingestion/src/publish_search_sync_table.py`
+`bundles/ingestion/src/publish_search_sync_table.py`（公開確定したCurrent ChunkをAI Search同期専用Tableへ反映し、検索公開境界を作る処理）
 
 **実装概要**
 
@@ -10264,8 +10343,8 @@ AI Search公式資料はDelta Sync SourceをDelta Tableとして説明してお�
 | 目的 | Gold CurrentをSearch Sync Tableへ反映し文書集合スナップショットを登録する。 呼出元はSearch Publish Job。 |
 | 入力 | Gold Current、既存Sync、Snapshot設定。 実行契機はGold検証合格後。 |
 | 処理 | Stage、MERGE、削除反映、件数Hash付きSnapshot確定を行う。 Snapshot確定中に入力バージョンが変わらないことを検証する。 snapshot_idを後続Traceへ渡す。 |
-| 出力 | `internal_docs_search_sync`、`corpus_snapshot_members`。SyncとSnapshotが同じGold状態になる。後続はSearch Index作成。 |
-| 失敗・再実行 | 旧Snapshot／Routeを維持する。`snapshot_id`と`chunk_version_id`で収束する。 |
+| 出力 | `internal_docs_search_sync`（AI Searchへ同期する現在公開Chunkを保持するTable）、`corpus_snapshot_members`（文書集合スナップショットと構成文書Versionの対応を保持するTable）。SyncとSnapshotが同じGold状態になる。後続はSearch Index作成。 |
+| 失敗・再実行 | 旧Snapshot／Routeを維持する。`snapshot_id`（スナップショット・IDを表す識別子）と`chunk_version_id`（検索Chunkの内容・版を一意に識別するID）で収束する。 |
 
 ```python
 """Gold Currentを検索同期用Delta Tableと文書集合スナップショットへ反映するModule。
@@ -10410,7 +10489,7 @@ def publish_current_snapshot(
         raise ValueError("Search sync table has invalid chunk_version_id values")
 ```
 
-物理同期表は事前作成時に`delta.enableChangeDataFeed=true`を設定する。人がUIでv2からv3へ公開Versionを切り替え、Manifest ExecutorがPointerを反映すると、旧バージョンがCurrent MVから消え、Publish Jobの`whenNotMatchedBySourceDelete()`が同期表から削除する。新Versionの取込だけではAI Searchを切り替えない。公開停止や、人がv3からv2を選ぶロールバックも同じ`UI → Workflow → Manifest → Gold → Search Sync → AI Search`経路を使う。履歴はBronze／Silverに残るため、「履歴削除」と「検索対象除外」を混同しない。
+物理同期表は事前作成時に`delta.enableChangeDataFeed=true`を設定する。人がUIでv2からv3へ公開Versionを切り替え、Manifest ExecutorがPointerを反映すると、旧バージョンがCurrent MVから消え、Publish Jobの`whenNotMatchedBySourceDelete()`（同期元に存在しない行を同期先から削除するDelta Merge API）が同期表から削除する。新Versionの取込だけではAI Searchを切り替えない。公開停止や、人がv3からv2を選ぶロールバックも同じ`UI → Workflow → Manifest → Gold → Search Sync → AI Search`経路を使う。履歴はBronze／Silverに残るため、「履歴削除」と「検索対象除外」を混同しない。
 
 ##### 4.3.4.4 整合性差分確認と文書Lifecycle（本番導入後の高度化用参照）
 
@@ -10420,14 +10499,14 @@ def publish_current_snapshot(
 
 | 事象 | 台帳処理 | IDと履歴 | Current／Index |
 | --- | --- | --- | --- |
-| 同一文書の移動・改名 | 人がUIで同じ`document_id`の移動を指定し、Executorが`source_uri`を更新 | 内容が同じなら同じ`document_version_id` | URIを更新し、Chunk IDは維持する |
-| 別文書として登録 | 新しい`document_id`を採番 | 新しいバージョン履歴 | 新規Chunkとして公開する |
-| 訂正 | 同じ`document_id`へ新内容を登録し、人が審査後に公開Versionを選択 | 新しい`document_version_id`、旧版保持 | ExecutorがPointerを反映後、旧版をCurrentから外す |
+| 同一文書の移動・改名 | 人がUIで同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）の移動を指定し、Executorが`source_uri`（原文または取得元を特定するURI）を更新 | 内容が同じなら同じ`document_version_id`（文書内容ごとの不変バージョンID） | URIを更新し、Chunk IDは維持する |
+| 別文書として登録 | 新しい`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）を採番 | 新しいバージョン履歴 | 新規Chunkとして公開する |
+| 訂正 | 同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）へ新内容を登録し、人が審査後に公開Versionを選択 | 新しい`document_version_id`（文書内容ごとの不変バージョンID）、旧版保持 | ExecutorがPointerを反映後、旧版をCurrentから外す |
 | 公開停止 | 人がUIで停止し、Executorが`enabled=false`相当へ更新 | 履歴保持 | CurrentとIndexから除外する |
-| 削除 | 人が正式削除を承認した場合だけ、Executorが`is_deleted=true`へ条件付き更新 | Audit Eventを残し、原本・Silver履歴は保持Policyに従う | CurrentとIndexから除外する |
+| 削除 | 人が正式削除を承認した場合だけ、Executorが`is_deleted=true`（論理削除済みを表す状態）へ条件付き更新 | Audit Eventを残し、原本・Silver履歴は保持Policyに従う | CurrentとIndexから除外する |
 | 復活 | 人がUIで公開可能なVersionを再選択 | 監査上は新しい人間判断 | Executor反映後にCurrentへ再公開する |
 
-`bundles/ingestion/advanced/reconciliation/reconcile_source_manifest.py`
+`bundles/ingestion/advanced/reconciliation/reconcile_source_manifest.py`（原文・Registry・文書マニフェストの差分を照合し、不整合候補を抽出する処理）
 
 **実装概要**
 
@@ -10633,13 +10712,13 @@ if __name__ == "__main__":
     main()
 ```
 
-整合性差分確認ジョブは`pending`候補の作成までとし、Source消失だけで自動的に`is_deleted=true`へしない。文書管理者が移動中、一時障害、正式削除を区別し、承認済みLifecycleワークフローが楽観Lock付きで文書マニフェストを更新する。その後にPipeline、Current Publish、Triggered Syncを順に実行し、専用Golden Queryで削除・失効文書の`chunk_version_id`が0件になったことを確認する。改名を同一文書移動として扱うには、利用者操作または文書管理Systemが同じ`document_id`を明示する必要があり、Path類似度だけで自動同一視しない。
+整合性差分確認ジョブは`pending`（未処理・確認待ちを表す状態値）候補の作成までとし、Source消失だけで自動的に`is_deleted=true`（論理削除済みを表す状態）へしない。文書管理者が移動中、一時障害、正式削除を区別し、承認済みLifecycleワークフローが楽観Lock付きで文書マニフェストを更新する。その後にPipeline、Current Publish、Triggered Syncを順に実行し、専用Golden Queryで削除・失効文書の`chunk_version_id`（検索Chunkの内容・版を一意に識別するID）が0件になったことを確認する。改名を同一文書移動として扱うには、利用者操作または文書管理Systemが同じ`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）を明示する必要があり、Path類似度だけで自動同一視しない。
 
 ##### 4.3.4.5 Search Sync・AI Search
 
-この実装では、Current同期用Delta Tableから新しい`index_release_id`ごとにIndexを作成する。既存Indexを名前だけで再利用せず、`describe()`のSource、Primary Key、Embedding列、Embedding Model、Query Model、Pipeline Type、同期列をリリース構成台帳の期待値と比較する。差分があれば破壊更新せず、新Indexを並行作成する。
+この実装では、Current同期用Delta Tableから新しい`index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID）ごとにIndexを作成する。既存Indexを名前だけで再利用せず、`describe()`（AI Search Index等の現在設定を取得するSDKメソッド）のSource、Primary Key、Embedding列、Embedding Model、Query Model、Pipeline Type、同期列をリリース構成台帳の期待値と比較する。差分があれば破壊更新せず、新Indexを並行作成する。
 
-`bundles/ingestion/src/create_search_index.py`
+`bundles/ingestion/src/create_search_index.py`（承認済み検索同期TableからAI Search Indexを作成・更新し、検索可能状態まで同期する処理）
 
 **実装概要**
 
@@ -10648,7 +10727,7 @@ if __name__ == "__main__":
 | 目的 | Search Sync SnapshotからAI Search Indexを作成・検証する。 呼出元はSearch Index Job。 |
 | 入力 | Search Sync、Release設定、Vector Search SDK。 実行契機は新Index Release作成時。 |
 | 処理 | 取得／作成、Sync待機、Schema／件数／ACL／最小Queryを検証する。 ReadyだけでなくSnapshot一致を必須にする。 index_release_idをリリース構成台帳へ渡す。 |
-| 出力 | AI Search Indexと`index_release_id`。検証済みIndexをcandidateにし、後続で`rag_release_manifest`へ固定する。後続はリリース判定。 |
+| 出力 | AI Search Indexと`index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID）。検証済みIndexをcandidateにし、後続で`rag_release_manifest`（承認済みRAGリリース構成を保持する管理Table）へ固定する。後続はリリース判定。 |
 | 失敗・再実行 | Current Routeを切り替えない。 index_release_idで既存Resourceを再利用する。 |
 
 ```python
@@ -10861,38 +10940,38 @@ if __name__ == "__main__":
     main()
 ```
 
-`run_golden_query_and_acl_regression()`は、期待文書Recall、削除・失効文書0件、権限外Chunk 0件、Snapshot一致、最低Source件数を確認する組織固有Test Harnessである。小さすぎるSourceで本番Indexを作ると容量・Latency・コストの判断を誤るため、devは小規模、stgは本番分布・件数に近い匿名化Corpusで検証する。
+`run_golden_query_and_acl_regression()`（期待文書取得とACL違反を回帰確認する関数）は、期待文書Recall、削除・失効文書0件、権限外Chunk 0件、Snapshot一致、最低Source件数を確認する組織固有Test Harnessである。小さすぎるSourceで本番Indexを作ると容量・Latency・コストの判断を誤るため、devは小規模、stgは本番分布・件数に近い匿名化Corpusで検証する。
 
 2026年8月時点の公式資料では、Standard EndpointはSource TableのCDFが必要で、Continuous／Triggeredの増分同期を利用できる。Storage-optimizedはTriggeredのみで、同期時に部分再構築し、FilterはSQL風文字列となる。Dedicated Full-Text IndexはBetaである。Endpoint種別、Filter Builder、待機TimeoutはBundle変数へ分離し、Workspaceで利用可能な機能とSDKバージョンを固定する。
 
 ##### 4.3.4.6 RAGリリース構成台帳
 
-リリース構成台帳は、RAGを再現・ロールバックするための構成を一行に固定する本システム独自の管理資産である。物理的な実体はDelta Table`main.llmops.rag_release_manifest`のRecordで、Git Commit、解決済みPromptバージョン、モデル経路、Index Release、文書集合スナップショット、Scorer／Judgeバージョンを保持する。実行環境が個別Resourceの最新値を都度選ばないよう、本番RAGを起動する前に必要になる。
+リリース構成台帳は、RAGを再現・ロールバックするための構成を一行に固定する本システム独自の管理資産である。物理的な実体はDelta Table`main.llmops.rag_release_manifest`（承認済みRAGリリース構成の正本となるDelta Table）のRecordで、Git Commit、解決済みPromptバージョン、モデル経路、Index Release、文書集合スナップショット、Scorer／Judgeバージョンを保持する。実行環境が個別Resourceの最新値を都度選ばないよう、本番RAGを起動する前に必要になる。
 
-本資料では、**RAGリリース構成台帳を「承認済みRAG構成」の正本とする。** MLflow Traceは構成の正本ではなく、`rag.release_id`でこの台帳を参照し、検索回数、実際のモデル経路、拒否結果等のRequest固有の実行事実を保持する。これにより、台帳に存在しないPrompt／Index／Model等の組合せでRealtime Traceが生成される経路を作らない。
+本資料では、**RAGリリース構成台帳を「承認済みRAG構成」の正本とする。** MLflow Traceは構成の正本ではなく、`rag.release_id`（実行したRAGリリースをTraceから参照するTag）でこの台帳を参照し、検索回数、実際のモデル経路、拒否結果等のRequest固有の実行事実を保持する。これにより、台帳に存在しないPrompt／Index／Model等の組合せでRealtime Traceが生成される経路を作らない。
 
-Prompt エイリアス、Index名、Codeを別々に切り替えると新旧構成が混在するため、Quality Bundleは`main.llmops.rag_release_manifest`へ次の不変Releaseを発行する。
+Prompt エイリアス、Index名、Codeを別々に切り替えると新旧構成が混在するため、Quality Bundleは`main.llmops.rag_release_manifest`（承認済みRAGリリース構成の正本となるDelta Table）へ次の不変Releaseを発行する。
 
 | 列 | 内容 |
 | --- | --- |
-| `rag_release_id` | Requestで固定するRelease ID。MLflow Traceからこの値で台帳を参照する |
-| `configuration_hash` | Code、Prompt、Model、Index、文書集合、ACL Policy等の有効構成を正規化してHash化した重複防止用Key。同じ構成を別Release IDで二重登録しないために使う |
-| `git_commit`、`repository_url`、`build_id` | CI/CDが注入したCode来歴 |
-| `common_wheel_version` | 共通契約Package バージョン |
-| `sufficiency_prompt_uri`、`rewrite_prompt_uri`、`answer_prompt_uri`、`answer_validation_prompt_uri` | `prompts:/name/version`形式の不変URI |
-| `model_service`、`expected_model_route` | 生成Model Service FQNと期待Destination／Route |
-| `multimodal_enabled` | 同じModel Serviceへ画像入力を許可するか。Vision Smoke Test合格Releaseだけ`true` |
-| `search_endpoint_name`、`index_name`、`index_release_id`、`corpus_snapshot_id` | 検索基盤Release |
-| `embedding_model`、`query_embedding_model` | Index作成・Query用Embedding |
-| `ai_parse_document_version`、`ai_prep_search_version`、`chunk_schema_version` | 解析・Chunk来歴 |
-| `acl_policy_version`、`judge_version` | セキュリティ／評価Policyバージョン |
-| `status`、`approved_at` | `candidate`、`production`、`retired`と承認時刻 |
+| `rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID） | Requestで固定するRelease ID。MLflow Traceからこの値で台帳を参照する |
+| `configuration_hash`（同じRAGリリース構成の重複登録を防ぐHash） | Code、Prompt、Model、Index、文書集合、ACL Policy等の有効構成を正規化してHash化した重複防止用Key。同じ構成を別Release IDで二重登録しないために使う |
+| `git_commit`（実行コードを特定するGit Commit）、`repository_url`（実行コードのRepositoryを特定するURL）、`build_id`（配備Artifactを特定するBuild ID） | CI/CDが注入したCode来歴 |
+| `common_wheel_version`（共通Python PackageのVersion） | 共通契約Package バージョン |
+| `sufficiency_prompt_uri`（根拠十分性判定Promptの不変Version URI）、`rewrite_prompt_uri`（検索Query書換えPromptの不変Version URI）、`answer_prompt_uri`（回答生成Promptの不変Version URI）、`answer_validation_prompt_uri`（回答Grounding等を検証するPromptの不変Version URI） | `prompts:/name/version`形式の不変URI |
+| `model_service`（回答生成に利用するModel Service）、`expected_model_route`（リリース時に想定したModelのRouting先） | 生成Model Service FQNと期待Destination／Route |
+| `multimodal_enabled`（画像を含むMultimodal入力を許可するかを示す設定） | 同じModel Serviceへ画像入力を許可するか。Vision Smoke Test合格Releaseだけ`true`（真を表すBoolean値） |
+| `search_endpoint_name`（利用するAI Search Endpoint名）、`index_name`（利用するAI Search Index名）、`index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID）、`corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID） | 検索基盤Release |
+| `embedding_model`（文書をVector化するEmbedding Model）、`query_embedding_model`（検索QueryをVector化するEmbedding Model） | Index作成・Query用Embedding |
+| `ai_parse_document_version`（文書解析AI FunctionのVersion）、`ai_prep_search_version`（検索用整形AI FunctionのVersion）、`chunk_schema_version`（Chunk生成Schema／規則のVersion） | 解析・Chunk来歴 |
+| `acl_policy_version`（RAG検索で適用するACLポリシーのVersion）、`judge_version`（品質判定に利用したJudgeのVersion） | セキュリティ／評価Policyバージョン |
+| `status`（対象Recordの現在状態）、`approved_at`（承認が確定した時刻） | `candidate`（評価中の候補構成を表す状態値）、`production`（本番で現在利用する参照先を表すAlias）、`retired`（利用停止済みを表す状態値）と承認時刻 |
 
 ###### 4.3.4.6.1 RAGリリース構成台帳は「どこから」「誰が」作るか
 
-`rag_release_manifest`はMLflow Traceを後から集計して作るTableではない。**Release Pipelineが、上流で既に確定・検証された不変IDを集約して、本番実行前に1行を発行する。** 書込主体はQuality／Release JobのService Principalであり、Realtime Agentは読取専用とする。
+`rag_release_manifest`（承認済みRAGリリース構成を保持する管理Table）はMLflow Traceを後から集計して作るTableではない。**Release Pipelineが、上流で既に確定・検証された不変IDを集約して、本番実行前に1行を発行する。** 書込主体はQuality／Release JobのService Principalであり、Realtime Agentは読取専用とする。
 
-本資料では、`release_gate.py`が「この候補を採用可能か」の判定材料を作り、人の最終承認後に`publish_rag_release.py`が「承認した構成そのもの」を`main.llmops.rag_release_manifest`へInsertする。`rag_release.py`はその後のRuntime読取側であり、構成を生成しない。
+本資料では、`release_gate.py`（Holdout・Security・SLO・Costからリリース判定材料を作るPythonファイル）が「この候補を採用可能か」の判定材料を作り、人の最終承認後に`publish_rag_release.py`（承認済みRAGリリース構成を公開するPythonファイル）が「承認した構成そのもの」を`main.llmops.rag_release_manifest`（承認済みRAGリリース構成の正本となるDelta Table）へInsertする。`rag_release.py`（RAGリリース構成の読込・検証を実装するPythonファイル）はその後のRuntime読取側であり、構成を生成しない。
 
 ```mermaid
 flowchart TD
@@ -10919,28 +10998,28 @@ flowchart TD
     PUB --> MAN --> RT --> TRACE
 ```
 
-各列の情報源は次のように固定する。重要なのは、`latest`、`production` Alias、現在のIndex名などを`publish_rag_release.py`がその場で推測して選ばないことである。**Evaluationで実際に使った不変値を上流Jobから受け取り、実Resourceと照合してから保存する。**
+各列の情報源は次のように固定する。重要なのは、`latest`、`production`（本番で現在利用する参照先を表すAlias） Alias、現在のIndex名などを`publish_rag_release.py`（承認済みRAGリリース構成を公開するPythonファイル）がその場で推測して選ばないことである。**Evaluationで実際に使った不変値を上流Jobから受け取り、実Resourceと照合してから保存する。**
 
-| `rag_release_manifest`項目 | 正本／取得元 | 値を確定する処理 | `publish_rag_release.py`での確認 |
+| `rag_release_manifest`（承認済みRAGリリース構成を保持する管理Table）項目 | 正本／取得元 | 値を確定する処理 | `publish_rag_release.py`（承認済みRAGリリース構成を公開するPythonファイル）での確認 |
 | --- | --- | --- | --- |
-| `rag_release_id` | Release Pipeline | 新Candidate発行時に一意IDを生成 | 既存IDと重複しない |
-| `configuration_hash` | `publish_rag_release.py` | 実行に影響する構成項目をCanonical JSONへ正規化してSHA-256を計算 | 同じHashのReleaseが既に存在しない |
-| `git_commit`、`repository_url`、`build_id` | CI/CD Build Metadata | Clean Git Build／DAB Deploy | 実行中Build metadataと一致する |
-| `common_wheel_version` | CI Build Artifact | Wheel build | Deploy済みArtifact Versionと一致する |
-| Prompt URI群 | MLflow Prompt Registry | `register_prompts.py`／Evaluationが使用した候補Version | `prompts:/<name>/<version>`形式でAliasを含まず、Resourceが存在する |
-| `model_service` | DAB変数／環境契約 | Realtime／EvaluationのModel Service設定 | Evaluation対象Serviceと一致する |
-| `expected_model_route` | Model Service Release設定 | Holdout／Smoke Test対象Route | 承認済みRouteである |
-| `multimodal_enabled` | Vision Smoke Test／Release設定 | PDF／PPTX画像入力の回帰試験 | Vision Smoke Test未合格なら`false` |
-| `search_endpoint_name`、`index_name`、`index_release_id` | `create_search_index.py`の検証済み出力 | Search Index Job | `describe()`したSource、Schema、Embedding、Snapshotと一致する |
-| `corpus_snapshot_id` | Search Publish Job | `publish_search_sync_table.py`がMember集合を固定 | `corpus_snapshot_members`に存在し、Index対象Snapshotと一致する |
-| `embedding_model`、`query_embedding_model` | AI Search Index設定 | Index Release作成時 | Index `describe()`の実設定と一致する |
-| `ai_parse_document_version`、`ai_prep_search_version`、`chunk_schema_version` | Ingestion Bundle configuration | Pipeline Deploy時 | Indexへ到達したChunkのVersion列と一致する |
-| `acl_policy_version` | Git／Security Policy設定 | ACL Regression Test | Holdout／Golden Testで使用したPolicyと一致する |
-| `judge_version` | Quality Bundle／MLflow評価 | Holdout評価・Judge Validation | Release Gateで使った承認済みJudgeと一致する |
-| `status` | Release Workflow | 発行時`candidate`、昇格後`production` | 許可された状態遷移だけを認める |
-| `approved_at` | Release承認記録 | 品質責任者／Release Manager承認時 | 未承認CandidateではNULL、本番昇格時だけ設定 |
+| `rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID） | Release Pipeline | 新Candidate発行時に一意IDを生成 | 既存IDと重複しない |
+| `configuration_hash`（同じRAGリリース構成の重複登録を防ぐHash） | `publish_rag_release.py`（承認済みRAGリリース構成を公開するPythonファイル） | 実行に影響する構成項目をCanonical JSONへ正規化してSHA-256を計算 | 同じHashのReleaseが既に存在しない |
+| `git_commit`（実行コードを特定するGit Commit）、`repository_url`（実行コードのRepositoryを特定するURL）、`build_id`（配備Artifactを特定するBuild ID） | CI/CD Build Metadata | Clean Git Build／DAB Deploy | 実行中Build metadataと一致する |
+| `common_wheel_version`（共通Python PackageのVersion） | CI Build Artifact | Wheel build | Deploy済みArtifact Versionと一致する |
+| Prompt URI群 | MLflow Prompt Registry | `register_prompts.py`（Git管理したPromptを検証してPrompt Registryへ登録し、同一内容の重複Version作成を防ぐ処理）／Evaluationが使用した候補Version | `prompts:/<name>/<version>`（不変なMLflow Prompt Versionを指すURI形式）形式でAliasを含まず、Resourceが存在する |
+| `model_service`（回答生成に利用するModel Service） | DAB変数／環境契約 | Realtime／EvaluationのModel Service設定 | Evaluation対象Serviceと一致する |
+| `expected_model_route`（リリース時に想定したModelのRouting先） | Model Service Release設定 | Holdout／Smoke Test対象Route | 承認済みRouteである |
+| `multimodal_enabled`（画像を含むMultimodal入力を許可するかを示す設定） | Vision Smoke Test／Release設定 | PDF／PPTX画像入力の回帰試験 | Vision Smoke Test未合格なら`false`（偽を表すBoolean値） |
+| `search_endpoint_name`（利用するAI Search Endpoint名）、`index_name`（利用するAI Search Index名）、`index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID） | `create_search_index.py`（承認済み検索同期TableからAI Search Indexを作成・更新し、検索可能状態まで同期する処理）の検証済み出力 | Search Index Job | `describe()`（AI Search Index等の現在設定を取得するSDKメソッド）したSource、Schema、Embedding、Snapshotと一致する |
+| `corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID） | Search Publish Job | `publish_search_sync_table.py`（公開確定したCurrent ChunkをAI Search同期専用Tableへ反映し、検索公開境界を作る処理）がMember集合を固定 | `corpus_snapshot_members`（文書集合スナップショットと構成文書Versionの対応を保持するTable）に存在し、Index対象Snapshotと一致する |
+| `embedding_model`（文書をVector化するEmbedding Model）、`query_embedding_model`（検索QueryをVector化するEmbedding Model） | AI Search Index設定 | Index Release作成時 | Index `describe()`（AI Search Index等の現在設定を取得するSDKメソッド）の実設定と一致する |
+| `ai_parse_document_version`（文書解析AI FunctionのVersion）、`ai_prep_search_version`（検索用整形AI FunctionのVersion）、`chunk_schema_version`（Chunk生成Schema／規則のVersion） | Ingestion Bundle configuration | Pipeline Deploy時 | Indexへ到達したChunkのVersion列と一致する |
+| `acl_policy_version`（RAG検索で適用するACLポリシーのVersion） | Git／Security Policy設定 | ACL Regression Test | Holdout／Golden Testで使用したPolicyと一致する |
+| `judge_version`（品質判定に利用したJudgeのVersion） | Quality Bundle／MLflow評価 | Holdout評価・Judge Validation | Release Gateで使った承認済みJudgeと一致する |
+| `status`（対象Recordの現在状態） | Release Workflow | 発行時`candidate`（評価中の候補構成を表す状態値）、昇格後`production`（本番で現在利用する参照先を表すAlias） | 許可された状態遷移だけを認める |
+| `approved_at`（承認が確定した時刻） | Release承認記録 | 品質責任者／Release Manager承認時 | 未承認CandidateではNULL、本番昇格時だけ設定 |
 
-この収集は「各Systemから最新値を吸い上げるInventory処理」ではない。例えばPromptの`@production` Aliasを読んでManifestを作るのではなく、Holdout評価で実際に使用した`prompts:/.../12`をそのまま受け取る。同様に、`corpus_snapshot_id`はCurrent文書一覧から再計算せず、Search Publish Jobが固定したIDを受け取る。
+この収集は「各Systemから最新値を吸い上げるInventory処理」ではない。例えばPromptの`@production`（該当Frameworkの処理を有効化・制御するDecorator） Aliasを読んでManifestを作るのではなく、Holdout評価で実際に使用した`prompts:/.../12`をそのまま受け取る。同様に、`corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID）はCurrent文書一覧から再計算せず、Search Publish Jobが固定したIDを受け取る。
 
 **Traceとの向きは逆である。**
 
@@ -10957,11 +11036,11 @@ MLflow Trace
   rag.release_id
 ```
 
-`rag.release_id`が、Traceと承認済み構成を結ぶ唯一の構成参照Keyになる。Prompt Version、Index Release、文書集合スナップショット、期待モデル経路等はTraceへ重複保存せず、必要なときにRAGリリース構成台帳から取得する。
+`rag.release_id`（実行したRAGリリースをTraceから参照するTag）が、Traceと承認済み構成を結ぶ唯一の構成参照Keyになる。Prompt Version、Index Release、文書集合スナップショット、期待モデル経路等はTraceへ重複保存せず、必要なときにRAGリリース構成台帳から取得する。
 
 一方、検索回数、実際に利用されたモデル経路、拒否結果、人手確認要否、Latency等の**Requestごとに変わる実行事実**はTrace／Span／Assessmentへ記録する。つまり、RAGリリース構成台帳は「何を使うと承認したか」の正本、MLflow Traceは「そのRequestで実際に何が起きたか」の正本とする。
 
-`bundles/quality/src/publish_rag_release.py`
+`bundles/quality/src/publish_rag_release.py`（評価済みのCode・Prompt・Model・Index・文書集合を1つの不変RAG Releaseとして台帳へ発行する処理）
 
 **実装骨格**
 
@@ -11109,21 +11188,21 @@ def publish_release(
 # Realtime AgentはMANIFEST_TABLEへ書き込まず、rag_release.pyから読取るだけにする。
 ```
 
-`configuration_hash`はMLflow Traceへ記録するための値ではなく、RAGリリース構成台帳内で同じ実効構成を二重登録しないための内部Keyである。同じHashの構成を再承認する必要がある場合は新しいRelease行を作らず、承認・意思決定の履歴側へ新しい判断記録を追加する。
+`configuration_hash`（同じRAGリリース構成の重複登録を防ぐHash）はMLflow Traceへ記録するための値ではなく、RAGリリース構成台帳内で同じ実効構成を二重登録しないための内部Keyである。同じHashの構成を再承認する必要がある場合は新しいRelease行を作らず、承認・意思決定の履歴側へ新しい判断記録を追加する。
 
-`approved_by`や`decision_id`を`rag_release_manifest`自体へ保持するか、別の意思決定記録を正本にするかは組織の監査設計で決める。本資料のRuntime契約は、実行に必要な不変構成だけを`RagRelease`へ読み込み、承認理由などの運用情報をAgent Stateへ流さない。
+`approved_by`（承認を行ったActorを記録する項目）や`decision_id`（人が行った採用・却下等の意思決定記録ID）を`rag_release_manifest`（承認済みRAGリリース構成を保持する管理Table）自体へ保持するか、別の意思決定記録を正本にするかは組織の監査設計で決める。本資料のRuntime契約は、実行に必要な不変構成だけを`RagRelease`（1 Requestで固定するRAGリリース構成を表すデータ型）へ読み込み、承認理由などの運用情報をAgent Stateへ流さない。
 
-`bundles/realtime/app/rag_release.py`
+`bundles/realtime/app/rag_release.py`（本番RAGのリリース構成読込を実装するPythonファイル）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | Current 参照から不変RAGリリースを読み、`rag_graph.py`と`start_server.py`へ渡す。 |
+| 目的 | Current 参照から不変RAGリリースを読み、`rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル）と`start_server.py`（RAG AgentをAgent Serverとして起動し、Responses API／Streamingの受付口を公開する処理）へ渡す。 |
 | 入力 | リリース参照、リリース構成台帳、Prompt、モデル経路、Index。App起動時とRequest開始時に読む。 |
 | 処理 | 参照を一度解決し各バージョンを照合する。Request途中で構成を変えず、不一致はFail ClosedとしてRoot Traceへ記録する。 |
-| 出力 | 検証済み`RagRelease`とCacheを返し、RAG GraphとEvaluationが使用する。 |
-| 失敗・再実行 | 推測FallbackはせずReadiness エラーにする。`release_id`単位のCacheを再利用する。 |
+| 出力 | 検証済み`RagRelease`（1 Requestで固定するRAGリリース構成を表すデータ型）とCacheを返し、RAG GraphとEvaluationが使用する。 |
+| 失敗・再実行 | 推測FallbackはせずReadiness エラーにする。`release_id`（Release・IDを表す識別子）単位のCacheを再利用する。 |
 
 ```python
 """実行環境で不変RAGリリース構成台帳を読込み、Code、Prompt、Model、Index、Snapshot、ACL Policyを検証するModule。
@@ -11256,7 +11335,7 @@ def load_rag_release(rag_release_id: str) -> RagRelease:
     return RagRelease(prompt_uris=prompt_uris, **row)
 ```
 
-**想定出力サンプル（`RagRelease`）**
+**想定出力サンプル（`RagRelease`（1 Requestで固定するRAGリリース構成を表すデータ型））**
 
 ```json
 {
@@ -11287,9 +11366,9 @@ def load_rag_release(rag_release_id: str) -> RagRelease:
 
 Release状態不一致、存在しないIndex、可変Prompt エイリアス、Build metadata不一致のいずれかがある場合は、このObjectを返さず起動またはRequestをFail Closedにする。
 
-リリース判定合格後に候補リリース構成をInsertし、`rag_release_channels`の`production`参照を1 Transactionで切り替える。実行環境は起動時またはRequest開始時に`RAG_RELEASE_ID`を解決し、Stateへ固定する。ロールバックは直前のリリース構成台帳IDを再指定する。`@development`／`@candidate` エイリアスはPrompt候補作成時だけに使い、本番Applicationは参照しない。Promptだけ、Indexだけ、Modelだけを比較するExperimentでも別のリリース構成を作り、その他の列を同一にする。
+リリース判定合格後に候補リリース構成をInsertし、`rag_release_channels`（production等が現在利用するRAG Releaseを指す参照Table）の`production`（本番で現在利用する参照先を表すAlias）参照を1 Transactionで切り替える。実行環境は起動時またはRequest開始時に`RAG_RELEASE_ID`（本番で利用するRAG Release IDを指定する環境変数）を解決し、Stateへ固定する。ロールバックは直前のリリース構成台帳IDを再指定する。`@development`（該当Frameworkの処理を有効化・制御するDecorator）／`@candidate`（該当Frameworkの処理を有効化・制御するDecorator） エイリアスはPrompt候補作成時だけに使い、本番Applicationは参照しない。Promptだけ、Indexだけ、Modelだけを比較するExperimentでも別のリリース構成を作り、その他の列を同一にする。
 
-本番Appは`RAG_RELEASE_STATUS=production`、Staging／Evaluation Jobは対象に応じて`candidate`を明示し、状態不一致を拒否する。Channel参照更新とリリース構成台帳への行InsertはQuality Service Principalだけに許可する。
+本番Appは`RAG_RELEASE_STATUS=production`、Staging／Evaluation Jobは対象に応じて`candidate`（評価中の候補構成を表す状態値）を明示し、状態不一致を拒否する。Channel参照更新とリリース構成台帳への行InsertはQuality Service Principalだけに許可する。
 
 ##### 4.3.4.7 LangGraph
 
@@ -11305,11 +11384,11 @@ flowchart TD
     TRACE --> UI["MLflow Traces UI"]
 ```
 
-この実装は、リクエスト開始時に `rag_release_manifest` と実利用者の Entitlement をStateへ固定し、取得、決定論的検査、意味的十分性判定、再検索、回答、回答検証、拒否または人手確認をNodeとして分離する。検索のたびに過去証跡を捨てず、`SearchAttempt` と累積証跡を保持する。回答に渡す証跡だけはScore順、重複排除、Context上限で選び、採用されなかったChunkも監査履歴へ残す。PDF／PPTXの図表については、まずParse時のFigure descriptionを含むText Chunkで検索・十分性判定し、`requires_visual_context=true`の場合だけ取得済みChunkの`page_image_uri`をRead-only Volumeから読み、Base64 Data URIへ変換して同じModel Serviceへ追加する。Textだけで回答できるRequestへ画像を無条件に添付しない。
+この実装は、リクエスト開始時に `rag_release_manifest`（承認済みRAGリリース構成を保持する管理Table） と実利用者の Entitlement をStateへ固定し、取得、決定論的検査、意味的十分性判定、再検索、回答、回答検証、拒否または人手確認をNodeとして分離する。検索のたびに過去証跡を捨てず、`SearchAttempt`（1回の検索Queryと取得結果・判定を保持する型） と累積証跡を保持する。回答に渡す証跡だけはScore順、重複排除、Context上限で選び、採用されなかったChunkも監査履歴へ残す。PDF／PPTXの図表については、まずParse時のFigure descriptionを含むText Chunkで検索・十分性判定し、`requires_visual_context=true`（回答にページ画像が必要だと判定した状態）の場合だけ取得済みChunkの`page_image_uri`（ページ画像の保存先を指すURI）をRead-only Volumeから読み、Base64 Data URIへ変換して同じModel Serviceへ追加する。Textだけで回答できるRequestへ画像を無条件に添付しない。
 
 エージェント側の想定出力は、同じ正常回答ケースを共通契約、Release、Graph、Identity、SSE、画面表示の順に追跡できるよう、IDを意図的に揃えている。Token、Raw Path、ACL式など本番で記録・表示してはいけない値はサンプルにも含めない。
 
-生成モデルは`DatabricksOpenAI`のOpenAI互換Clientが、リリース構成台帳で固定されたUnity AI Gateway Model Service FQNを`model`へ指定して呼ぶ。したがって、Application CodeはLegacy Model Serving Endpoint固有URIを組み立てない。`similarity_search()`はAI Search、Query EmbeddingはIndexに設定されたEmbedding Resourceを呼ぶ。Promptはエイリアスではなくリリース構成台帳の不変バージョンURIから解決する。Model Service内で複数DestinationへTraffic Split／Fallbackする場合はResponseのModel名とRequest IDをTraceへ残し、詳細RouteがResponseにない場合だけ`system.ai_gateway.usage`をRequest IDで後続照合する。Inference Loggingを前提にはしない。
+生成モデルは`DatabricksOpenAI`のOpenAI互換Clientが、リリース構成台帳で固定されたUnity AI Gateway Model Service FQNを`model`（Modelに関する分類・設定値）へ指定して呼ぶ。したがって、Application CodeはLegacy Model Serving Endpoint固有URIを組み立てない。`similarity_search()`（AI Search Indexへ類似検索を実行するSDKメソッド）はAI Search、Query EmbeddingはIndexに設定されたEmbedding Resourceを呼ぶ。Promptはエイリアスではなくリリース構成台帳の不変バージョンURIから解決する。Model Service内で複数DestinationへTraffic Split／Fallbackする場合はResponseのModel名とRequest IDをTraceへ残し、詳細RouteがResponseにない場合だけ`system.ai_gateway.usage`（AI Gatewayの利用量・Token・Model経路等を確認するSystem Table）をRequest IDで後続照合する。Inference Loggingを前提にはしない。
 
 
 ###### 4.3.4.7.1 エージェント実行時ガバナンスの全体像
@@ -11333,7 +11412,7 @@ flowchart TD
 | 出典や禁止情報に問題がないか | 存在しない出典、重要記述の出典漏れ、機密情報らしい出力をシステム側で検査する | × |
 | 回答が根拠に沿っているか | 回答と根拠の意味的な整合性を生成AIで確認する | ○ |
 | 利用者へ回答を返してよいか | どこかの確認に失敗した場合は回答を止め、拒否または担当者確認へ切り替える | × |
-| 後から原因を追えるか | 構成は`rag.release_id`で台帳を参照し、検索回数・実際のモデル経路・拒否結果等の実行事実を記録する | × |
+| 後から原因を追えるか | 構成は`rag.release_id`（実行したRAGリリースをTraceから参照するTag）で台帳を参照し、検索回数・実際のモデル経路・拒否結果等の実行事実を記録する | × |
 
 つまり、**生成AIには「意味を考える仕事」をさせ、権限・回数・処理順序・最終公開可否はシステム側で固定する**。
 
@@ -11386,7 +11465,7 @@ sequenceDiagram
 2. **生成AIは意味判断や回答作成に使うが、検索回数、利用する文書、最終的に回答を返してよいかはシステム側で制御する。**
 3. **確認に失敗した場合は無理に回答せず、拒否または人手確認へ切り替える。**
 
-具体的な関数名、状態名、設定値はこの後の`rag_graph.py`実装で確認する。ここでは、**「確認済みの根拠だけを使い、各段階で問題があれば止める」**ことがエージェント実行時ガバナンスの基本である。
+具体的な関数名、状態名、設定値はこの後の`rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル）実装で確認する。ここでは、**「確認済みの根拠だけを使い、各段階で問題があれば止める」**ことがエージェント実行時ガバナンスの基本である。
 
 ###### 4.3.4.7.3 問題がある場合は回答を止め、人が確認する
 
@@ -11403,11 +11482,96 @@ sequenceDiagram
 
 単なる根拠不足なら固定の回答拒否へ、安全性・アクセス権・公開状態・回答内容に疑義がある場合は担当者確認へ送る。生成途中の回答本文や、権限外文書が存在することを推測できる内部理由は利用者へそのまま返さない。
 
-実装では、この判断を`refuse`や`human_review`などの状態で表現する。ここで重要なのは状態名ではなく、**「確認できない場合は回答を出さない」ことをシステム側の必須ルールにしている**点である。
+実装では、この判断を`refuse`（回答拒否へ進む処理経路名）や`human_review`（人手確認へ処理を送る経路名）などの状態で表現する。ここで重要なのは状態名ではなく、**「確認できない場合は回答を出さない」ことをシステム側の必須ルールにしている**点である。
 
 この設計により、将来このRAGエージェントを別のエージェントからResponses APIで呼び出す場合も、呼出元は内部のアクセス権確認、検索対象制御、根拠検証、回答検証を省略できない。RAGエージェント自身が統制境界を持った専門エージェントとして動作する。
 
-`bundles/realtime/app/rag_graph.py`
+###### 4.3.4.7.4 `rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル）のワークフロー全体像
+
+`rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル）は実装コード自体は長いが、**NodeとEdgeだけを見るとかなりシンプル**である。最初に全体図を見てから、分岐が複雑な`check`（検索結果が回答に十分か確認するNode）と`validate_answer`（生成した回答を検証するNode）の中を見ると理解しやすい。
+
+```mermaid
+flowchart TD
+    START["開始"] --> RETRIEVE["retrieve<br/>文書検索を実行する"]
+    RETRIEVE --> CHECK["check<br/>取得した根拠で回答できるか確認する"]
+
+    CHECK -->|回答できる| ANSWER["answer<br/>回答を生成する"]
+    CHECK -->|検索のやり直しが必要| REWRITE["rewrite<br/>検索語を書き換える"]
+    CHECK -->|根拠不足で回答できない| REFUSE["refuse<br/>回答を拒否する"]
+    CHECK -->|安全性・整合性に疑義がある| HUMAN["human_review<br/>担当者確認へ送る"]
+
+    REWRITE -->|新しい検索語を作れた| RETRIEVE
+    REWRITE -->|空または重複した検索語しか作れない| REFUSE
+
+    ANSWER --> VALIDATE["validate_answer<br/>生成した回答を検証する"]
+
+    VALIDATE -->|検証OK| END["終了"]
+    VALIDATE -->|検証NG| HUMAN
+
+    REFUSE --> END
+    HUMAN --> END
+```
+
+この図で重要なのは、**回答生成後にそのまま終了しない**こと、そして**回答できない時だけでなく、危険または不整合な時も人手確認へ送る**ことである。
+
+###### 4.3.4.7.5 `check`（検索結果が回答に十分か確認するNode）の詳細
+
+`check`（検索結果が回答に十分か確認するNode）は、このGraphの分岐を最も大きく決めるNodeである。ここでは、**権限・公開状態・文書集合の整合性に問題がないか**、**新しい根拠を取得できたか**、**意味的に質問へ答えるのに十分か**を順番に確認する。
+
+```mermaid
+flowchart TD
+    S["check を開始する"] --> R{"最初から回答拒否が確定している<br/>または検索結果が存在しない?"}
+
+    R -->|はい| REFUSE["回答を拒否する"]
+    R -->|いいえ| SEVERE{"権限・公開状態・文書集合に<br/>重大な不整合がある?"}
+
+    SEVERE -->|はい| HUMAN["担当者確認へ送る"]
+    SEVERE -->|いいえ| NEWDOC{"回答に使える根拠を取得できた?"}
+
+    NEWDOC -->|いいえ| REWRITEABLE{"再検索回数に余裕がある?"}
+    REWRITEABLE -->|はい| REWRITE["検索語の書き換えへ進む"]
+    REWRITEABLE -->|いいえ| REFUSE2["根拠不足として回答を拒否する"]
+
+    NEWDOC -->|はい| SUFF{"意味的に見て<br/>この根拠で回答できる?"}
+
+    SUFF -->|はい| ANSWER["回答生成へ進む"]
+    SUFF -->|いいえ| HUMANREQ{"担当者確認が必要と判断された?"}
+
+    HUMANREQ -->|はい| HUMAN2["担当者確認へ送る"]
+    HUMANREQ -->|いいえ| REWRITEABLE2{"再検索回数に余裕がある?"}
+
+    REWRITEABLE2 -->|はい| REWRITE2["検索語の書き換えへ進む"]
+    REWRITEABLE2 -->|いいえ| REFUSE3["根拠不足として回答を拒否する"]
+```
+
+このNodeは、単に「文書が何件取れたか」を見ているわけではない。  
+**0件ならすぐ拒否、ではなく、検索語を書き換えれば取れるかもしれないため再検索も試す**。一方で、**権限や公開状態の不整合は検索語を変えても直らない**ので、人手確認へ送る。
+
+###### 4.3.4.7.6 `validate_answer`（生成した回答を検証するNode）の詳細
+
+`validate_answer`（生成した回答を検証するNode）は、生成した回答をそのまま利用者へ返さず、**決定論的な検査**と**意味的な検査**の2段階で止めるNodeである。
+
+```mermaid
+flowchart TD
+    S["validate_answer を開始する"] --> DET{"出典の実在性・出典漏れ・機密情報らしき出力に<br/>問題はない?"}
+
+    DET -->|いいえ| HUMAN["担当者確認へ送る"]
+    DET -->|はい| SEM{"回答内容は根拠に沿っており<br/>矛盾や未出典の重要主張がない?"}
+
+    SEM -->|はい| COMPLETE["回答を確定して終了する"]
+    SEM -->|いいえ| HUMAN2["担当者確認へ送る"]
+```
+
+ここでいう**決定論的な検査**とは、例えば次のようなものである。
+
+- 回答に書かれた出典IDが、実際に構造化Citation一覧に存在するか。
+- ある程度長い段落に、出典IDが1つも付いていない箇所がないか。
+- `system prompt`、`secret`、`token` など、機密情報らしい表現が含まれていないか。
+
+これらはPythonで機械的に確認できるため、生成AIへ任せず先に止める。  
+その後で、**回答内容が検索した根拠に本当に沿っているか**を生成AIで確認する。したがって、このNodeの役割は、**「もっともらしい回答」を返すことではなく、「確認できた回答だけを返すこと」**である。
+
+`bundles/realtime/app/rag_graph.py`（本番RAGのLangGraph処理を実装するPythonファイル）
 
 **実装概要**
 
@@ -11416,7 +11580,7 @@ sequenceDiagram
 | 目的 | ACL検索、再検索、回答、検証、拒否をLangGraphで実行し、Agent Serverから呼ばれる。 |
 | 入力 | 質問、Identity、Release、AI Search、Prompt、Model Service。Realtime Requestごとに読む。 |
 | 処理 | IdentityとReleaseを固定して検索、Judge、Rewrite、回答、検証を進める。ACL再検査を通らない回答は拒否し、AGENT配下へRETRIEVER／LLM Spanを作る。 |
-| 出力 | `RagResult`、Trace、進捗EventをAgent ServerとEvaluationへ返す。 |
+| 出力 | `RagResult`（Agent Server・UI・Evaluationへ返すRAG実行結果の型）、Trace、進捗EventをAgent ServerとEvaluationへ返す。 |
 | 失敗・再実行 | 権限外証跡と部分回答を破棄する。同じReleaseとrequest_idを記録して比較可能にする。 |
 
 ```python
@@ -11455,10 +11619,14 @@ from identity_context import EntitlementContext
 from rag_release import RagRelease
 
 
+# 1 Requestで無制限に再検索・Context投入・画像投入しないよう、上限をCode側で固定する。
+# LLM自身の判断では超えられない値にし、Latency・Cost・無限Loopを抑える。
 MAX_REWRITES = 2
 MAX_CONTEXT_CHARS = 24_000
 MAX_VISUAL_PAGES = 3
 SEARCH_LIMIT = 10
+
+# 回答本文中の出典表記を、構造化Citation一覧と照合するための共通Pattern。
 ANSWER_CITATION_PATTERN = re.compile(r"\[(SRC-[A-F0-9]{12})\]")
 SENSITIVE_OUTPUT_PATTERNS = (
     re.compile(r"(?i)system prompt"),
@@ -11484,6 +11652,8 @@ def stable_citation_id(chunk_version_id: str) -> str:
 
 
     """
+    # 検索順位や検索回数からIDを作ると、再検索で同じChunkの出典IDが変わってしまう。
+    # そのため不変なchunk_version_idだけをHash化し、同じChunkなら常に同じ出典IDにする。
     digest = hashlib.sha256(chunk_version_id.encode("utf-8")).hexdigest()[:12]
     return f"SRC-{digest.upper()}"
 
@@ -11500,7 +11670,11 @@ def get_index(release: RagRelease):
 
 
     """
+    # Endpoint名とIndex名の組をCache Keyにする。
+    # Releaseが別Indexを指す場合は別Objectになるため、別ReleaseのIndexを誤って使い回さない。
     key = (release.search_endpoint_name, release.index_name)
+
+    # 同じIndex Objectの取得をRequestごとに繰り返さず、Process内で再利用する。
     if key not in _index_cache:
         _index_cache[key] = search_client.get_index(
             endpoint_name=release.search_endpoint_name,
@@ -11520,6 +11694,9 @@ def get_model_client() -> DatabricksOpenAI:
 
     """
     global _model_client
+
+    # Workspace認証を使うClientはRequestごとに作り直す必要がないため、
+    # Process内で1度だけ生成して再利用する。
     if _model_client is None:
         _model_client = DatabricksOpenAI()
     return _model_client
@@ -11527,10 +11704,16 @@ def get_model_client() -> DatabricksOpenAI:
 
 def page_image_to_data_uri(image_uri: str) -> str:
     """AppへRead-only Bindingした画像Volume配下だけを読み、Base64 Data URIへ変換する。"""
+    # 許可したRead-only Volumeを基準Pathとして正規化する。
+    # `resolve()`後の実Pathで比較し、`../`等によるPath Traversalを防ぐ。
     root = Path(os.environ["RAG_PAGE_IMAGE_ROOT"]).resolve()
     image_path = Path(image_uri).resolve()
+
+    # 許可Volume自身またはその配下以外の画像は、Modelへ渡す前にFail Closedにする。
     if root != image_path and root not in image_path.parents:
         raise PermissionError("page_image_uri is outside the bound image volume")
+
+    # Model APIへ渡せるData URIへ変換するためMIME Typeを決める。
     mime_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
     with image_path.open("rb") as file:
         payload = base64.b64encode(file.read()).decode("ascii")
@@ -11544,9 +11727,16 @@ def invoke_model_service(
     image_uris: list[str] | None = None,
 ) -> tuple[str, Any]:
     """Textを基本とし、必要時だけ承認済みページ画像をVision入力へ追加する。"""
+    # 同じページ画像を複数回送らないよう順序を維持して重複排除し、
+    # Code側の上限を超える画像はModel Contextへ入れない。
     unique_images = list(dict.fromkeys(image_uris or []))[:MAX_VISUAL_PAGES]
+
+    # ReleaseでMultimodal利用が承認されていない場合、
+    # Request単位の都合だけでVision推論へ切り替わらないようFail Closedにする。
     if unique_images and not release.multimodal_enabled:
         raise RuntimeError("RAG Release is not approved for multimodal inference")
+    # 画像が必要な場合だけOpenAI互換のMultimodal Message形式を組み立てる。
+    # Text-only Requestでは不要な画像変換・送信を行わない。
     message_content = [{"type": "text", "text": instruction}]
     message_content.extend(
         {
@@ -11555,6 +11745,8 @@ def invoke_model_service(
         }
         for image_uri in unique_images
     )
+    # Model名をSourceへ直書きせず、RAG Releaseで固定したModel Serviceだけを呼ぶ。
+    # temperature=0.0にして、同じ入力条件での不要な出力揺れを抑える。
     response = get_model_client().chat.completions.create(
         model=release.model_service,
         messages=[
@@ -11565,9 +11757,12 @@ def invoke_model_service(
         ],
         temperature=0.0,
     )
+    # 空応答を成功扱いすると後段の拒否・十分性判定が曖昧になるため、ここで例外にする。
     content = response.choices[0].message.content
     if not content:
         raise ValueError("Model Service returned empty content")
+
+    # 画像利用有無はReleaseの静的構成ではなくRequestごとの実行事実なのでTraceへ残す。
     mlflow.update_current_trace(
         tags={
             "rag.visual_context_used": str(bool(unique_images)).lower(),
@@ -11585,16 +11780,21 @@ def invoke_structured_model(
     image_uris: list[str] | None = None,
 ):
     """JSON Schemaを明示し、Pydantic Validationに失敗した出力をFail Closedにする。"""
+    # Pydantic ModelからJSON Schemaを生成し、LLMへ期待する出力構造を明示する。
+    # 自由文を後から推測してParseするのではなく、構造化出力契約を先に固定する。
     schema = json.dumps(
         response_type.model_json_schema(),
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    # JSON以外を返さないよう指示したうえで、通常のModel呼出し経路を再利用する。
     content, _ = invoke_model_service(
         release,
         f"{instruction}\n\nReturn JSON only. JSON Schema:\n{schema}",
         image_uris=image_uris,
     )
+
+    # Schema違反を補正して続行せず、Pydantic ValidationでFail Closedにする。
     return response_type.model_validate_json(content)
 
 
@@ -11612,8 +11812,11 @@ def load_prompt(release: RagRelease, prompt_key: str, **values: str) -> str:
 
 
     """
+    # Aliasや最新版をRequest途中で再解決せず、Releaseが保持する不変Prompt URIを使う。
     prompt_uri = release.prompt_uris[prompt_key]
     prompt = mlflow.genai.load_prompt(prompt_uri)
+
+    # Nodeごとに必要な値だけを差し込み、Prompt本文はRegistry上のVersionを正本とする。
     return prompt.format(**values)
 
 
@@ -11630,6 +11833,8 @@ def record_model_route(response: Any, release: RagRelease) -> None:
 
 
     """
+    # Release台帳には「期待Route」を保持し、TraceにはServingが返した「実際のRoute」を残す。
+    # Fallback等で期待Routeと実RouteがずれたRequestを後から検出できるようにする。
     actual_route = getattr(response, "model", None) or "NOT_REPORTED"
     request_id = getattr(response, "_request_id", None)
     tags = {
@@ -11661,6 +11866,9 @@ def parse_search_rows(
 
     """
     documents: list[RetrievedDocument] = []
+
+    # AI Search SDKのdata_arrayは、similarity_search()で指定したcolumnsの順序で値が返る。
+    # 位置依存の配列をここでRetrievedDocumentへ変換し、後段Nodeが生の配列Indexを扱わないようにする。
     for row in result.get("result", {}).get("data_array", []):
         chunk_version_id = str(row[0])
         documents.append(
@@ -11682,8 +11890,12 @@ def parse_search_rows(
                 is_current=bool(row[13]),
                 is_deleted=bool(row[14]),
                 corpus_snapshot_id=str(row[15]),
+
+                # Index Release IDは検索Rowから信用して復元せず、Request開始時に固定した値を使う。
                 index_release_id=state["index_release_id"],
                 ai_prep_search_version=str(row[16]),
+
+                # 検索ScoreはSDK Responseの末尾に付与されるため、固定Metadata列とは分けて取得する。
                 score=float(row[-1]),
             )
         )
@@ -11707,16 +11919,25 @@ def validate_retrieved_document(
 
     """
     failures: list[str] = []
+
+    # AI Searchの事前Filterだけを信用せず、取得後にもACLの積集合を確認する。
+    # Index同期遅延やFilter意味論の差があっても、権限外ChunkをLLMへ渡さないDefense in Depthである。
     if not set(document.allowed_principals).intersection(state["allowed_principals"]):
         failures.append("ACL_MISMATCH")
+    # 現在公開中・未削除・承認済みの3条件をすべて満たすChunkだけを採用する。
     if (
         not document.is_current
         or document.is_deleted
         or document.approval_status != "approved"
     ):
         failures.append("NON_CURRENT")
+    # Request開始時に固定した文書集合Snapshotと違うChunkは、
+    # 関連度が高くても別Releaseの証跡なので採用しない。
     if document.corpus_snapshot_id != state["corpus_snapshot_id"]:
         failures.append("SNAPSHOT_MISMATCH")
+
+    # 出典・監査・再現に必要なMetadataが1つでも欠ける場合は、
+    # 回答内容が正しそうでも証跡として利用できないためFail Closedにする。
     if not all(
         [
             document.document_id,
@@ -11747,15 +11968,22 @@ def select_answer_evidence(
 
 
     """
+    # 再検索で同じChunk Versionが再取得されてもContextへ重複投入しない。
+    # 同一chunk_version_idは同じ内容を指す前提なので、後から現れたObjectで1件に畳む。
     best_by_chunk = {
         document.chunk_version_id: document for document in previous + current
     }
+
+    # 重複排除後にScore降順へ並べ、Context Budget内では関連度の高いChunkを優先する。
     ordered = sorted(best_by_chunk.values(), key=lambda item: item.score, reverse=True)
     selected: list[RetrievedDocument] = []
     used_chars = 0
     overflowed = False
     for document in ordered:
         projected = used_chars + len(document.content)
+
+        # 上限を超えるChunkは採用しないが、Loop自体は終了しない。
+        # 後続の短いChunkなら残りBudgetへ入る可能性があるため、continueして次候補を見る。
         if projected > MAX_CONTEXT_CHARS:
             overflowed = True
             continue
@@ -11779,6 +12007,9 @@ def trace_retrieved_documents(
 
 
     """
+    # Application内部型をそのままSpan出力にせず、
+    # MLflow Retrieval Scorerが理解できるDocument形式へ変換する。
+    # この関数へ渡るdocumentsはACL・Current・Snapshot検査済みのものだけである。
     return [
         {
             "page_content": document.content,
@@ -11809,6 +12040,8 @@ def retrieve_node(state: RagState, release: RagRelease) -> dict[str, Any]:
 
 
     """
+    # 権限集合が空のまま検索すると、0件／件数差から非公開文書の存在を推測される可能性がある。
+    # そのためAI Searchへ問い合わせる前に固定拒否へ進める。
     if not state["allowed_principals"]:
         return {
             "next_step": "refuse",
@@ -11816,7 +12049,9 @@ def retrieve_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             "validation_failures": ["EMPTY_ENTITLEMENT"],
         }
 
-    # ACLとCurrent条件を検索前Filterへ入れ、検索後にも同じ条件を再検証する。
+    # 第1段階: AI Searchへ渡す時点でACL・公開状態・SnapshotをFilterし、
+    # 不要／権限外の候補が検索結果へ入る確率を下げる。
+    # 第2段階の取得後検査は後で必ず行うため、ここだけでSecurityを成立させない。
     result = get_index(release).similarity_search(
         query_text=state["search_query"],
         columns=[
@@ -11848,9 +12083,11 @@ def retrieve_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         num_results=SEARCH_LIMIT,
         query_type="HYBRID",
     )
+    # SDK固有の配列ResponseをRetrievedDocumentへ変換する。
     raw_documents = parse_search_rows(result, state)
 
-    # Filter実装差やIndex不整合があっても、不合格ChunkをLLM／Traceへ渡さず分類だけ残す。
+    # 第2段階: 検索後にACL・公開状態・Snapshot・Metadataを再検証する。
+    # Filter実装差やIndex不整合があっても、不合格ChunkをLLM／Retriever Spanへ渡さず分類だけ残す。
     failures: list[str] = []
     accepted: list[RetrievedDocument] = []
     for document in raw_documents:
@@ -11861,18 +12098,26 @@ def retrieve_node(state: RagState, release: RagRelease) -> dict[str, Any]:
     # ACL／Current／Snapshot検査を通った証跡だけをRetriever Spanへ保存する。
     trace_retrieved_documents(accepted)
 
+    # 過去Attemptですでに見たChunk Versionを集合化する。
+    # Query Rewrite後に同じChunkしか返らなかった場合を「新しい証拠を得た」と誤判定しないために使う。
     previous_ids = {
         document.chunk_version_id for document in state["all_retrieved_documents"]
     }
+
+    # `accepted`は今回の検査合格全件、`new_documents`はそのうち過去Attemptと重複しない新規件だけ。
     new_documents = [
         document
         for document in accepted
         if document.chunk_version_id not in previous_ids
     ]
+    # 既存Evidenceと今回の新規Evidenceを統合し、Score順・Context上限で回答用Evidenceを作り直す。
+    # 全検索履歴は別Fieldへ残すため、Contextから落ちたChunkも検索履歴からは失われない。
     evidence, overflowed = select_answer_evidence(state["documents"], new_documents)
     if overflowed:
         failures.append("CONTEXT_BUDGET_APPLIED")
 
+    # 1回の検索をSearchAttemptとして構造化し、Query Rewrite前後の比較とLoop診断に使う。
+    # retrieved_* は今回の検査合格件、accepted_* はそのうち過去Attemptにない新規件を表す。
     attempt = SearchAttempt(
         attempt_number=len(state["search_attempts"]) + 1,
         query=state["search_query"],
@@ -11883,6 +12128,8 @@ def retrieve_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             document.chunk_version_id for document in new_documents
         ],
     )
+    # 検索回数・件数はReleaseの静的構成ではなくRequest固有の実行事実なのでTraceへ記録する。
+    # 「再検索が多いRequest」「新規Evidenceが増えないRequest」の絞り込みに使える。
     mlflow.update_current_trace(
         tags={
             "rag.search_count": str(attempt.attempt_number),
@@ -11890,6 +12137,8 @@ def retrieve_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             "rag.accepted_new_count": str(len(new_documents)),
         }
     )
+    # `documents`は現在の回答用Evidence、`all_retrieved_documents`は全Attemptの検査合格履歴。
+    # 役割を分けることで、回答Contextを絞りつつ検索履歴は保持する。
     return {
         "documents": evidence,
         "all_retrieved_documents": state["all_retrieved_documents"]
@@ -11912,6 +12161,8 @@ def update_attempt_reason(state: RagState, reason: str) -> list[SearchAttempt]:
 
 
     """
+    # 過去Attemptを直接Mutationせず、新しいlistを作る。
+    # 最新AttemptだけをPydanticのmodel_copyで差し替え、過去の検索証跡を不変に保つ。
     attempts = list(state["search_attempts"])
     attempts[-1] = attempts[-1].model_copy(
         update={"sufficiency_reason": reason}
@@ -11933,9 +12184,13 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
 
 
     """
+    # retrieve_nodeで権限なし等の固定拒否が決まった場合、十分性Judgeを呼ばずそのまま拒否する。
+    # SearchAttempt自体がない異常状態も安全側へ倒す。
     if state["next_step"] == "refuse" or not state["search_attempts"]:
         return {"next_step": "refuse"}
 
+    # ACL・Snapshot・Current不整合は「検索品質が低い」問題ではなくSecurity／Release事故の疑義。
+    # 再検索で解決しようとせず、人手確認へ送る。
     severe_failures = [
         failure
         for failure in state["validation_failures"]
@@ -11951,8 +12206,12 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             ),
         }
 
+    # 最新Attemptで新しいEvidenceを得られたかを見る。
+    # documentsが空なら根拠自体がなく、accepted_chunk_version_idsが空なら既知Evidenceしか増えていない。
     latest_attempt = state["search_attempts"][-1]
     if not state["documents"] or not latest_attempt.accepted_chunk_version_ids:
+
+        # Rewrite回数に余裕がある間だけ検索Queryの改善を試す。
         if state["rewrite_count"] < MAX_REWRITES:
             return {
                 "next_step": "rewrite",
@@ -11961,6 +12220,8 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
                     state, "No new accepted evidence"
                 ),
             }
+        # Rewrite上限まで試しても新規Evidenceが増えなければ終了する。
+        # Evidenceが一度も得られなかった場合と、Evidenceはあるが不足した場合で内部Reasonを分ける。
         return {
             "next_step": "refuse",
             "refusal_reason": (
@@ -11973,7 +12234,8 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             ),
         }
 
-    # 決定論的Gateを通った証跡だけを、意味的十分性Judgeへ渡す。
+    # Security・Version整合性の決定論的Gateを通ったEvidenceだけを意味的十分性Judgeへ渡す。
+    # LLMには「質問へ答えるのに内容が十分か」だけを判断させる。
     context = "\n\n".join(
         (
             f"[{document.citation_id}] "
@@ -11988,7 +12250,10 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         question=state["original_question"],
         context=context,
     )
+    # Judge結果はSearchDecision Schemaへ強制し、sufficient／missing_aspects／recommended_actionを受け取る。
     decision = invoke_structured_model(release, instruction, SearchDecision)
+
+    # 画像が必要とJudgeが判断しても、ReleaseでVision未承認なら勝手にMultimodalへ切り替えない。
     if decision.requires_visual_context and not release.multimodal_enabled:
         return {
             "next_step": "human_review",
@@ -11998,6 +12263,7 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             "validation_failures": state["validation_failures"]
             + ["VISUAL_CONTEXT_REQUIRED_BUT_RELEASE_DISABLED"],
         }
+    # Vision利用が承認済みでも、実際のページ画像がEvidenceに存在しない場合は自動回答しない。
     if decision.requires_visual_context and not any(
         document.page_image_uri for document in state["documents"]
     ):
@@ -12009,6 +12275,11 @@ def check_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             "validation_failures": state["validation_failures"]
             + ["VISUAL_CONTEXT_REQUIRED_BUT_IMAGE_MISSING"],
         }
+    # 分岐優先順位:
+    # 1. 十分かつ回答推奨の場合だけ回答生成へ進む。
+    # 2. 明示的な人手確認は再検索より優先する。
+    # 3. それ以外の不足はRewrite Budgetが残っていれば再検索する。
+    # 4. 上限到達後は根拠不足として拒否する。
     if decision.sufficient and decision.recommended_action == "answer":
         next_step = "answer"
     elif decision.recommended_action == "human_review":
@@ -12053,8 +12324,13 @@ def rewrite_node(state: RagState, release: RagRelease) -> dict[str, Any]:
     )
     response_text, _ = invoke_model_service(release, instruction)
     rewritten = response_text.strip()
+
+    # 大文字小文字や空白差だけのQueryを別Queryと数えないよう正規化する。
+    # LLMが実質同じQueryを繰り返してLoopするのを防ぐ。
     normalized = " ".join(rewritten.casefold().split())
     executed = {" ".join(query.casefold().split()) for query in state["executed_queries"]}
+    # 空Queryまたは過去実行済みQueryしか作れない場合は、
+    # これ以上検索しても新しい証拠が増えないと判断し再検索Loopを終了する。
     if not rewritten or normalized in executed:
         return {
             "next_step": "refuse",
@@ -12062,6 +12338,8 @@ def rewrite_node(state: RagState, release: RagRelease) -> dict[str, Any]:
             "validation_failures": state["validation_failures"]
             + ["DUPLICATE_REWRITE_QUERY"],
         }
+    # 新Queryと回数をStateへ記録する。
+    # next_step="rewrite" はbuild_graph側でretrieve Nodeへ接続される。
     return {
         "search_query": rewritten,
         "executed_queries": state["executed_queries"] + [rewritten],
@@ -12084,6 +12362,8 @@ def answer_node(state: RagState, release: RagRelease) -> dict[str, Any]:
 
 
     """
+    # 本文だけでなく安定した出典ID・文書Version・PageをContextへ明示する。
+    # 回答生成後に「どのVersionのどの根拠を使ったか」を機械検証できる境界を作る。
     context = "\n\n".join(
         (
             f"[{document.citation_id}]\n"
@@ -12101,6 +12381,7 @@ def answer_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         question=state["original_question"],
         context=context,
     )
+    # 画像は常時送らず、十分性判定でVisual Contextが必要と判断されたRequestだけに限定する。
     image_uris = [
         document.page_image_uri
         for document in state["documents"]
@@ -12111,6 +12392,8 @@ def answer_node(state: RagState, release: RagRelease) -> dict[str, Any]:
         instruction,
         image_uris=image_uris,
     )
+    # 回答本文の`[SRC-...]`文字列とは別に、API/UI/検証が使う構造化Citation一覧を作る。
+    # 後段では本文の出典IDがこの一覧に実在するかを照合する。
     citations = [
         Citation(
             citation_id=document.citation_id,
@@ -12143,11 +12426,16 @@ def deterministic_answer_failures(state: RagState) -> list[str]:
 
     """
     failures: list[str] = []
+
+    # 生成回答に現れた出典IDが、回答生成時に作ったCitation一覧に本当に存在するか照合する。
+    # LLMがもっともらしい`SRC-*`を捏造しても検出できる。
     known_ids = {citation.citation_id for citation in state["citations"]}
     used_ids = set(ANSWER_CITATION_PATTERN.findall(state["answer"]))
     unknown_ids = sorted(used_ids - known_ids)
     if unknown_ids:
         failures.append(f"UNKNOWN_CITATION:{','.join(unknown_ids)}")
+    # ある程度長い段落を「主要な主張を含む可能性が高い段落」とみなし、出典漏れを機械検出する。
+    # 40文字は意味判定ではなく、短い見出し等を除外するための簡易Heuristicである。
     paragraphs = [
         paragraph.strip()
         for paragraph in state["answer"].split("\n\n")
@@ -12155,6 +12443,7 @@ def deterministic_answer_failures(state: RagState) -> list[str]:
     ]
     if any(not ANSWER_CITATION_PATTERN.search(paragraph) for paragraph in paragraphs):
         failures.append("UNCITED_MAJOR_CLAIM")
+    # System PromptやSecretらしい文字列は意味Judgeより前に機械判定し、1件でも該当すれば公開候補から外す。
     if any(pattern.search(state["answer"]) for pattern in SENSITIVE_OUTPUT_PATTERNS):
         failures.append("SENSITIVE_OUTPUT_PATTERN")
     return failures
@@ -12174,6 +12463,8 @@ def validate_answer_node(state: RagState, release: RagRelease) -> dict[str, Any]
 
 
     """
+    # 第1段階はCodeだけで判定できる検査。
+    # ここで失敗した回答はLLM Judgeへ回して「救済」せず、その時点で公開を止める。
     failures = deterministic_answer_failures(state)
     if failures:
         return {
@@ -12187,6 +12478,8 @@ def validate_answer_node(state: RagState, release: RagRelease) -> dict[str, Any]
             "validation_failures": state["validation_failures"] + failures,
         }
 
+    # 第2段階の意味検証では、回答生成時に使った同じEvidenceだけをJudgeへ渡す。
+    # 新しい検索や外部知識をJudgeへ与えず、「この回答が与えられた根拠に沿うか」を確認する。
     context = "\n\n".join(
         f"[{document.citation_id}] {document.content}"
         for document in state["documents"]
@@ -12198,6 +12491,8 @@ def validate_answer_node(state: RagState, release: RagRelease) -> dict[str, Any]
         context=context,
         answer=state["answer"],
     )
+    # 回答生成で画像根拠を使った場合は、意味検証側にも同じ画像条件を渡す。
+    # 「生成は画像あり・検証はTextだけ」という条件ずれを防ぐ。
     validation_image_uris = [
         document.page_image_uri
         for document in state["documents"]
@@ -12209,6 +12504,8 @@ def validate_answer_node(state: RagState, release: RagRelease) -> dict[str, Any]
         AnswerValidation,
         image_uris=validation_image_uris,
     )
+    # Judgeが列挙した未出典Claimと矛盾を1つの失敗一覧へまとめる。
+    # grounded=False、未出典Claimあり、矛盾ありのいずれかなら自動公開しない。
     semantic_failures = validation.uncited_claims + validation.contradictions
     if not validation.grounded or semantic_failures:
         return {
@@ -12218,6 +12515,7 @@ def validate_answer_node(state: RagState, release: RagRelease) -> dict[str, Any]
             "validation_failures": state["validation_failures"]
             + [f"SEMANTIC:{item}" for item in semantic_failures],
         }
+    # 決定論的検査と意味検証の両方に合格した場合だけGraphを正常完了させる。
     return {"next_step": "complete"}
 
 
@@ -12293,7 +12591,11 @@ def build_graph(release: RagRelease):
 
 
     """
+    # `release`をClosureとして各NodeへBindする。
+    # Graph実行途中でproduction Alias等を再解決しないため、1 Request内の構成が固定される。
     workflow = StateGraph(RagState)
+
+    # 各NodeはRagStateの一部を更新し、判定Nodeが設定したnext_stepで経路を決める。
     workflow.add_node("retrieve", lambda state: retrieve_node(state, release))
     workflow.add_node("check", lambda state: check_node(state, release))
     workflow.add_node("rewrite", lambda state: rewrite_node(state, release))
@@ -12304,8 +12606,11 @@ def build_graph(release: RagRelease):
     )
     workflow.add_node("refuse", refuse_node)
     workflow.add_node("human_review", human_review_node)
+    # 正常系の入口は必ず検索から始め、その検索結果をcheck Nodeで評価する。
     workflow.add_edge(START, "retrieve")
     workflow.add_edge("retrieve", "check")
+
+    # check Nodeの結果に応じて、回答・再検索・拒否・人手確認の4経路へ分岐する。
     workflow.add_conditional_edges(
         "check",
         route_next,
@@ -12316,17 +12621,23 @@ def build_graph(release: RagRelease):
             "human_review": "human_review",
         },
     )
+    # Rewrite成功時はretrieveへ戻し、空／重複Queryならrefuseへ進む。
     workflow.add_conditional_edges(
         "rewrite",
         route_next,
         {"refuse": "refuse", "rewrite": "retrieve"},
     )
+
+    # 生成回答は直接ENDへ出さず、必ず回答検証Nodeを通す。
     workflow.add_edge("answer", "validate_answer")
+    # 回答検証に合格した場合だけENDへ進み、不合格回答は表示せず人手確認へ送る。
     workflow.add_conditional_edges(
         "validate_answer",
         route_next,
         {"complete": END, "human_review": "human_review"},
     )
+
+    # 拒否と人手確認はいずれも未検証回答を返さず終了する終端Node。
     workflow.add_edge("refuse", END)
     workflow.add_edge("human_review", END)
     return workflow.compile()
@@ -12353,18 +12664,27 @@ def initial_state(
 
     """
     return {
+        # Request固有情報。original_questionは不変で、search_queryだけRewriteにより更新される。
         "request_id": request_id,
         "original_question": question,
         "search_query": question,
+
+        # 認証済みIdentityからServer側で解決した権限情報。Client入力で途中変更しない。
         "identity_fixture_id": identity.fixture_id,
         "entitlement_hash": identity.entitlement_hash,
         "allowed_principals": identity.allowed_principals,
         "acl_policy_version": identity.acl_policy_version,
+
+        # Request開始時に固定するRelease構成。
+        # 以後のNodeはAliasや「最新」を引き直さず、このStateとBind済みreleaseを使う。
         "rag_release_id": release.rag_release_id,
         "corpus_snapshot_id": release.corpus_snapshot_id,
         "index_release_id": release.index_release_id,
         "prompt_uris": release.prompt_uris,
         "model_service": release.model_service,
+
+        # 検索・回答処理で更新される可変State。
+        # documentsは現在の回答用Evidence、all_retrieved_documentsは全Attemptの検査合格履歴。
         "documents": [],
         "all_retrieved_documents": [],
         "search_attempts": [],
@@ -12372,7 +12692,12 @@ def initial_state(
         "missing_aspects": [],
         "requires_visual_context": False,
         "rewrite_count": 0,
+
+        # Graph自体はSTART→retrieveで始まるため、この初期値だけでRewriteへ飛ぶわけではない。
+        # retrieve/checkが状況に応じてnext_stepを上書きし、Conditional Edgeで利用する。
         "next_step": "rewrite",
+
+        # 回答・拒否・人手確認の最終状態。
         "answer": "",
         "citations": [],
         "refused": False,
@@ -12394,9 +12719,12 @@ def to_result(state: RagState) -> RagResult:
 
 
     """
+    # APIへ返す取得文書一覧は、全検索履歴ではなく最終的な回答用Evidenceから作る。
     documents = state["documents"]
     return RagResult(
         answer=state["answer"],
+
+        # 同一文書の複数Chunkがあっても、文書IDは順序を保ったまま重複排除する。
         retrieved_document_ids=list(
             dict.fromkeys(document.document_id for document in documents)
         ),
@@ -12409,6 +12737,8 @@ def to_result(state: RagState) -> RagResult:
         citations=state["citations"],
         search_attempts=state["search_attempts"],
         search_count=len(state["search_attempts"]),
+
+        # Stateへ蓄積したValidation Failureから、API／Evaluationで使うSecurity系件数を集計する。
         acl_violation_count=sum(
             failure.startswith("ACL_MISMATCH")
             for failure in state["validation_failures"]
@@ -12448,17 +12778,25 @@ def run_graph(
 
 
     """
+    # Root Traceへ、承認済み構成を引くRelease IDとRequest固有の権限Hashを付与する。
+    # Prompt／Index／Model等の静的構成詳細はRelease台帳から参照し、Traceへ重複コピーしない。
     mlflow.update_current_trace(
         tags={
             "rag.release_id": release.rag_release_id,
             "rag.entitlement_hash": identity.entitlement_hash,
         }
     )
+
+    # 同じReleaseをBindしたGraphを構築し、同じ初期Stateで最後まで同期実行する。
     graph = build_graph(release)
     final_state = graph.invoke(
         initial_state(question, identity, release, request_id)
     )
+    # LangGraph内部Stateを外部契約RagResultへ変換してから、最終OutcomeをTraceへ記録する。
     result = to_result(final_state)
+
+    # これらはRequestごとに変わる実行結果であり、
+    # 運用時に拒否・人手確認対象Traceを絞り込むためのTagとして残す。
     mlflow.update_current_trace(
         tags={
             "rag.refused": str(result.refused).lower(),
@@ -12480,10 +12818,10 @@ def run_graph(
 
 | 順序 | 完了Node | 主なState差分 | 次のNode |
 | ---: | --- | --- | --- |
-| 1 | `retrieve` | `documents=[chk-a110...]`、`search_count=1`、ACL違反0 | `check` |
-| 2 | `check` | `missing_aspects=[]`、`next_step='answer'` | `answer` |
-| 3 | `answer` | 出典付き`answer`、構造化`citations` | `validate_answer` |
-| 4 | `validate_answer` | `validation_failures=[]`、`next_step='complete'` | 終了 |
+| 1 | `retrieve`（文書検索を実行する処理Node名） | `documents=[chk-a110...]`、`search_count=1`、ACL違反0 | `check`（取得根拠が十分か確認する処理Node名） |
+| 2 | `check`（取得根拠が十分か確認する処理Node名） | `missing_aspects=[]`、`next_step='answer'` | `answer`（回答生成を行う処理Node名） |
+| 3 | `answer`（回答生成を行う処理Node名） | 出典付き`answer`（回答生成を行う処理Node名）、構造化`citations` | `validate_answer`（生成回答を検証する処理Node名） |
+| 4 | `validate_answer`（生成回答を検証する処理Node名） | `validation_failures=[]`、`next_step='complete'` | 終了 |
 
 ```json
 {
@@ -12501,23 +12839,23 @@ def run_graph(
 }
 ```
 
-検索結果が不足する場合は`retrieve -> check -> rewrite -> retrieve`と進む。上限到達、Query重複、ACL／Current疑義、回答検証失敗では、回答本文を公開せず`refuse`または`human_review`へ分岐する。
+検索結果が不足する場合は`retrieve -> check -> rewrite -> retrieve`と進む。上限到達、Query重複、ACL／Current疑義、回答検証失敗では、回答本文を公開せず`refuse`（回答拒否へ進む処理経路名）または`human_review`（人手確認へ処理を送る経路名）へ分岐する。
 
-`allowed_principals` がArray列の場合のFilter意味論は、採用するAI Search SDK／Endpoint TypeでGolden ACL Testを実行して固定する。Workspaceで期待するintersection動作を満たさない場合は、Principal単位の検索用行へ正規化するなど、検索前に完全一致Filterできる物理Schemaへ変更する。曖昧なClient側Filterだけで本番ACLを成立させない。
+`allowed_principals`（この文書を検索できるUser／Group識別子の一覧） がArray列の場合のFilter意味論は、採用するAI Search SDK／Endpoint TypeでGolden ACL Testを実行して固定する。Workspaceで期待するintersection動作を満たさない場合は、Principal単位の検索用行へ正規化するなど、検索前に完全一致Filterできる物理Schemaへ変更する。曖昧なClient側Filterだけで本番ACLを成立させない。
 
-MLflow Retrieval Scorer向けSpanは、検索Nodeの内部Stateをそのまま出力せず、`page_content`と`metadata.doc_uri`／`chunk_id`を持つDocument一覧へ正規化する。`doc_uri`にはRaw Storage PathではなくOpaqueな`source_ref`を使う。
+MLflow Retrieval Scorer向けSpanは、検索Nodeの内部Stateをそのまま出力せず、`page_content`（MLflow Retriever Documentへ渡すChunk本文Field）と`metadata.doc_uri`（MLflow Retriever Document Metadata内の文書参照URI Field）／`chunk_id`（MLflow Retriever Document内の取得Chunkを識別するID）を持つDocument一覧へ正規化する。`doc_uri`（MLflow Retriever Document Metadataで取得元を参照するField）にはRaw Storage PathではなくOpaqueな`source_ref`（取得根拠をTrace・回答から参照する識別子）を使う。
 
 | Node | 外部呼び出し | 主な判定 | 失敗時 |
 | --- | --- | --- | --- |
-| `retrieve` | AI Search、Embedding Resource | ACL、Current、Snapshot、metadata、重複、Context上限 | 再検索または人手確認 |
-| `check` | Model Service | 決定論的Gate後の意味的十分性 | 再検索、拒否、人手確認 |
-| `rewrite` | Model Service | Query重複、最大回数 | 拒否 |
-| `answer` | Model Service | 安定した出典付き回答生成 | Modelエラーとして遮断 |
-| `validate_answer` | Application検査＋Model Service | 出典実在、未引用Claim、禁止出力、支持・矛盾 | 人手確認 |
-| `refuse` | なし | 内部理由を開示しない固定応答 | 終了 |
-| `human_review` | なし | 疑義ある回答を表示しない | Review候補化 |
+| `retrieve`（文書検索を実行する処理Node名） | AI Search、Embedding Resource | ACL、Current、Snapshot、metadata、重複、Context上限 | 再検索または人手確認 |
+| `check`（取得根拠が十分か確認する処理Node名） | Model Service | 決定論的Gate後の意味的十分性 | 再検索、拒否、人手確認 |
+| `rewrite`（検索Query書換えへ進む処理経路名） | Model Service | Query重複、最大回数 | 拒否 |
+| `answer`（回答生成を行う処理Node名） | Model Service | 安定した出典付き回答生成 | Modelエラーとして遮断 |
+| `validate_answer`（生成回答を検証する処理Node名） | Application検査＋Model Service | 出典実在、未引用Claim、禁止出力、支持・矛盾 | 人手確認 |
+| `refuse`（回答拒否へ進む処理経路名） | なし | 内部理由を開示しない固定応答 | 終了 |
+| `human_review`（人手確認へ処理を送る経路名） | なし | 疑義ある回答を表示しない | Review候補化 |
 
-Model ServiceはモデルRouteと統制の実行面、AI Searchは検索面、Agent ServerはGraphとPolicyの実行面である。基盤モデルを変える場合はリリース構成台帳が参照するModel ServiceまたはそのDestination Routeを変更し、Prompt、Index、Code、モデル経路をまとめた別の`rag_release_id`としてリリース判定を行う。
+Model ServiceはモデルRouteと統制の実行面、AI Searchは検索面、Agent ServerはGraphとPolicyの実行面である。基盤モデルを変える場合はリリース構成台帳が参照するModel ServiceまたはそのDestination Routeを変更し、Prompt、Index、Code、モデル経路をまとめた別の`rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID）としてリリース判定を行う。
 
 ##### 4.3.4.8 EvaluationDataset・Scorer
 
@@ -12535,11 +12873,11 @@ flowchart TD
     MON --> ASSESS
 ```
 
-Evaluation Caseは質問グループと実行時バージョンを分離する。`case_family_id`は質問の意味、業務目的、文書グループから作り、Snapshotを含めない。Training／HoldoutはこのIDのHashで固定する。`case_instance_id`は質問グループ、Identity fixture、文書集合スナップショット、`expectation_version`を含む個別ケースIDであり、文書改訂で期待値が変わる場合は同じグループに新Instanceを追加する。
+Evaluation Caseは質問グループと実行時バージョンを分離する。`case_family_id`（同じ意味・業務目的の評価Case群を識別するID）は質問の意味、業務目的、文書グループから作り、Snapshotを含めない。Training／HoldoutはこのIDのHashで固定する。`case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID）は質問グループ、Identity fixture、文書集合スナップショット、`expectation_version`（評価Caseの期待値定義のVersion）を含む個別ケースIDであり、文書改訂で期待値が変わる場合は同じグループに新Instanceを追加する。
 
 Datasetには期待回答だけでなく、Snapshot、Index Release、期待文書／Chunk／出典、拒否理由、最大検索Attempt、Identity fixtureを保存する。ProductionのUser Headerや任意のScopeはDatasetへ入れず、評価専用の承認済みFixtureをサーバー側でEntitlementへ解決する。
 
-`bundles/quality/src/seed_evaluation_dataset.py`
+`bundles/quality/src/seed_evaluation_dataset.py`（固定した評価CaseをTraining／Holdout EvaluationDatasetへ登録し、再現可能な評価母集団を作る処理）
 
 **実装概要**
 
@@ -12547,9 +12885,9 @@ Datasetには期待回答だけでなく、Snapshot、Index Release、期待文�
 | --- | --- |
 | 目的 | Snapshotと権限評価用テスト条件を固定したTraining EvaluationDatasetを作る。 |
 | 入力 | Seed、Snapshot ID、権限評価用テスト条件、Dataset FQN。初期セットアップまたはCase追加時に読む。 |
-| 処理 | 入力をMaskし`case_id`でMLflow Expectationをmergeする。Holdout混入とACL条件欠落を拒否し、Dataset Digestを評価Runへ渡す。 |
+| 処理 | 入力をMaskし`case_id`（評価Caseを識別するID）でMLflow Expectationをmergeする。Holdout混入とACL条件欠落を拒否し、Dataset Digestを評価Runへ渡す。 |
 | 出力 | EvaluationDataset Recordを作成し、EvaluationとPrompt Optimizationが使用する。 |
-| 失敗・再実行 | 既存Datasetを破壊せず、`case_id`で冪等mergeする。 |
+| 失敗・再実行 | 既存Datasetを破壊せず、`case_id`（評価Caseを識別するID）で冪等mergeする。 |
 
 ```python
 """Snapshotと権限評価用テスト条件を固定した開発用EvaluationDatasetを作成するModule。Holdoutの恣意的な入替えは行わない。
@@ -12710,9 +13048,9 @@ if __name__ == "__main__":
     main()
 ```
 
-Golden Setには通常質問だけでなく、文書バージョン競合、削除／失効、古い文書だけの検索、Parseエラー、0件、同一Query Rewrite、再検索上限、ACL境界、Prompt Injection、System Prompt／Secret抽出要求を含める。同じ質問グループの旧Snapshot版と新Snapshot版はグループHashにより同じSplitへ置き、MLflow Expectation変更は上書きせず`expectation_version`を増やす。`seed_evaluation_cases.json`は両Splitへ十分な質問グループが入ること、カテゴリ、ACL、拒否、セキュリティCaseの分布が偏りすぎないことをCIで検査する。
+Golden Setには通常質問だけでなく、文書バージョン競合、削除／失効、古い文書だけの検索、Parseエラー、0件、同一Query Rewrite、再検索上限、ACL境界、Prompt Injection、System Prompt／Secret抽出要求を含める。同じ質問グループの旧Snapshot版と新Snapshot版はグループHashにより同じSplitへ置き、MLflow Expectation変更は上書きせず`expectation_version`（評価Caseの期待値定義のVersion）を増やす。`seed_evaluation_cases.json`（EvaluationDatasetへ投入する質問・期待文書・期待回答・ACL条件等のSeed Case定義）は両Splitへ十分な質問グループが入ること、カテゴリ、ACL、拒否、セキュリティCaseの分布が偏りすぎないことをCIで検査する。
 
-`bundles/quality/src/evaluate_rag.py`
+`bundles/quality/src/evaluate_rag.py`（本番候補RAGをEvaluationするPythonファイル）
 
 **実装概要**
 
@@ -12724,9 +13062,9 @@ Golden Setには通常質問だけでなく、文書バージョン競合、削�
 | 出力 | Evaluation Run、Trace、Metricを作り、リリース判定とレビュー待ちキューへ渡す。 |
 | 失敗・再実行 | 失敗Recordを保持してReleaseを昇格しない。過去Runを上書きしない。 |
 
-本番の`predict_fn`もPromptではなく、EvaluationDatasetと評価対象Applicationを接続するAdapter／Callbackである。Dataset Recordの`inputs`にある`question`、`identity_fixture_id`、`rag_release_id`、`corpus_snapshot_id`、`index_release_id`が同名引数へ渡され、Recordごとに実際のRAG Graphを1回実行する。戻り値の`outputs`と実行TraceをCustom Code ScorerとBuilt-in Judgeが評価する。
+本番の`predict_fn`（MLflow Evaluationが評価対象RAGを実行するために呼ぶ関数）もPromptではなく、EvaluationDatasetと評価対象Applicationを接続するAdapter／Callbackである。Dataset Recordの`inputs`（Evaluation Datasetへ保存する評価対象の入力）にある`question`（評価・RAGへ入力する質問）、`identity_fixture_id`（評価時に再現する利用者権限条件を識別するID）、`rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID）、`corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID）、`index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID）が同名引数へ渡され、Recordごとに実際のRAG Graphを1回実行する。戻り値の`outputs`（既存実行結果として保存する評価対象の出力）と実行TraceをCustom Code ScorerとBuilt-in Judgeが評価する。
 
-PoC版が`question`だけをRecord入力にし、Index等を評価Run全体の`args`で固定したのに対し、本番版はCaseごとのACL条件とRelease再現性も評価するため引数が多い。どちらも評価専用RAGを`predict_fn`内に作らず、実利用と同じApplication Entry Point（本番では`run_graph()`）を呼ぶ。
+PoC版が`question`（評価・RAGへ入力する質問）だけをRecord入力にし、Index等を評価Run全体の`args`（コマンドライン引数を保持する値）で固定したのに対し、本番版はCaseごとのACL条件とRelease再現性も評価するため引数が多い。どちらも評価専用RAGを`predict_fn`（MLflow Evaluationが評価対象RAGを実行するために呼ぶ関数）内に作らず、実利用と同じApplication Entry Point（本番では`run_graph()`（本番LangGraphを1 Request実行する関数））を呼ぶ。
 
 ```python
 """Retrieval、回答、拒否、ACL、Agent経路を階層別Scorerで評価するModule。評価不合格Releaseを昇格しない。
@@ -12986,13 +13324,13 @@ results = mlflow.genai.evaluate(
 
 Primary Key、削除反映、Parseエラー率はRAG Responseではなく、Ingestion／Index リリース判定がDelta SQLで評価する。意味理解を必要としない条件をLLM Judgeへ委ねない。Hash Split後はカテゴリ、ACL区分、拒否、文書種別、セキュリティCaseの件数と比率をTraining／Holdout間で比較し、少数カテゴリがHoldoutに0件なら品質責任者承認のもと質問グループ単位でSplit Policyバージョンを更新する。
 
-EvaluationDatasetはUnity Catalogで管理し、Dataset名、Datasetバージョン／Digest、Lineage、Split PolicyバージョンをEvaluation Runとリリース構成台帳へ記録する。候補探索は`internal_rag_train`、最終Gateは`internal_rag_holdout`だけを読み、評価結果を見た後にCaseを移動しない。Built-in JudgeとCustom JudgeはExperimentへ登録してバージョンを固定する。Code-based ScorerはScorer Registryへ登録できる前提にせず、Git CommitとQuality Wheel バージョンを正本として固定する。
+EvaluationDatasetはUnity Catalogで管理し、Dataset名、Datasetバージョン／Digest、Lineage、Split PolicyバージョンをEvaluation Runとリリース構成台帳へ記録する。候補探索は`internal_rag_train`（内部・RAG・Trainingを保持する項目）、最終Gateは`internal_rag_holdout`（内部・RAG・Holdoutを保持する項目）だけを読み、評価結果を見た後にCaseを移動しない。Built-in JudgeとCustom JudgeはExperimentへ登録してバージョンを固定する。Code-based ScorerはScorer Registryへ登録できる前提にせず、Git CommitとQuality Wheel バージョンを正本として固定する。
 
 ##### 4.3.4.9 Production Identity・評価Fixture
 
-Databricks Apps Proxyが付与する `X-Forwarded-Email`、`X-Forwarded-User`、User Authorizationの `x-forwarded-access-token` は、Databricks Apps内の公開入口でだけ信頼する。同じApp内のStreamlitからlocalhost Agent ServerへHeaderは自動継承されないため、StreamlitがTokenを明示的に内部Requestへ転送する。Token、Email、Group一覧はTraceへ保存しない。
+Databricks Apps Proxyが付与する `X-Forwarded-Email`、`X-Forwarded-User`、User Authorizationの `x-forwarded-access-token`（Appから認証済みUser Tokenを受け取るHTTP Header名） は、Databricks Apps内の公開入口でだけ信頼する。同じApp内のStreamlitからlocalhost Agent ServerへHeaderは自動継承されないため、StreamlitがTokenを明示的に内部Requestへ転送する。Token、Email、Group一覧はTraceへ保存しない。
 
-`bundles/realtime/app/identity_context.py`
+`bundles/realtime/app/identity_context.py`（利用者IdentityをServer側で解決し、検索に使うPrincipal集合と権限Hashを生成する処理）
 
 **実装概要**
 
@@ -13106,7 +13444,7 @@ def resolve_production_identity(user_access_token: str | None) -> EntitlementCon
     )
 ```
 
-**想定出力サンプル（`EntitlementContext`）**
+**想定出力サンプル（`EntitlementContext`（認証済み利用者の権限情報を保持する型））**
 
 ```json
 {
@@ -13122,11 +13460,11 @@ def resolve_production_identity(user_access_token: str | None) -> EntitlementCon
 }
 ```
 
-Access Token、Email、Group表示名は出力・Traceへ残さない。Token欠落、Principal上限超過、Account API失敗時は`EntitlementContext`を返さず、検索を開始しない。
+Access Token、Email、Group表示名は出力・Traceへ残さない。Token欠落、Principal上限超過、Account API失敗時は`EntitlementContext`（認証済み利用者の権限情報を保持する型）を返さず、検索を開始しない。
 
-ProductionはUser Authorization TokenからDatabricks AccountのUser／Groupを解決する。組織独自の権限台帳を使う場合は、上の `principals` を入力に、認可付きSQL Warehouseまたは社内Authorization APIへサーバー側照会する。Identity欠落、Group過多、Policyバージョン不一致、台帳TimeoutはFail Closedとする。App Service PrincipalはIndex全体へ `SELECT` できるため、Query前Filterと検索後検査の両方を必須にする。
+ProductionはUser Authorization TokenからDatabricks AccountのUser／Groupを解決する。組織独自の権限台帳を使う場合は、上の `principals`（利用者本人と所属Groupを表す権限主体の集合） を入力に、認可付きSQL Warehouseまたは社内Authorization APIへサーバー側照会する。Identity欠落、Group過多、Policyバージョン不一致、台帳TimeoutはFail Closedとする。App Service PrincipalはIndex全体へ `SELECT`（Table／Viewを読み取るSQL権限） できるため、Query前Filterと検索後検査の両方を必須にする。
 
-Evaluation JobはToken Headerを偽装せず、`quality` Bundleだけが読める承認済み `identity_fixtures.json` を `resolve_evaluation_fixture()` で読み込む。Fixtureには架空Subject、Group ID、ACL Policyバージョンを保存し、Production ResolverからImportしない。
+Evaluation JobはToken Headerを偽装せず、`quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） Bundleだけが読める承認済み `identity_fixtures.json`（Evaluationで再現する利用者Principal集合とACL条件を固定するIdentity Fixture定義） を `resolve_evaluation_fixture()`（評価Case用の固定権限・文書集合条件を解決する関数） で読み込む。Fixtureには架空Subject、Group ID、ACL Policyバージョンを保存し、Production ResolverからImportしない。
 
 ```text
 Databricks Apps Proxy
@@ -13140,17 +13478,17 @@ EntitlementContext
 AI Search
 ```
 
-##### 4.3.4.10 Agent Serverの`@stream`
+##### 4.3.4.10 Agent Serverの`@stream`（Agent Serverで逐次応答を有効にするDecorator）
 
-`@stream()` を主経路とし、`graph.astream(..., stream_mode="updates")` から実際に完了したNodeを取得する。進捗は `progress_*` Item、最終回答は `answer_*` Itemへ分離するため、Responses APIの完成本文へ「検索しています」などを混ぜない。Chain-of-Thought、Judge理由、ACL詳細は送らない。回答Token自体はModelから逐次転送せず、検証済み完成回答をChunk分割するため、「Node進捗Streaming＋検証後Text Streaming」でありToken Streamingではない。
+`@stream()`（Agent Serverで逐次応答を有効にするDecorator呼出し） を主経路とし、`graph.astream(..., stream_mode="updates")`（LangGraphのNode更新を非同期Streamで受け取る呼出し） から実際に完了したNodeを取得する。進捗は `progress_*`（Responses APIで進捗通知Itemへ付けるID Prefix） Item、最終回答は `answer_*`（Responses APIで最終回答Itemへ付けるID Prefix） Itemへ分離するため、Responses APIの完成本文へ「検索しています」などを混ぜない。Chain-of-Thought、Judge理由、ACL詳細は送らない。回答Token自体はModelから逐次転送せず、検証済み完成回答をChunk分割するため、「Node進捗Streaming＋検証後Text Streaming」でありToken Streamingではない。
 
-`bundles/realtime/app/agent.py`
+`bundles/realtime/app/agent.py`（Agent ServerのRequestを認証済みRAG Graphへ接続し、Streaming Responseへ変換するAdapter）
 
 **実装概要**
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | `@stream`でGraph進捗と最終ResponseをSSEへ変換する。 |
+| 目的 | `@stream`（Agent Serverで逐次応答を有効にするDecorator）でGraph進捗と最終ResponseをSSEへ変換する。 |
 | 入力 | Request、Identity Header、Graph Event。Responses API Requestごとに読む。 |
 | 処理 | 入力検証後、安全な進捗だけをyieldする。Chain-of-ThoughtやRaw Chunkを配信せず、Root TraceとNode SpanをRealtime Experimentへ関連付ける。 |
 | 出力 | Responses API互換SSE EventをStreamlitと監視へ返す。 |
@@ -13435,15 +13773,15 @@ data: {"type":"response.output_item.done","item":{"id":"answer_b2","content":[{"
 data: [DONE]
 ```
 
-Progress用`item_id`と回答用`item_id`を分けるため、Streamlitは進捗文字列を最終回答へ混入させない。エラー時もStack Traceではなく固定拒否Eventを返す。
+Progress用`item_id`（Responses APIの出力Itemを識別するID）と回答用`item_id`（Responses APIの出力Itemを識別するID）を分けるため、Streamlitは進捗文字列を最終回答へ混入させない。エラー時もStack Traceではなく固定拒否Eventを返す。
 
-Node実行やModel呼び出しがExceptionになった場合は、`safe_graph_updates()`がTraceへ`SEARCH_ERROR`または`MODEL_ERROR`を付与し、固定応答へ変換する。Raw Exception、Token、Query Filter、権限外文書候補はClientへ返さない。429、Timeout、Circuit Breakerの再試行回数はSDK共通設定で上限を固定し、同じRequest内で無制限再試行しない。
+Node実行やModel呼び出しがExceptionになった場合は、`safe_graph_updates()`（Graph実行中の例外を安全な応答へ変換しつつ更新を返す関数）がTraceへ`SEARCH_ERROR`（検索・エラーを指定する設定値／環境変数）または`MODEL_ERROR`（Model・エラーを指定する設定値／環境変数）を付与し、固定応答へ変換する。Raw Exception、Token、Query Filter、権限外文書候補はClientへ返さない。429、Timeout、Circuit Breakerの再試行回数はSDK共通設定で上限を固定し、同じRequest内で無制限再試行しない。
 
 ##### 4.3.4.11 Agent ServerのBuild metadata検証
 
-MLflow 3.4以降の現行APIは `mlflow.genai.enable_git_model_versioning()` でありExperimentalである。Git repositoryを読める開発・CI環境ではLoggedModelとTraceを自動関連付けできるが、Databricks Git Foldersは公式に未対応で、Databricks Apps配布物に `.git` がある保証もない。したがってApp 実行環境では `git rev-parse` や旧Helperへ依存せず、CI/CDが注入したCommit、Repository、Build ID、Dirty=falseを検証し、リリース構成台帳とTraceへ明示保存する。
+MLflow 3.4以降の現行APIは `mlflow.genai.enable_git_model_versioning()`（Git情報とMLflow Model Versionの関連付けを有効にするAPI） でありExperimentalである。Git repositoryを読める開発・CI環境ではLoggedModelとTraceを自動関連付けできるが、Databricks Git Foldersは公式に未対応で、Databricks Apps配布物に `.git` がある保証もない。したがってApp 実行環境では `git rev-parse`（現在のGit Commitを取得するCLIコマンド） や旧Helperへ依存せず、CI/CDが注入したCommit、Repository、Build ID、Dirty=falseを検証し、リリース構成台帳とTraceへ明示保存する。
 
-`bundles/realtime/app/start_server.py`
+`bundles/realtime/app/start_server.py`（RAG AgentをAgent Serverとして起動し、Responses API／Streamingの受付口を公開する処理）
 
 **実装概要**
 
@@ -13544,7 +13882,7 @@ if __name__ == "__main__":
 | 状態 | 起動結果 | Log例 |
 | --- | --- | --- |
 | 必須Build metadataあり、`APP_GIT_DIRTY=false` | 起動 | `AgentServer ResponsesAgent listening on 127.0.0.1:8001` |
-| `APP_GIT_COMMIT`欠落 | 起動停止 | `RuntimeError: Missing build metadata: ['APP_GIT_COMMIT']` |
+| `APP_GIT_COMMIT`（app・Git・Commitを指定する設定値／環境変数）欠落 | 起動停止 | `RuntimeError: Missing build metadata: ['APP_GIT_COMMIT']` |
 | `APP_GIT_DIRTY=true` | 起動停止 | `RuntimeError: Dirty source build is not allowed in production` |
 
 成功時もAgent Serverを外部へ直接公開せず、同一Databricks App内のStreamlitからlocalhost経由で呼び出す。
@@ -13581,13 +13919,13 @@ def verify_git_versioning_in_ci() -> None:
         raise RuntimeError("CI commit and MLflow Git context do not match")
 ```
 
-`APP_GIT_COMMIT`を設定しても`enable_git_model_versioning()`がその環境変数をGit metadataとして読むとは公式に保証されない。自動関連付けが必要な処理はGit checkout上で実行し、Apps実行環境はリリース構成台帳とRoot Trace TagをFallbackの監査正本とする。再現性はCommit単体ではなく、Wheel、Promptバージョン、Index Release、文書集合スナップショット、モデル経路を含む`rag_release_id`で保証する。
+`APP_GIT_COMMIT`（app・Git・Commitを指定する設定値／環境変数）を設定しても`enable_git_model_versioning()`（Git情報とMLflow Model Versionの関連付けを有効にするAPI）がその環境変数をGit metadataとして読むとは公式に保証されない。自動関連付けが必要な処理はGit checkout上で実行し、Apps実行環境はリリース構成台帳とRoot Trace TagをFallbackの監査正本とする。再現性はCommit単体ではなく、Wheel、Promptバージョン、Index Release、文書集合スナップショット、モデル経路を含む`rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID）で保証する。
 
 ##### 4.3.4.12 Streamlit
 
-StreamlitはApps Proxyから受け取ったUser Authorization Tokenをlocalhostへだけ転送する。TokenをPayload、Session State、Log、Traceへ保存しない。`progress_*` のDeltaはStatus表示へ、`answer_*` のDeltaだけを `st.write_stream()` へ渡し、最終Eventの出典 annotationを別表で表示する。
+StreamlitはApps Proxyから受け取ったUser Authorization Tokenをlocalhostへだけ転送する。TokenをPayload、Session State、Log、Traceへ保存しない。`progress_*`（Responses APIで進捗通知Itemへ付けるID Prefix） のDeltaはStatus表示へ、`answer_*`（Responses APIで最終回答Itemへ付けるID Prefix） のDeltaだけを `st.write_stream()`（Streamlitで逐次出力を表示するAPI） へ渡し、最終Eventの出典 annotationを別表で表示する。
 
-`bundles/realtime/app/streamlit_app.py`
+`bundles/realtime/app/streamlit_app.py`（利用者の質問入力・Streaming表示・出典表示を行うDatabricks Appsの画面処理）
 
 **実装概要**
 
@@ -13733,9 +14071,9 @@ if question := st.chat_input("技術文書について質問してください")
 
 | 表示領域 | 表示例 | 元Event |
 | --- | --- | --- |
-| Status | `回答に必要な根拠を確認しました。` | `progress_*`の`response.output_text.delta` |
-| 回答 | `検索にはDatabricks AI Searchを利用します。[SRC-8A10F2C9B331]` | `answer_*`のDeltaを`st.write_stream()`で連結 |
-| 出典 | `社内RAGアーキテクチャガイド p.2` | 最終`response.output_item.done`の`annotations` |
+| Status | `回答に必要な根拠を確認しました。` | `progress_*`（Responses APIで進捗通知Itemへ付けるID Prefix）の`response.output_text.delta`（Responses APIで返すEvent Type） |
+| 回答 | `検索にはDatabricks AI Searchを利用します。[SRC-8A10F2C9B331]` | `answer_*`（Responses APIで最終回答Itemへ付けるID Prefix）のDeltaを`st.write_stream()`（Streamlitで逐次出力を表示するAPI）で連結 |
+| 出典 | `社内RAGアーキテクチャガイド p.2` | 最終`response.output_item.done`（Responses APIで返すEvent Type）の`annotations` |
 | 認証エラー | `利用者権限を確認できないため検索できません。` | Token欠落時の`PermissionError` |
 | 実行環境 エラー | `検索処理に失敗しました。時間をおいて再実行してください。` | 内部エラーを安全な固定文へ変換 |
 
@@ -13745,17 +14083,17 @@ if question := st.chat_input("技術文書について質問してください")
 
 ##### 4.3.4.13 Databricks Apps Resource
 
-`app.yaml`の`valueFrom`はApps Resource Keyを値へ解決するだけであり、リリース構成台帳が参照する任意Resourceへ自動権限を与えない。AI Search Index、Experiment、SQL Warehouseは対応するApps Resource Bindingを使う。一方、2026年8月時点のApps／DAB Resource BindingはUnity AI Gateway Model ServiceをSupported Resource Typeとして公開していないため、架空の`MODEL_SERVICE` Bindingを作らず、TerraformがApp Service Principalへ親Catalog／Schemaと対象Model Serviceの`EXECUTE`を直接付与する。実行環境Health Checkはリリース構成台帳のIndex／Model Serviceが承認済みリリースに含まれ、最小Query／Inferenceが成功することを確認してからReadinessを返す。
+`app.yaml`（Databricks Appの実行設定を定義するファイル）の`valueFrom`（Databricks Apps Resource Keyから値を解決する設定項目）はApps Resource Keyを値へ解決するだけであり、リリース構成台帳が参照する任意Resourceへ自動権限を与えない。AI Search Index、Experiment、SQL Warehouseは対応するApps Resource Bindingを使う。一方、2026年8月時点のApps／DAB Resource BindingはUnity AI Gateway Model ServiceをSupported Resource Typeとして公開していないため、架空の`MODEL_SERVICE`（Model・Serviceを指定する設定値／環境変数） Bindingを作らず、TerraformがApp Service Principalへ親Catalog／Schemaと対象Model Serviceの`EXECUTE`（対象Function／Model等を実行するSQL権限）を直接付与する。実行環境Health Checkはリリース構成台帳のIndex／Model Serviceが承認済みリリースに含まれ、最小Query／Inferenceが成功することを確認してからReadinessを返す。
 
-`bundles/realtime/databricks.yml`
+`bundles/realtime/databricks.yml`（Realtime RAG Applicationと本番参照値を配備するDAB Bundle設定）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | このFileの責務 | Realtime App、Resource Binding、環境別Experiment／Index／Warehouse参照のBundle入口を定義する |
-| 実行契機／変数解決 | CIが初期セットアップ出力とRelease候補を`BUNDLE_VAR_*`で注入し、`bundle validate/deploy`がResource YAMLへ展開する |
+| 実行契機／変数解決 | CIが初期セットアップ出力とRelease候補を`BUNDLE_VAR_*`（DAB Bundleへ環境別値を渡す変数名Pattern）で注入し、`bundle validate/deploy`（対象Resource／ソースを指す物理パス）がResource YAMLへ展開する |
 | 重要な判定 | ExperimentをこのBundleで再作成せず、SDKによる初期セットアップで確定したIDだけを参照する |
 | 正常／失敗／再試行 | 同Targetへ再DeployしてApp定義へ収束。Validate失敗時は稼働中Appを変更しない |
-| 後続処理 | `realtime_app.yml`がBinding、`app.yaml`が`valueFrom`をProcess Environmentへ解決する |
+| 後続処理 | `realtime_app.yml`（Realtime RAGのDatabricks App Resource・Binding・環境変数参照を定義する設定）がBinding、`app.yaml`（Databricks Appの実行設定を定義するファイル）が`valueFrom`（Databricks Apps Resource Keyから値を解決する設定項目）をProcess Environmentへ解決する |
 
 ```yaml
 # Realtime Applicationを独立DeployするBundleと環境固有参照を定義する。
@@ -13792,7 +14130,7 @@ targets:
     mode: production
 ```
 
-`bundles/realtime/resources/realtime_app.yml`
+`bundles/realtime/resources/realtime_app.yml`（Realtime RAGのDatabricks App Resource・Binding・環境変数参照を定義する設定）
 
 **実装概要**
 
@@ -13800,8 +14138,8 @@ targets:
 | --- | --- |
 | 目的 | AppとExperiment／Index／Warehouse Binding、SP権限をDABで定義する。 |
 | 入力 | Bundle変数、Source Path、初期セットアップ済みResource ID。Realtime Deploy時に解決する。 |
-| 処理 | Appを作成し既存ResourceをBindingする。Model Serviceの架空Bindingは作らず、App SPへ`EXECUTE`を別途付与する。 |
-| 出力 | Databricks AppとResource Bindingを作り、`app.yaml`とSmoke Testへ渡す。 |
+| 処理 | Appを作成し既存ResourceをBindingする。Model Serviceの架空Bindingは作らず、App SPへ`EXECUTE`（対象Function／Model等を実行するSQL権限）を別途付与する。 |
+| 出力 | Databricks AppとResource Bindingを作り、`app.yaml`（Databricks Appの実行設定を定義するファイル）とSmoke Testへ渡す。 |
 | 失敗・再実行 | Binding不能ならDeployを失敗させる。同じApp Keyを更新し、SP変更時はGrantを再適用する。 |
 
 ```yaml
@@ -13841,9 +14179,9 @@ resources:
             permission: READ_VOLUME
 ```
 
-AI Search IndexはApps Resource／Model移行表の公式対応に従い、Bundleでは`uc_securable`、`securable_type: TABLE`、`permission: SELECT`としてBindingする。Apps UIでは`vector-search-index`のCan selectと表示される。Endpoint作成・Sync権限は`ingestion` Bundleだけへ分離する。
+AI Search IndexはApps Resource／Model移行表の公式対応に従い、Bundleでは`uc_securable`（AppsへBindingするUnity Catalog Resource名）、`securable_type: TABLE`（Apps Resource Binding対象をTableとして扱う設定）、`permission: SELECT`（Apps Resource Bindingへ読み取り権限を指定する設定）としてBindingする。Apps UIでは`vector-search-index`（Apps UIでAI Search Index Bindingを示すResource種別名）のCan selectと表示される。Endpoint作成・Sync権限は`ingestion`（文書取込・解析・検索公開を配備するDAB Bundle名） Bundleだけへ分離する。
 
-`bundles/realtime/app/app.yaml`
+`bundles/realtime/app/app.yaml`（Databricks App内でAgent Server／UIを起動し、Binding値をProcessへ渡す実行設定）
 
 **実装概要**
 
@@ -13851,12 +14189,12 @@ AI Search IndexはApps Resource／Model移行表の公式対応に従い、Bundl
 | --- | --- |
 | 目的 | App内のAgent Server／Streamlit Processと環境変数を定義する。 |
 | 入力 | Resource BindingとBundle環境変数。Deploy／Restart時に読む。 |
-| 処理 | `start.sh`へPort、Experiment、Model、Index、Releaseを渡す。必須値をDefaultへFallbackせずSecretを埋め込まない。 |
+| 処理 | `start.sh`（Databricks App起動時にAgent Serverと画面Applicationを所定の順序で立ち上げる起動Script）へPort、Experiment、Model、Index、Releaseを渡す。必須値をDefaultへFallbackせずSecretを埋め込まない。 |
 | 出力 | 同じRelease設定で二つのProcessを起動する。 |
 | 失敗・再実行 | 必須値欠落時は起動しない。Restart時にBindingを再解決する。 |
 
 ```yaml
-# App ProcessまたはTaskが実行するCommandを設定する。
+# App ProcessまたはTaskが実行する処理指示を設定する。
 command: ["bash", "start.sh"]
 
 # Processへ渡す環境変数を定義する。
@@ -13898,9 +14236,9 @@ env:
     value: "false"
 ```
 
-Commit、Build ID、Release IDはCIがTarget別のDeploy artifactへ埋め込み、dev／stg／prdで別値にする。Secretではないが、手編集ではなく署名済みBuild manifestを正本とする。Resource名はBundle変数でTargetごとに切り替える。`RAG_PAGE_IMAGE_ROOT`はAppsのUnity Catalog Volume Resourceから解決し、`page_image_to_data_uri()`はこのRoot配下以外のPathを拒否する。Raw Volume PathやBase64画像はTrace、Log、SSEへ保存しない。
+Commit、Build ID、Release IDはCIがTarget別のDeploy artifactへ埋め込み、dev／stg／prdで別値にする。Secretではないが、手編集ではなく署名済みBuild manifestを正本とする。Resource名はBundle変数でTargetごとに切り替える。`RAG_PAGE_IMAGE_ROOT`（RAG・ページ・画像・根本を指定する設定値／環境変数）はAppsのUnity Catalog Volume Resourceから解決し、`page_image_to_data_uri()`（ページ画像をModel入力用Data URIへ変換する関数）はこのRoot配下以外のPathを拒否する。Raw Volume PathやBase64画像はTrace、Log、SSEへ保存しない。
 
-`bundles/realtime/app/start.sh`
+`bundles/realtime/app/start.sh`（Databricks App起動時にAgent Serverと画面Applicationを所定の順序で立ち上げる起動Script）
 
 **実装概要**
 
@@ -13908,7 +14246,7 @@ Commit、Build ID、Release IDはCIがTarget別のDeploy artifactへ埋め込み
 | --- | --- |
 | 目的 | Agent ServerとStreamlitを起動し、子Process終了をContainerへ伝播する。 |
 | 入力 | 環境変数とPython Source。Container起動時に読む。 |
-| 処理 | strict modeでServerをBackground起動しUIを開始する。一方の異常終了を隠さず`wait`で監視する。 |
+| 処理 | strict modeでServerをBackground起動しUIを開始する。一方の異常終了を隠さず`wait`（処理完了を待つ操作名）で監視する。 |
 | 出力 | 両ProcessをDatabricks Apps Health Checkへ公開する。 |
 | 失敗・再実行 | 非0終了をAppsへ返す。外部状態を持たないため再起動できる。 |
 
@@ -13929,7 +14267,7 @@ exec streamlit run streamlit_app.py \
   --server.headless true
 ```
 
-`requirements.txt`は検証済みLockから生成し、少なくとも`mlflow[databricks]>=3.14,<4`、`databricks-sdk`、`databricks-ai-search`、`databricks-openai`、`langgraph`、`pydantic>=2`、`requests`、`streamlit`と共通Wheelを固定する。Model Serviceへの最小推論が失敗する、Indexが`ONLINE`でない、リリース構成台帳のResourceがApps許可List外、Promptバージョンが解決不能、Wheelバージョン不一致のいずれかではHealth Checkを失敗させる。`multimodal_enabled=true`のReleaseでは、Read-only画像Volumeから検証用ページ画像を1枚読み、Base64画像＋短い質問でVision Smoke Testが成功することもReadiness条件にする。
+`requirements.txt`（Python依存PackageとVersion制約を定義するファイル）は検証済みLockから生成し、少なくとも`mlflow[databricks]>=3.14,<4`、`databricks-sdk`（Databricks Workspace APIを利用するPython SDK Package名）、`databricks-ai-search`（Databricks AI Searchを操作するPython SDK Package名）、`databricks-openai`（Databricks Model ServiceをOpenAI互換APIで呼ぶPython Package名）、`langgraph`（RAG処理Graphを実装するPython Package名）、`pydantic>=2`、`requests`（HTTP Clientとして利用するPython Package名）、`streamlit`（RAG利用UIを構築するPython Package名）と共通Wheelを固定する。Model Serviceへの最小推論が失敗する、Indexが`ONLINE`（onlineを指定する設定値／環境変数）でない、リリース構成台帳のResourceがApps許可List外、Promptバージョンが解決不能、Wheelバージョン不一致のいずれかではHealth Checkを失敗させる。`multimodal_enabled=true`のReleaseでは、Read-only画像Volumeから検証用ページ画像を1枚読み、Base64画像＋短い質問でVision Smoke Testが成功することもReadiness条件にする。
 
 ##### 4.3.4.14 Production Monitoringを本番開始前に設定する
 
@@ -13937,7 +14275,7 @@ Production Monitoringは、Realtime Experimentへ登録したScorerを本番Trac
 
 Production MonitoringはBeta機能である。本番導入／Pilot時に、PoCとリリース判定で検証したJudgeを本番Experimentへ登録し、Stagingの本番相当TraceでDry Runしてから開始する。全件集計するLatency、Token、検索件数、拒否率などは決定論的集計へ残し、意味評価だけをSamplingしたJudgeへ任せる。
 
-**`mlflow.genai.evaluate()`を実行してもProduction Monitoringは自動では作成・開始されない。** `evaluate()`は指定したDataset／Traceに対してScorerやJudgeを実行し、その時点のEvaluation Runを作る処理である。継続監視へ移すには、検証済みScorer／Judgeを対象Experimentへ明示的に`register()`し、さらにSampling条件を指定して`start()`する必要がある。
+**`mlflow.genai.evaluate()`（Evaluation DatasetとScorer／Judgeで評価Runを作成するMLflow API）を実行してもProduction Monitoringは自動では作成・開始されない。** `evaluate()`（固定Datasetに対してScorer／Judgeを実行する評価API）は指定したDataset／Traceに対してScorerやJudgeを実行し、その時点のEvaluation Runを作る処理である。継続監視へ移すには、検証済みScorer／Judgeを対象Experimentへ明示的に`register()`（Scorer等を本番利用向けに登録する処理）し、さらにSampling条件を指定して`start()`（登録済みScorerの本番Sampling評価を開始する処理）する必要がある。
 
 ##### EvaluationとProduction Monitoringの役割を分ける
 
@@ -13968,14 +14306,14 @@ flowchart TD
 
 | 処理 | 何をするか | 自動でProduction Monitoringになるか |
 | --- | --- | --- |
-| `mlflow.genai.evaluate()` | 固定Dataset／TraceへScorer・Judgeを実行しEvaluation Runを作る | **ならない** |
-| `Scorer.register()` | 検証済みScorer／Judgeを対象MLflow Experimentへ登録する | 登録だけ。まだ継続評価は開始しない |
-| `Registered Scorer.start()` | Sample Rateと必要なFilterを設定し、継続評価を開始する | **ここからProduction Monitoringが動く** |
+| `mlflow.genai.evaluate()`（Evaluation DatasetとScorer／Judgeで評価Runを作成するMLflow API） | 固定Dataset／TraceへScorer・Judgeを実行しEvaluation Runを作る | **ならない** |
+| `Scorer.register()`（ScorerをProduction Monitoring用に登録するMLflow API） | 検証済みScorer／Judgeを対象MLflow Experimentへ登録する | 登録だけ。まだ継続評価は開始しない |
+| `Registered Scorer.start()`（登録済みScorerのSampling評価を開始するMLflow API） | Sample Rateと必要なFilterを設定し、継続評価を開始する | **ここからProduction Monitoringが動く** |
 | Production Trace受信後 | Sampling対象Traceへ登録済みScorer／Judgeを非同期実行する | Databricks／MLflow側が継続実行する |
 | Assessment保存 | Scorer／Judge結果を対象TraceへFeedback Assessmentとして残す | Databricks／MLflow側が保存する |
 | AI/BI Dashboard／SQL Alert | Monitoring結果、運用Metric、問題Sliceを可視化・通知する | 本システム側で必要なView／Dashboard／Alertを定義する |
 
-したがって、`evaluate_rag.py`と`register_monitoring.py`の責務は異なる。
+したがって、`evaluate_rag.py`（指定したRAG Releaseを固定EvaluationDataset上で実行し、Scorer／Judge結果を記録する処理）と`register_monitoring.py`（Production Monitoring用Scorerを登録・開始するPythonファイル）の責務は異なる。
 
 ```text
 evaluate_rag.py
@@ -13992,28 +14330,28 @@ Production Monitoring
   └─ 以後のProduction Traceを継続評価する
 ```
 
-`register_monitoring.py`はProduction Monitoring機能そのものを実装するApplication Codeではなく、**検証済みScorer／JudgeをManaged MLflowのProduction Monitoringへ配備するBootstrap／Registration処理**である。登録後のSampling、Scorer実行、Assessment付与はManaged MLflow側が行う。
+`register_monitoring.py`（Production Monitoring用Scorerを登録・開始するPythonファイル）はProduction Monitoring機能そのものを実装するApplication Codeではなく、**検証済みScorer／JudgeをManaged MLflowのProduction Monitoringへ配備するBootstrap／Registration処理**である。登録後のSampling、Scorer実行、Assessment付与はManaged MLflow側が行う。
 
-Code-based ScorerをProduction Monitoringへ登録する場合は制約に注意する。独自`@scorer`関数はDatabricks Notebookで定義・登録し、関数内Importだけを使うSelf-contained実装にする。Standalone Python Fileで定義したCustom Code Scorerを、そのままProduction MonitoringへSerializationできる前提にしない。一方、オフライン`mlflow.genai.evaluate()`では同じ品質ロジックを通常のPython実装として利用できるため、Production Monitoringへ登録するScorerとRelease Gateで全件評価する決定論的検査を必ずしも同一の実行方式にする必要はない。
+Code-based ScorerをProduction Monitoringへ登録する場合は制約に注意する。独自`@scorer`（MLflowで独自Scorer関数を定義するDecorator）関数はDatabricks Notebookで定義・登録し、関数内Importだけを使うSelf-contained実装にする。Standalone Python Fileで定義したCustom Code Scorerを、そのままProduction MonitoringへSerializationできる前提にしない。一方、オフライン`mlflow.genai.evaluate()`（Evaluation DatasetとScorer／Judgeで評価Runを作成するMLflow API）では同じ品質ロジックを通常のPython実装として利用できるため、Production Monitoringへ登録するScorerとRelease Gateで全件評価する決定論的検査を必ずしも同一の実行方式にする必要はない。
 
 | Prerequisite | 実体／確認方法 | 不足時の動作 |
 | --- | --- | --- |
-| Feature Status | Workspace AdminがPreviewsでProduction Monitoring Betaを許可 | `register()`を実行しない |
-| 対象Experiment | 初期セットアップ済み`MLFLOW_REALTIME_EXPERIMENT_ID` | 名前Fallbackせず停止 |
-| Trace Schema | `AGENT`、`RETRIEVER`、`LLM` Spanとバージョン Tagを固定Staging Traceで検証 | Pilot Gate不合格 |
-| Monitoring SQL Warehouse | `set_databricks_monitoring_sql_warehouse_id()`でExperiment Tagへ永続設定 | UC Trace上のMonitoring開始不可 |
-| Warehouse／Experiment権限 | 最初の登録IdentityにWarehouse`CAN USE`、Experiment`CAN EDIT` | 登録Job停止 |
-| Serverless Budget Policy | Default利用可、または`mlflow.workload_creation_policy_id` Tag | Fail Closed |
+| Feature Status | Workspace AdminがPreviewsでProduction Monitoring Betaを許可 | `register()`（Scorer等を本番利用向けに登録する処理）を実行しない |
+| 対象Experiment | 初期セットアップ済み`MLFLOW_REALTIME_EXPERIMENT_ID`（mlflow・Realtime・Experiment・IDを指定する設定値／環境変数） | 名前Fallbackせず停止 |
+| Trace Schema | `AGENT`（RAG全体を表すMLflow Span Type）、`RETRIEVER`（文書検索処理を表すMLflow Span Type）、`LLM`（Model推論処理を表すMLflow Span Type） Spanとバージョン Tagを固定Staging Traceで検証 | Pilot Gate不合格 |
+| Monitoring SQL Warehouse | `set_databricks_monitoring_sql_warehouse_id()`（Production Monitoringで使うSQL WarehouseをExperimentへ設定するAPI）でExperiment Tagへ永続設定 | UC Trace上のMonitoring開始不可 |
+| Warehouse／Experiment権限 | 最初の登録IdentityにWarehouse`CAN USE`（SQL Warehouse等の利用を許可するDatabricks権限）、Experiment`CAN EDIT`（MLflow Experiment等の編集を許可するDatabricks権限） | 登録Job停止 |
+| Serverless Budget Policy | Default利用可、または`mlflow.workload_creation_policy_id`（MLflowで利用する設定・Resource名） Tag | Fail Closed |
 | Scorer／Judgeバージョン | HoldoutとJudge Validationで承認済み。Experiment当たり最大20 Registered Scorer | 不要バージョンをStop／Archiveしてから登録 |
 | Sampling／コスト | Scorer別Sample Rate、月額上限、停止閾値を開始前に確定し、その内容を意思決定記録へ保存 | Pilot拡大不可 |
-| Judge Model権限 | Monitoring IdentityにJudge Model Service`EXECUTE` | Judge登録／開始不可 |
+| Judge Model権限 | Monitoring IdentityにJudge Model Service`EXECUTE`（対象Function／Model等を実行するSQL権限） | Judge登録／開始不可 |
 | 実行Identity | 最初にScorer登録した管理対象Quality SP | 個人Userでの初回登録禁止 |
 
-Registered ScorerはExperimentに関連付くバージョン付きMLflow Resourceであり、実行結果は対象TraceのFeedback Assessmentとして保存される。`register()`は定義を登録するだけ、`start()`はSampling設定でバックグラウンド評価を開始する。停止時はRegistered ScorerをStopし、既存Feedbackは監査証跡として残す。再開は承認済みバージョンとSample Rateを確認してStartし直す。ロールバックは新JudgeをStopして直前のRegistered Judgeバージョンを再開し、リリース構成台帳と意思決定記録へ切替理由を記録する。
+Registered ScorerはExperimentに関連付くバージョン付きMLflow Resourceであり、実行結果は対象TraceのFeedback Assessmentとして保存される。`register()`（Scorer等を本番利用向けに登録する処理）は定義を登録するだけ、`start()`（登録済みScorerの本番Sampling評価を開始する処理）はSampling設定でバックグラウンド評価を開始する。停止時はRegistered ScorerをStopし、既存Feedbackは監査証跡として残す。再開は承認済みバージョンとSample Rateを確認してStartし直す。ロールバックは新JudgeをStopして直前のRegistered Judgeバージョンを再開し、リリース構成台帳と意思決定記録へ切替理由を記録する。
 
-Production Monitoringへ登録する独自`@scorer`関数はDatabricks Notebookで定義・登録し、関数内Importだけを使うSelf-contained実装にする必要がある。Standalone Python FileのCustom Code ScorerをSerializationできる前提にしない。本Sourceの`make_judge`はバージョン管理するJudge定義であり、決定論的なACL／出典検査は引き続きオフラインGateとOperational SQLで全件評価する。
+Production Monitoringへ登録する独自`@scorer`（MLflowで独自Scorer関数を定義するDecorator）関数はDatabricks Notebookで定義・登録し、関数内Importだけを使うSelf-contained実装にする必要がある。Standalone Python FileのCustom Code ScorerをSerializationできる前提にしない。本Sourceの`make_judge`（Production Monitoringへ登録するJudge Scorerを生成する定義）はバージョン管理するJudge定義であり、決定論的なACL／出典検査は引き続きオフラインGateとOperational SQLで全件評価する。
 
-`bundles/quality/src/register_monitoring.py`
+`bundles/quality/src/register_monitoring.py`（Production Monitoring用Scorerを登録・開始するPythonファイル）
 
 **実装概要**
 
@@ -14021,7 +14359,7 @@ Production Monitoringへ登録する独自`@scorer`関数はDatabricks Notebook�
 | --- | --- |
 | 目的 | **Production Monitoring自体を実装するのではなく**、検証済みScorer／JudgeをManaged MLflowへ登録し、承認時だけ継続監視を開始するBootstrap処理。 |
 | 入力 | Realtime Experiment、Judge Model、Warehouse、Budget、承認済みScorer／Judgeバージョン、Sampling Rate、Filter。Pilot前に読む。 |
-| 処理 | PrerequisiteとEvaluation／Validation承認を検査し、`register()`で対象Experimentへ登録する。開始承認済みの場合だけ`start()`でSampling Rate／Filterを設定する。 |
+| 処理 | PrerequisiteとEvaluation／Validation承認を検査し、`register()`（Scorer等を本番利用向けに登録する処理）で対象Experimentへ登録する。開始承認済みの場合だけ`start()`（登録済みScorerの本番Sampling評価を開始する処理）でSampling Rate／Filterを設定する。 |
 | 出力 | Registered Scorerと有効なSampling設定。以後のSampling、非同期Scoring、Feedback Assessment付与はManaged MLflowが実行する。 |
 | 失敗・再実行 | 既存Monitoringを無断変更しない。Scorer名とバージョンで重複登録を避け、未承認Scorerを自動Startしない。 |
 
@@ -14102,7 +14440,7 @@ if __name__ == "__main__":
     main()
 ```
 
-Judgeをリリース判定へ使う場合、同名のJudge Feedbackと人間Feedbackを用意し、Alignmentを行ったか否かにかかわらず、Alignmentへ使っていないValidation Setで一致率、False Positive、False Negativeを確認する。未検証Judgeだけで金融機関向けReleaseを可決しない。Aligned Judge候補を登録しても自動開始せず、Judgeバージョン、Validation結果、承認者をリリース構成台帳へ固定してから`start()`する。
+Judgeをリリース判定へ使う場合、同名のJudge Feedbackと人間Feedbackを用意し、Alignmentを行ったか否かにかかわらず、Alignmentへ使っていないValidation Setで一致率、False Positive、False Negativeを確認する。未検証Judgeだけで金融機関向けReleaseを可決しない。Aligned Judge候補を登録しても自動開始せず、Judgeバージョン、Validation結果、承認者をリリース構成台帳へ固定してから`start()`（登録済みScorerの本番Sampling評価を開始する処理）する。
 
 
 Production Monitoringの標準UIはScorer／Judge結果とTraceを確認する入口として利用する。一方、本資料のAI/BI Dashboardは、Production Monitoring結果だけでなくLatency、Token、検索0件、429、品質改善課題、SLA等も同じRelease単位で横断して見る運用Dashboardであり、Production Monitoringが自動生成するものではない。SQL Alertも同様に、本システムの運用閾値に合わせて別途定義する。
@@ -14115,9 +14453,9 @@ Production Monitoringの標準UIはScorer／Judge結果とTraceを確認する�
 
 **レビュー記録（本資料独自用語）**は、代表TraceからMLflow Expectation、技術根本原因、採否を確定するレビュー工程のRecordである。MLflow Review App／Labeling Sessionは公式機能だが、レビュー記録という状態付きRecordは公式Resourceではない。
 
-本番でもレビュー記録と品質改善課題を同義にしない。品質改善課題は確認済み失敗原因グループを改善・再評価・Closeまで追跡する論理チケット、Incidentは可用性／セキュリティの緊急対応単位である。`internal_rag_review_cases`はReview証跡と`family_id`参照を保持する本システム独自Delta Tableであり、品質改善課題のチケット正本に必須ではない。
+本番でもレビュー記録と品質改善課題を同義にしない。品質改善課題は確認済み失敗原因グループを改善・再評価・Closeまで追跡する論理チケット、Incidentは可用性／セキュリティの緊急対応単位である。`internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable）はReview証跡と`family_id`（同じ症状・原因でまとめる失敗原因グループID）参照を保持する本システム独自Delta Tableであり、品質改善課題のチケット正本に必須ではない。
 
-外部Issue Trackerを採用する場合、Status、Assignee、Priority、SLAの正本は外部側とする。Databricks側にはTrace／Evaluation／失敗原因グループ／外部Issueの参照と同期状態だけを保持する。この節の`case_status`、Owner、SLA列は、外部Trackerを導入しない組織向けの**任意のDelta実装例**であり、外部Trackerと同時に二重管理しない。
+外部Issue Trackerを採用する場合、Status、Assignee、Priority、SLAの正本は外部側とする。Databricks側にはTrace／Evaluation／失敗原因グループ／外部Issueの参照と同期状態だけを保持する。この節の`case_status`（Case・状態を表す状態項目）、Owner、SLA列は、外部Trackerを導入しない組織向けの**任意のDelta実装例**であり、外部Trackerと同時に二重管理しない。
 
 ```mermaid
 flowchart TD
@@ -14138,7 +14476,7 @@ flowchart TD
     L --> N["Close承認・case_status=closed"]
 ```
 
-`bundles/quality/src/create_operational_monitoring_assets.sql`
+`bundles/quality/src/create_operational_monitoring_assets.sql`（本番運用で使う監視Signal Table・集計View等の監視用資産を作成するSQL）
 
 **実装概要**
 
@@ -14255,19 +14593,19 @@ WHERE coalesce(case_status, 'detected') NOT IN
 
 **想定出力サンプル**
 
-| `quality_case_id` | `failure_family_id` | `trigger_type` | `severity` | `case_status` | `primary_owner` | `validated_run_id` |
+| `quality_case_id`（品質改善課題を識別するID） | `failure_family_id`（同じ症状・原因でまとめる失敗原因グループID） | `trigger_type`（監視検知イベントの発生種別） | `severity`（問題の重大度） | `case_status`（Case・状態を表す状態項目） | `primary_owner`（品質改善課題の主担当を示す項目） | `validated_run_id`（検証済みEvaluation Runを識別するID） |
 | --- | --- | --- | --- | --- | --- | --- |
-| `qcase-91e2...` | `family-run-timeout` | `RUN_EVENT` | `Error` | `triaged` | `rag-data-engineering` | `NULL` |
-| `qcase-a75c...` | `family-old-version` | `JUDGE_FEEDBACK` | `Warning` | `diagnosed` | `rag-quality` | `NULL` |
-| `qcase-42bd...` | `family-acl-crossing` | `SECURITY_EVENT` | `Critical` | `validated` | `rag-security` | `eval-security-2208` |
+| `qcase-91e2...` | `family-run-timeout` | `RUN_EVENT`（Job／Pipeline等の実行イベントを表す種別） | `Error`（エラーレベルを表すSeverity値） | `triaged`（一次分類済みを表す状態値） | `rag-data-engineering` | `NULL`（SQLで値がないことを表す値） |
+| `qcase-a75c...` | `family-old-version` | `JUDGE_FEEDBACK`（Judge・feedbackを指定する設定値／環境変数） | `Warning`（警告レベルを表すSeverity値） | `diagnosed`（原因診断済みを表す状態値） | `rag-quality` | `NULL`（SQLで値がないことを表す値） |
+| `qcase-42bd...` | `family-acl-crossing` | `SECURITY_EVENT`（セキュリティ検知イベントを表す種別） | `Critical`（重大レベルを表すSeverity値） | `validated`（検証済みを表す状態値） | `rag-security` | `eval-security-2208` |
 
-`bundles/quality/src/triage_operational_signals.sql`
+`bundles/quality/src/triage_operational_signals.sql`（監視イベントの重複排除・暫定原因分類を行うSQLファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
-| 責務／実行契機 | 10分ごとに`ready_for_case`となった監視検知イベントを品質改善課題へ冪等変換する |
-| 読取／更新 | `internal_rag_monitoring_signals`を読み、確認済み失敗原因グループだけを`internal_rag_quality_cases`へMERGEし、取込済み監視検知イベントを`processed`へ更新する |
-| SQL順序 | 失敗パターン識別子である`dedup_key`内の最古イベント選択→未作成グループだけInsert→原因別Owner／Severity別SLA設定→Case存在イベントを処理済みにする |
+| 責務／実行契機 | 10分ごとに`ready_for_case`（品質改善課題へ昇格できる状態かを示す項目）となった監視検知イベントを品質改善課題へ冪等変換する |
+| 読取／更新 | `internal_rag_monitoring_signals`（品質・運用監視で検知したイベントを集約するTable）を読み、確認済み失敗原因グループだけを`internal_rag_quality_cases`（同じ原因の問題を改善単位で管理する品質改善課題Table）へMERGEし、取込済み監視検知イベントを`processed`（処理済みを表す状態値）へ更新する |
+| SQL順序 | 失敗パターン識別子である`dedup_key`（同じ失敗候補を重複判定するための識別Key）内の最古イベント選択→未作成グループだけInsert→原因別Owner／Severity別SLA設定→Case存在イベントを処理済みにする |
 | 重要判定 | 同じ失敗パターン識別子／失敗原因グループからCaseを1件だけ作り、質問本文をワークフロー Tableへ複製しない。Critical／セキュリティは人手Review前でも即時Case／Incident化できる |
 | Transaction／再試行 | 各MERGEは冪等。1本目成功・2本目失敗でも再実行時に既存Caseへ一致して状態だけ収束する |
 
@@ -14353,20 +14691,20 @@ THEN UPDATE SET target.ingestion_status = 'processed';
 
 **想定出力サンプル**
 
-| `dedup_key` | Signalの実行結果 | Caseの実行結果 |
+| `dedup_key`（同じ失敗候補を重複判定するための識別Key） | Signalの実行結果 | Caseの実行結果 |
 | --- | --- | --- |
-| `job:7341:run:98211` | `ready_for_case`→`processed` | `qcase-...`を1件作成 |
-| `job:7341:run:98211`の再送 | 同じ`dedup_key` | 既存Caseに一致し追加しない |
+| `job:7341:run:98211` | `ready_for_case`（品質改善課題へ昇格できる状態かを示す項目）→`processed`（処理済みを表す状態値） | `qcase-...`を1件作成 |
+| `job:7341:run:98211`の再送 | 同じ`dedup_key`（同じ失敗候補を重複判定するための識別Key） | 既存Caseに一致し追加しない |
 
-`bundles/quality/resources/operational_monitoring.yml`
+`bundles/quality/resources/operational_monitoring.yml`（本番運用Monitoring Job／Alertを定義する設定ファイル）
 
 | ロジック概要 | 内容 |
 | --- | --- |
 | 責務／実行契機 | 一次分類ジョブ、SQL Alert、通知、Warehouse、実行SPの接続をDABで宣言する |
-| 変数解決 | `quality/databricks.yml`のWarehouse、System Destination、Group Mail、SP Application IDを環境別に展開する |
+| 変数解決 | `quality/databricks.yml`（対象環境へResource・Job・変数を一括配備するDAB Bundle設定）のWarehouse、System Destination、Group Mail、SP Application IDを環境別に展開する |
 | Deploy／Run | DeployはJob／Alert定義を作成し、Run時はSQL MERGE、5分Alert、10分一次分類を実行する |
 | 重要判定 | Emailだけに依存せずSystem Destinationも使い、Run時間超過とJob失敗をQuality Signalとは別経路で通知する |
-| 正常／失敗／再試行 | 同Targetへ再Deployして設定を収束。一次分類 SQLは`dedup_key`で重複Caseを防ぐ |
+| 正常／失敗／再試行 | 同Targetへ再Deployして設定を収束。一次分類 SQLは`dedup_key`（同じ失敗候補を重複判定するための識別Key）で重複Caseを防ぐ |
 
 ```yaml
 # このFileが参照するEmail、Group、System Destination、Warehouseは
@@ -14453,9 +14791,9 @@ resources:
 
 | Resource | 動作 | 監査証跡 |
 | --- | --- | --- |
-| `rag_operational_triage` | 10分ごとにSignalを冪等Case化する | Job Run ID、Task Run ID、Git Commit |
-| `rag_actionable_quality_cases` | Open Critical・エラーまたはAck超過で通知する | Alert ID、Alert History、Case ID |
-| `rag_operations` | Pipeline、Agent、Quality、セキュリティ、コスト、SLAをSlice表示する | Dashboard ID、Refresh時刻、Subscription実行履歴 |
+| `rag_operational_triage`（運用エラー・セキュリティSignalを一次分類するDashboard／Query名） | 10分ごとにSignalを冪等Case化する | Job Run ID、Task Run ID、Git Commit |
+| `rag_actionable_quality_cases`（対応が必要な品質改善課題だけを抽出する監視Query名） | Open Critical・エラーまたはAck超過で通知する | Alert ID、Alert History、Case ID |
+| `rag_operations`（運用担当向けMonitoring／障害対応用Dashboard名） | Pipeline、Agent、Quality、セキュリティ、コスト、SLAをSlice表示する | Dashboard ID、Refresh時刻、Subscription実行履歴 |
 
 DashboardのScheduleとSubscriptionはDeploy後にWorkspace UIまたは公式APIで初期セットアップする。Schedule ID、Subscriber Group、有効化時刻は運用設定台帳またはRun Logへ残し、有効化・変更を承認した理由、承認者、適用期間を意思決定記録へ保存する。Dashboard Subscriptionは日次・週次Snapshot用であり、即時障害通知の代替にはしない。
 
@@ -14463,12 +14801,12 @@ Operational Monitoringの担当契約は、通知先を個人ではなく管理G
 
 | Severity | Primary Owner | Ack期限 | 調査開始期限 | Escalation | 記録先 | Close承認 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `Critical` | セキュリティまたはIncident Commander | 15分 | 30分 | Service Owner、セキュリティ責任者、業務Owner | Incident台帳＋品質改善課題 | セキュリティ責任者またはIncident Commander |
-| `Error` | コンポーネント Owner | 30分 | 2時間 | 運用責任者、必要時Service Owner | 品質改善課題、可用性影響があればIncidentも併記 | 品質責任者または運用責任者 |
-| `Warning` | Qualityまたはコンポーネント Owner | 1営業日 | 2営業日 | SLA超過時に品質責任者 | 品質改善課題 | 品質責任者 |
+| `Critical`（重大レベルを表すSeverity値） | セキュリティまたはIncident Commander | 15分 | 30分 | Service Owner、セキュリティ責任者、業務Owner | Incident台帳＋品質改善課題 | セキュリティ責任者またはIncident Commander |
+| `Error`（エラーレベルを表すSeverity値） | コンポーネント Owner | 30分 | 2時間 | 運用責任者、必要時Service Owner | 品質改善課題、可用性影響があればIncidentも併記 | 品質責任者または運用責任者 |
+| `Warning`（警告レベルを表すSeverity値） | Qualityまたはコンポーネント Owner | 1営業日 | 2営業日 | SLA超過時に品質責任者 | 品質改善課題 | 品質責任者 |
 | `Info` | 定例Review担当 | 不要 | 定例会まで | なし | Dashboard・Run Log | 自動集計終了 |
 
-SQL Alertは30分の再通知抑止を設定し、Caseの`acknowledged_at`更新後も条件が継続する場合だけ再通知する。可用性またはセキュリティに即時影響する場合はIncidentも起票し、品質改善・回帰Caseは品質改善課題で継続する。Closeには`confirmed_root_cause`、`validated_run_id`、Decision ID、`close_approved_by`を必須とする。
+SQL Alertは30分の再通知抑止を設定し、Caseの`acknowledged_at`（品質改善課題を担当者が確認した時刻）更新後も条件が継続する場合だけ再通知する。可用性またはセキュリティに即時影響する場合はIncidentも起票し、品質改善・回帰Caseは品質改善課題で継続する。Closeには`confirmed_root_cause`（人がTrace等を確認して確定した根本原因）、`validated_run_id`（検証済みEvaluation Runを識別するID）、Decision ID、`close_approved_by`（品質改善課題のCloseを承認した担当者を示す項目）を必須とする。
 
 ### 4.4 本番開始前のDry Run・運用試験
 
@@ -14478,18 +14816,18 @@ SQL Alertは30分の再通知抑止を設定し、Caseの`acknowledged_at`更新
 | --- | --- | --- | --- | --- | --- |
 | Production Trace Schema | 検索なし、拒否、再検索、エラーの固定Request | MLflow Trace UIで必須Spanとリリースバージョンを確認 | LLMOps担当Groupが試験実施 | 固定Staging Trace、Dry Run台帳 | 全経路でGit、Prompt、モデル経路、Index、出典を再現できる |
 | Masking・Assessment権限 | PII／Secret入力、無権限Reviewerの更新 | Trace、Alert本文、Review App、Audit Logを確認 | セキュリティ Groupに即時通知し、過剰権限はPilot停止 | セキュリティ試験台帳、品質改善課題 | 平文露出0件、未許可更新0件、セキュリティ責任者承認 |
-| Job／Task Failure Notification | テストTaskを明示的に失敗 | Jobs UIと`system.lakeflow.job_task_run_timeline` | EmailとSystem DestinationがPrimary Ownerへ到達 | Job Run ID、通知履歴、Case ID | Ack SLA内にCaseを更新し、再実行成功を証跡化 |
+| Job／Task Failure Notification | テストTaskを明示的に失敗 | Jobs UIと`system.lakeflow.job_task_run_timeline`（Databricks System Table上の物理名） | EmailとSystem DestinationがPrimary Ownerへ到達 | Job Run ID、通知履歴、Case ID | Ack SLA内にCaseを更新し、再実行成功を証跡化 |
 | Duration Warning | 15分を超えるテストRun | Jobs Health RuleとRun Timeline | Duration Warningが運用Groupへ到達 | Run ID、警告時刻、Case ID | 警告時刻が閾値と一致し、長時間化の原因と対応を記録 |
 | SQL Alert閾値 | Staging専用MetricをThreshold超過へ更新 | SQL Alert v2、Alert History | System Destinationへ通知しPrimary Ownerを自動割当 | Alert ID、Alert History URL、Case ID | Alert解消通知まで確認し、Caseと相互参照できる |
 | Dashboard Refresh | 監視Viewに新規Run・Caseを追加 | AI/BI Dashboardの更新時刻と各Widget | 即時通知なし。表示失敗はDashboard Ownerへ連絡 | Dashboard ID、Refresh時刻 | Run、Quality、セキュリティ、コスト、Case SLAが同一ReleaseでSliceできる |
 | Dashboard Subscription | Staging専用の定時Subscription | Subscription実行履歴と受信メッセージ | 管理GroupにSnapshotを配信 | Schedule ID、Subscriber Group、実行時刻 | 権限のあるGroupだけが受信し、機密列が含まれない |
-| Scorer→Trace抽出 | 固定TraceにJudge `no`と0件検索を発生 | Production Monitoring結果とTrace Search | Quality GroupにWarning、セキュリティCaseはCritical | Scorer バージョン、Trace ID、`signal_id` | 対象Traceだけが監視検知イベントInboxへ入り、未評価を合格扱いしない |
-| Case重複排除・Owner割当 | 同じ`dedup_key`の監視検知イベントを2回追加 | 一次分類ジョブとOpen Case View | 根本原因 Mappingに従いGroupを割当 | `signal_id`、Case ID、Owner、SLA | Caseが1件だけ作成され、Ack・調査期限がSeverityと一致 |
+| Scorer→Trace抽出 | 固定TraceにJudge `no`（不合格・Noを表す例示値）と0件検索を発生 | Production Monitoring結果とTrace Search | Quality GroupにWarning、セキュリティCaseはCritical | Scorer バージョン、Trace ID、`signal_id`（監視で検知した1イベントを識別するID） | 対象Traceだけが監視検知イベントInboxへ入り、未評価を合格扱いしない |
+| Case重複排除・Owner割当 | 同じ`dedup_key`（同じ失敗候補を重複判定するための識別Key）の監視検知イベントを2回追加 | 一次分類ジョブとOpen Case View | 根本原因 Mappingに従いGroupを割当 | `signal_id`（監視で検知した1イベントを識別するID）、Case ID、Owner、SLA | Caseが1件だけ作成され、Ack・調査期限がSeverityと一致 |
 | Runbook初動・Escalation | Criticalとエラーの模擬Case | Runbookに従いTrace、Event Log、文書マニフェストを確認 | PrimaryからSecondary、責任者へ時限Escalation | Ack時刻、調査開始時刻、Incident ID | 当番者だけで安全停止・影響保全・Escalationを実行できる |
-| 再試行／再実行／Index切替 | 中途失敗、同一Command再送、新Index Health失敗 | Command、Event Log、Gold／Index差分、リリース構成台帳 | コンポーネント OwnerとRelease Managerへ通知 | 再実行Run、整合性差分確認、切替Decision | 重複公開なし、Gold／Index／文書マニフェスト一致、旧Indexへロールバック可能 |
+| 再試行／再実行／Index切替 | 中途失敗、同一処理指示再送、新Index Health失敗 | 処理指示、Event Log、Gold／Index差分、リリース構成台帳 | コンポーネント OwnerとRelease Managerへ通知 | 再実行Run、整合性差分確認、切替Decision | 重複公開なし、Gold／Index／文書マニフェスト一致、旧Indexへロールバック可能 |
 | Agent／Model／Search障害 | Timeout、429、5xx、Index停止 | Trace、AI Gateway Usage、Endpoint／Index状態 | エラーは運用Group、SLO重大影響はIncident Commander | Trace ID、Case／Incident ID、Release ID | 安全エラー／拒否、再試行上限、SLO回復、再発監視完了 |
 | ACL越境 | 権限外Documentを要求するGolden Test | セキュリティScorer、Search Filter、出典、Trace | セキュリティとIncident CommanderへCritical通知 | セキュリティCase、Incident、Audit 証跡 | 越境0件、影響調査とセキュリティ回帰評価合格、セキュリティ責任者承認 |
-| 再評価・ロールバック・Close | 修正Releaseと旧Releaseへのロールバック | 固定Case、Holdout、リリース判定、Pilot Metric | 品質責任者とRelease Managerが判断 | `validated_run_id`、Decision ID、ロールバック Log | 承認済み再評価、Close承認者、Alert回復、未解決Riskの明記 |
+| 再評価・ロールバック・Close | 修正Releaseと旧Releaseへのロールバック | 固定Case、Holdout、リリース判定、Pilot Metric | 品質責任者とRelease Managerが判断 | `validated_run_id`（検証済みEvaluation Runを識別するID）、Decision ID、ロールバック Log | 承認済み再評価、Close承認者、Alert回復、未解決Riskの明記 |
 | Pilot開始判断 | 上記全試験の完了Event | Dry Run台帳、Open Case、意思決定記録 | 業務Owner、品質、セキュリティ、Release Managerが承認 | Pilot Go／No-Go Decision | 必須試験合格、Open Critical 0件、未解決Riskの期限付き受容 |
 
 Production Monitoringでは、**構築**としてScorer登録、バージョン固定、Sampling、Alert、権限、コスト上限を用意し、**事前検証**としてStaging TraceによるDry Run、誤検知、通知を確認する。登録済みであってもDry Run未完了ならPilotでは開始しない。
@@ -14500,18 +14838,18 @@ Pilot開始と同時に監視を有効化し、利用範囲を限定したまま
 
 | 監視対象 | 実行契機種別 | 発火条件 | 検知手段／Data Source | 確認画面 | 通知方法 | Severity／Primary Owner | 記録先 | 初動Action | Close条件 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 文書審査・公開 | `LIFECYCLE_EVENT`／`SCHEDULE` | 未承認公開、自己承認、pending SLA超過 | 文書マニフェスト Audit Event、整合性差分確認View | 文書Lifecycle Dashboard | CriticalはSystem Destination、滞留は日次Subscription | Critical／文書Owner | 文書マニフェスト、意思決定記録、品質改善課題 | 公開参照を固定し権限・審査経路を確認 | 承認状態とGold公開対象が一致し、承認者が確認 |
-| Pipeline／Lakeflow Pipeline Expectation | `RUN_EVENT`／`THRESHOLD` | Run失敗、Duration警告、件数不整合、品質制約違反 | Jobs Notification、Pipeline Event Log、System Table | Jobs／Pipeline UI、Operations Dashboard | 失敗／DurationはPush、件数はSQL Alert | エラー／Data Engineering | Event Log、監視検知イベント、Case | 下流公開を停止し、最初の失敗DatasetとExpectation名を特定 | 冪等な再投入成功、件数一致、再評価合格 |
-| Parse／Prep／隔離 | `THRESHOLD`／`RUN_EVENT` | 形式別エラー率、未知エラー、反復失敗 | エラーテーブル、試行結果データセット、Threshold View | Data Quality Page | エラー率超過はSQL Alert | エラー／Data Engineering | エラーテーブル、Case | 隔離を維持し、バージョン・Processor・文書形式で切り分け | 対象バージョンの再処理成功とGold非混入を確認 |
-| Search Sync／Index Release | `RUN_EVENT`／`CHANGE` | Sync失敗、旧バージョン残存、文書マニフェスト不一致 | Sync Log、整合性差分確認、Index Health | Search Operations Page | 失敗はPush、DriftはSQL Alert | エラー／Search | リリース構成台帳、Case、意思決定記録 | 新Index公開を停止し旧Releaseを維持 | Gold・Index・文書マニフェストが一致しGolden Query合格 |
-| Agent Server／SSE | `THRESHOLD`／`RUN_EVENT` | 5xx、Loop、初回Event／P95 SLO超過 | Trace、App Log、Request Metric | Realtime Page、MLflow Trace UI | Critical／エラーはSystem Destination | エラー／Agent／Operations | Trace、Case、必要時Incident | Traffic制限、前Release固定、安全エラーを確認 | SLO回復、再発監視完了、Validation Run保存 |
-| モデル経路／AI Gateway | `THRESHOLD`／`CHANGE` | 429／5xx、Latency、Token、Route比率Drift | `system.ai_gateway.usage`、Trace Usage | Model／コスト Page | 重大障害はPush、コストは日次Subscription | エラー／LLMOps | Case、意思決定記録 | Rate制御、Capacity確認、承認済みRouteへ戻す | Route・SLO・コスト Guardrailが承認範囲へ回復 |
-| Trace／Masking | `SECURITY_EVENT`／`THRESHOLD` | 必須Span欠落、バージョン不明、平文機密情報 | Trace Search、決定論的Masking Scorer | MLflow Trace UI、セキュリティ Page | 機密露出はCritical Push | Critical／セキュリティ・LLMOps | セキュリティIncident／Case | 対象Releaseを停止し転送先と影響Traceを保全 | 露出0件、影響調査、セキュリティ回帰評価、責任者承認 |
-| Production Monitoring | `JUDGE_FEEDBACK`／`SCHEDULE` | 品質閾値割れ、評価停止、Judge コスト超過 | Registered Scorer結果、Evaluation Run | Quality Page、MLflow UI | エラーはSQL Alert、傾向は週次Subscription | エラー／Quality | 監視検知イベント、Case、Evaluation Run | 代表Trace、人間Feedback、バージョン欠落を確認 | 独立Validationで品質回復、未評価解消 |
-| Assessment／Review SLA | `USER_FEEDBACK`／`MANUAL_REVIEW`／`THRESHOLD` | 👎、重大誤回答、pending・approved滞留 | Assessment、Review Table、Open Case View | Review App、品質改善課題s Page | 重大CaseとSLA超過を通知 | Warning〜Critical／Quality | Trace Assessment、Review Table | ドメイン担当へMLflow Expectation、技術担当へDiagnosisを割当 | `review_status=synced`と改善先配送確認。Case Closeは再評価後 |
-| ACL／Identity | `SECURITY_EVENT`／`CHANGE` | 越境、Identity不一致、権限変更 | セキュリティScorer、Audit Log、Search Filter | セキュリティ Page | Critical PushとIncident Escalation | Critical／セキュリティ | Incident、Case、Audit Log | Traffic／Corpus停止、Access遮断、影響範囲確定 | ACL回帰評価0件、権限正本一致、セキュリティ承認 |
-| Latency／コスト | `THRESHOLD`／`SCHEDULE` | P95、Token、Request単価、月次予測超過 | AI Gateway Usage、Billing Usage、Trace | コスト／Performance Page | SLO重大超過はPush、傾向はSubscription | Warning／Service Owner | Case、コスト Report、意思決定記録 | Model・検索・再検索・Judgeに分解 | 品質Guardrailを維持しSLO／予算内へ回復 |
-| リリース構成のずれ／ロールバック | `CHANGE`／`RUN_EVENT` | Git、Prompt、Index、Model、Judge、Wheelのリリース構成台帳不一致 | Deploy Job、Trace Tag、リリース構成台帳 | Release Page | Gate失敗はRelease GroupへPush | Critical／Release Manager | リリース構成台帳、意思決定記録、Case | 未検証組合せを停止し旧リリース構成台帳へ一体ロールバック | 実稼働バージョンがリリース構成台帳と一致しHoldout・Pilot Gate合格 |
+| 文書審査・公開 | `LIFECYCLE_EVENT`（lifecycle・イベントを指定する設定値／環境変数）／`SCHEDULE`（scheduleを指定する設定値／環境変数） | 未承認公開、自己承認、pending SLA超過 | 文書マニフェスト Audit Event、整合性差分確認View | 文書Lifecycle Dashboard | CriticalはSystem Destination、滞留は日次Subscription | Critical／文書Owner | 文書マニフェスト、意思決定記録、品質改善課題 | 公開参照を固定し権限・審査経路を確認 | 承認状態とGold公開対象が一致し、承認者が確認 |
+| Pipeline／Lakeflow Pipeline Expectation | `RUN_EVENT`（Job／Pipeline等の実行イベントを表す種別）／`THRESHOLD`（thresholdを指定する設定値／環境変数） | Run失敗、Duration警告、件数不整合、品質制約違反 | Jobs Notification、Pipeline Event Log、System Table | Jobs／Pipeline UI、Operations Dashboard | 失敗／DurationはPush、件数はSQL Alert | エラー／Data Engineering | Event Log、監視検知イベント、Case | 下流公開を停止し、最初の失敗DatasetとExpectation名を特定 | 冪等な再投入成功、件数一致、再評価合格 |
+| Parse／Prep／隔離 | `THRESHOLD`（thresholdを指定する設定値／環境変数）／`RUN_EVENT`（Job／Pipeline等の実行イベントを表す種別） | 形式別エラー率、未知エラー、反復失敗 | エラーテーブル、試行結果データセット、Threshold View | Data Quality Page | エラー率超過はSQL Alert | エラー／Data Engineering | エラーテーブル、Case | 隔離を維持し、バージョン・Processor・文書形式で切り分け | 対象バージョンの再処理成功とGold非混入を確認 |
+| Search Sync／Index Release | `RUN_EVENT`（Job／Pipeline等の実行イベントを表す種別）／`CHANGE`（構成変更に起因するイベントを表す種別） | Sync失敗、旧バージョン残存、文書マニフェスト不一致 | Sync Log、整合性差分確認、Index Health | Search Operations Page | 失敗はPush、DriftはSQL Alert | エラー／Search | リリース構成台帳、Case、意思決定記録 | 新Index公開を停止し旧Releaseを維持 | Gold・Index・文書マニフェストが一致しGolden Query合格 |
+| Agent Server／SSE | `THRESHOLD`（thresholdを指定する設定値／環境変数）／`RUN_EVENT`（Job／Pipeline等の実行イベントを表す種別） | 5xx、Loop、初回Event／P95 SLO超過 | Trace、App Log、Request Metric | Realtime Page、MLflow Trace UI | Critical／エラーはSystem Destination | エラー／Agent／Operations | Trace、Case、必要時Incident | Traffic制限、前Release固定、安全エラーを確認 | SLO回復、再発監視完了、Validation Run保存 |
+| モデル経路／AI Gateway | `THRESHOLD`（thresholdを指定する設定値／環境変数）／`CHANGE`（構成変更に起因するイベントを表す種別） | 429／5xx、Latency、Token、Route比率Drift | `system.ai_gateway.usage`（AI Gatewayの利用量・Token・Model経路等を確認するSystem Table）、Trace Usage | Model／コスト Page | 重大障害はPush、コストは日次Subscription | エラー／LLMOps | Case、意思決定記録 | Rate制御、Capacity確認、承認済みRouteへ戻す | Route・SLO・コスト Guardrailが承認範囲へ回復 |
+| Trace／Masking | `SECURITY_EVENT`（セキュリティ検知イベントを表す種別）／`THRESHOLD`（thresholdを指定する設定値／環境変数） | 必須Span欠落、バージョン不明、平文機密情報 | Trace Search、決定論的Masking Scorer | MLflow Trace UI、セキュリティ Page | 機密露出はCritical Push | Critical／セキュリティ・LLMOps | セキュリティIncident／Case | 対象Releaseを停止し転送先と影響Traceを保全 | 露出0件、影響調査、セキュリティ回帰評価、責任者承認 |
+| Production Monitoring | `JUDGE_FEEDBACK`（Judge・feedbackを指定する設定値／環境変数）／`SCHEDULE`（scheduleを指定する設定値／環境変数） | 品質閾値割れ、評価停止、Judge コスト超過 | Registered Scorer結果、Evaluation Run | Quality Page、MLflow UI | エラーはSQL Alert、傾向は週次Subscription | エラー／Quality | 監視検知イベント、Case、Evaluation Run | 代表Trace、人間Feedback、バージョン欠落を確認 | 独立Validationで品質回復、未評価解消 |
+| Assessment／Review SLA | `USER_FEEDBACK`（User・feedbackを指定する設定値／環境変数）／`MANUAL_REVIEW`（manual・レビューを指定する設定値／環境変数）／`THRESHOLD`（thresholdを指定する設定値／環境変数） | 👎、重大誤回答、pending・approved滞留 | Assessment、Review Table、Open Case View | Review App、品質改善課題s Page | 重大CaseとSLA超過を通知 | Warning〜Critical／Quality | Trace Assessment、Review Table | ドメイン担当へMLflow Expectation、技術担当へDiagnosisを割当 | `review_status=synced`と改善先配送確認。Case Closeは再評価後 |
+| ACL／Identity | `SECURITY_EVENT`（セキュリティ検知イベントを表す種別）／`CHANGE`（構成変更に起因するイベントを表す種別） | 越境、Identity不一致、権限変更 | セキュリティScorer、Audit Log、Search Filter | セキュリティ Page | Critical PushとIncident Escalation | Critical／セキュリティ | Incident、Case、Audit Log | Traffic／Corpus停止、Access遮断、影響範囲確定 | ACL回帰評価0件、権限正本一致、セキュリティ承認 |
+| Latency／コスト | `THRESHOLD`（thresholdを指定する設定値／環境変数）／`SCHEDULE`（scheduleを指定する設定値／環境変数） | P95、Token、Request単価、月次予測超過 | AI Gateway Usage、Billing Usage、Trace | コスト／Performance Page | SLO重大超過はPush、傾向はSubscription | Warning／Service Owner | Case、コスト Report、意思決定記録 | Model・検索・再検索・Judgeに分解 | 品質Guardrailを維持しSLO／予算内へ回復 |
+| リリース構成のずれ／ロールバック | `CHANGE`（構成変更に起因するイベントを表す種別）／`RUN_EVENT`（Job／Pipeline等の実行イベントを表す種別） | Git、Prompt、Index、Model、Judge、Wheelのリリース構成台帳不一致 | Deploy Job、Trace Tag、リリース構成台帳 | Release Page | Gate失敗はRelease GroupへPush | Critical／Release Manager | リリース構成台帳、意思決定記録、Case | 未検証組合せを停止し旧リリース構成台帳へ一体ロールバック | 実稼働バージョンがリリース構成台帳と一致しHoldout・Pilot Gate合格 |
 
 Assessmentでは、**運用**としてTraceを選定し、専門家がFeedbackとMLflow Expectationを入力する。そこで得た証跡は、原因分類、Judge不一致、EvaluationDataset候補の判断へ使い、入力しただけで自動的にPrompt改善へ送らない。
 
@@ -14568,26 +14906,26 @@ flowchart TD
 
 ##### 本番導入時から継続するBaseline
 
-`document_source_manifest`、`document_version_registry`、`document_workflow_requests`、`document_manifest_audit_events`、本番`internal_docs_*` Pipeline、`internal_docs_search_sync`、`corpus_snapshot_members`、`internal_rag_train`、`internal_rag_holdout`、`rag_release_manifest`、`internal_rag_monitoring_signals`、`internal_rag_monitoring_thresholds`は4.2の構成を継続利用する。外部Issue Trackerを使わない場合は`internal_rag_quality_cases`も継続利用する。
+`document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable）、`document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）、`document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）、`document_manifest_audit_events`（文書マニフェスト変更の監査履歴を保持するTable）、本番`internal_docs_*`（本番文書Pipelineで利用するTable／Dataset物理名の総称） Pipeline、`internal_docs_search_sync`（AI Searchへ同期する現在公開Chunkを保持するTable）、`corpus_snapshot_members`（文書集合スナップショットと構成文書Versionの対応を保持するTable）、`internal_rag_train`（内部・RAG・Trainingを保持する項目）、`internal_rag_holdout`（内部・RAG・Holdoutを保持する項目）、`rag_release_manifest`（承認済みRAGリリース構成を保持する管理Table）、`internal_rag_monitoring_signals`（品質・運用監視で検知したイベントを集約するTable）、`internal_rag_monitoring_thresholds`（品質・運用Metricの監視閾値を保持するTable）は4.2の構成を継続利用する。外部Issue Trackerを使わない場合は`internal_rag_quality_cases`（同じ原因の問題を改善単位で管理する品質改善課題Table）も継続利用する。
 
 ##### 本番導入後に追加・高度化するもの
 
 | 分類 | 物理名 | 物理種別 | 1行の意味 | 主なKey | 主な役割 | 書込元 | 読取元 | 導入タイミング／条件 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 文書運用 | `main.llmops.document_reconciliation_candidates` | Delta Table | 1つのSource／Manifest／Gold／Search差分候補 | `issue_id`, `issue_type`, `source_uri` | 不整合を候補化する。公開Pointerや削除状態は自動変更しない | 整合性差分確認ジョブ | 文書管理者、再実行／Workflow | **条件付き高度化**。不整合件数・運用負荷等が開始条件を満たす場合 |
-| Quality／Review | `main.llmops.internal_rag_review_cases` | Delta Table | 代表Traceに対する1 レビュー記録 | `review_case_id`, `case_family_id`, `source_trace_id` | MLflow Expectation、根本原因、改善先、Split、承認、配送状態を正規化 | レビュー待ちキュー／Assessment同期Job | Assignment、Dataset同期、品質担当 | **本番導入後に追加**。定期レビュー待ちキュー自動化を開始する場合 |
-| 評価 | `main.llmops.internal_rag_train` | MLflow EvaluationDataset | 本番レビューから追加された1 Training Case | `case_instance_id` | 承認済みレビュー記録を既存Trainingへ継続反映 | `sync_evaluation_dataset` | Retrieval／Prompt改善 | **本番導入時から存在**。本番後にRecordを育成 |
-| 評価 | `main.llmops.internal_rag_holdout` | MLflow EvaluationDataset | 本番レビューから追加された1 Holdout Case | `case_instance_id` | 未使用Holdoutを継続育成 | `sync_evaluation_dataset` | リリース判定 | **本番導入時から存在**。Split規則を維持 |
-| Monitoring | `main.llmops.internal_rag_monitoring_signals` | Delta Table | 本番運用で検知した1監視検知イベント | `signal_id`, `dedup_key` | 既存検知イベント受け口へ本番実績を継続蓄積 | Production Monitoring／Alert／Detector | 一次分類、レビュー待ちキュー | **本番導入時から存在**。本番後に運用量が増える |
-| Quality | `main.llmops.internal_rag_quality_cases` | Delta Table（任意） | 1つの失敗原因グループの改善Case | `quality_case_id`, `failure_family_id` | Review済みの上位テーマを改善・再評価・Closeまで追跡 | 一次分類／品質管理ジョブ | Dashboard、Alert、Owner | **本番導入時から任意で存在**。本番後に高度化。外部Tracker採用時は外部側を正本 |
+| 文書運用 | `main.llmops.document_reconciliation_candidates`（Unity Catalog上の物理Resource名） | Delta Table | 1つのSource／Manifest／Gold／Search差分候補 | `issue_id`（文書整合性問題候補を識別するID）, `issue_type`（文書整合性問題の種類を示す項目）, `source_uri`（原文または取得元を特定するURI） | 不整合を候補化する。公開Pointerや削除状態は自動変更しない | 整合性差分確認ジョブ | 文書管理者、再実行／Workflow | **条件付き高度化**。不整合件数・運用負荷等が開始条件を満たす場合 |
+| Quality／Review | `main.llmops.internal_rag_review_cases`（代表Traceのレビュー記録を保持するTable） | Delta Table | 代表Traceに対する1 レビュー記録 | `review_case_id`（代表Traceに対するレビュー記録を識別するID）, `case_family_id`（同じ意味・業務目的の評価Case群を識別するID）, `source_trace_id`（レビュー元となるMLflow Trace ID） | MLflow Expectation、根本原因、改善先、Split、承認、配送状態を正規化 | レビュー待ちキュー／Assessment同期Job | Assignment、Dataset同期、品質担当 | **本番導入後に追加**。定期レビュー待ちキュー自動化を開始する場合 |
+| 評価 | `main.llmops.internal_rag_train`（候補改善に利用するTraining Evaluation Dataset） | MLflow EvaluationDataset | 本番レビューから追加された1 Training Case | `case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID） | 承認済みレビュー記録を既存Trainingへ継続反映 | `sync_evaluation_dataset`（同期・Evaluation・Datasetを保持する項目） | Retrieval／Prompt改善 | **本番導入時から存在**。本番後にRecordを育成 |
+| 評価 | `main.llmops.internal_rag_holdout`（候補探索に使わない最終判定用Holdout Evaluation Dataset） | MLflow EvaluationDataset | 本番レビューから追加された1 Holdout Case | `case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID） | 未使用Holdoutを継続育成 | `sync_evaluation_dataset`（同期・Evaluation・Datasetを保持する項目） | リリース判定 | **本番導入時から存在**。Split規則を維持 |
+| Monitoring | `main.llmops.internal_rag_monitoring_signals`（品質・運用監視の検知イベントを保持するTable） | Delta Table | 本番運用で検知した1監視検知イベント | `signal_id`（監視で検知した1イベントを識別するID）, `dedup_key`（同じ失敗候補を重複判定するための識別Key） | 既存検知イベント受け口へ本番実績を継続蓄積 | Production Monitoring／Alert／Detector | 一次分類、レビュー待ちキュー | **本番導入時から存在**。本番後に運用量が増える |
+| Quality | `main.llmops.internal_rag_quality_cases`（品質改善課題を保持するTable） | Delta Table（任意） | 1つの失敗原因グループの改善Case | `quality_case_id`（品質改善課題を識別するID）, `failure_family_id`（同じ症状・原因でまとめる失敗原因グループID） | Review済みの上位テーマを改善・再評価・Closeまで追跡 | 一次分類／品質管理ジョブ | Dashboard、Alert、Owner | **本番導入時から任意で存在**。本番後に高度化。外部Tracker採用時は外部側を正本 |
 
 **独立Tableを追加しない高度化**
 
 | 高度化 | 物理的な実体 | Tableを増やさない理由 |
 | --- | --- | --- |
 | レビュー待ちキュー自動配送 | MLflow Review App／Labeling Session＋Lakeflow Job | Queue／SessionはMLflow Resourceであり独立Delta Tableではない |
-| Assessment同期 | MLflow Assessment → `internal_rag_review_cases` | Assessment専用の二重正本Tableを作らない |
-| 失敗原因グループ集約 | 品質管理ジョブの集約結果＋`internal_rag_review_cases`／品質改善課題参照 | 名前だけの専用Tableを増やさずReview／Caseへ必要IDを保持 |
+| Assessment同期 | MLflow Assessment → `internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable） | Assessment専用の二重正本Tableを作らない |
+| 失敗原因グループ集約 | 品質管理ジョブの集約結果＋`internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable）／品質改善課題参照 | 名前だけの専用Tableを増やさずReview／Caseへ必要IDを保持 |
 | Prompt Optimization | MLflow Optimization Run＋Prompt候補Version | Run／Prompt Resourceで管理する |
 | Judge Alignment | Alignment Run＋候補Judge／Registered Scorer | Judge ResourceとRunで管理する |
 | Production Monitoring高度化 | 既存Registered Scorer／Judge、Sampling、Alert設定 | 本番導入時のMonitoringを作り直さず設定を調整する |
@@ -14615,7 +14953,7 @@ erDiagram
     }
 ```
 
-整合性差分候補は「差分を検知した」という事実であり、「削除する」「公開Versionを変える」という承認ではない。最終判断は文書管理者が行い、承認した操作だけを`document_workflow_requests`へ起票し、Manifest Executorが既存の監査経路で反映する。
+整合性差分候補は「差分を検知した」という事実であり、「削除する」「公開Versionを変える」という承認ではない。最終判断は文書管理者が行い、承認した操作だけを`document_workflow_requests`（文書登録・公開変更等の申請を保持するWorkflow Table）へ起票し、Manifest Executorが既存の監査経路で反映する。
 
 ##### Quality／Monitoring ER図
 
@@ -14662,7 +15000,7 @@ erDiagram
     }
 ```
 
-`internal_rag_quality_cases`を外部Issue Trackerで置き換える組織では、上図の品質改善課題部分は外部Issue ID参照へ読み替える。
+`internal_rag_quality_cases`（同じ原因の問題を改善単位で管理する品質改善課題Table）を外部Issue Trackerで置き換える組織では、上図の品質改善課題部分は外部Issue ID参照へ読み替える。
 
 #### 5.1.4 本番導入後のデータフロー図
 
@@ -14720,19 +15058,19 @@ flowchart TD
 
 本番導入後は、運用中に得たTrace、Assessment、Incident、コスト、Latencyを証跡として、レビューワークフローと改善Jobを段階的に高度化する。新規機能を「開発時」として独立させず、5.2から5.6の定常運用・分析で確認された問題を起点にバックログ化する。個別Traceをそのままチケット化せず、失敗パターン識別子で重複排除し、失敗原因グループへ集約してから原因別件数と業務影響で優先順位を決める。文書、Chunk、Retrieval、Prompt、エージェント処理分岐、ACL、Judgeを同時変更せず、変更対象を1つに限定してTrainingで探索し、未使用Holdoutで判定する。
 
-構築・高度化は次の順で行う。自動化は候補抽出・配送・Scorer実行までとし、MLflow Expectation、`root_cause`、改善採否、Release昇格は担当者が承認する。
+構築・高度化は次の順で行う。自動化は候補抽出・配送・Scorer実行までとし、MLflow Expectation、`root_cause`（品質問題の根本原因分類）、改善採否、Release昇格は担当者が承認する。
 
 1. 本番Traceへ検索文書、回答、拒否状態、Promptバージョン、Index設定を保存する。
 2. 低評価、0件、再検索上限、Judge不一致等を抽出し、失敗パターン識別子で重複排除して失敗原因グループへ集約する。代表TraceとCritical／重要ケースだけをReview Appへ送る。
 3. ドメイン担当者が回答品質Feedback、期待回答、期待文書を付与する。
-4. RAG／LLMOps担当者がTrace、Chunk、Indexを調査して技術的な`root_cause`を確定する。
+4. RAG／LLMOps担当者がTrace、Chunk、Indexを調査して技術的な`root_cause`（品質問題の根本原因分類）を確定する。
 5. 品質責任者が失敗原因グループ別件数、Severity、業務影響、再現性、利用頻度、修正コストから優先順位を承認し、上位テーマだけを品質改善課題／改善バックログへ登録する。品質管理ジョブは承認後の改善先とSplitを割り当てる。
 6. 承認済みMLflow ExpectationをTrainingとHoldoutのEvaluationDatasetへ反映する。
 7. Retrieval設定、Prompt、Agent経路を一度に1種類ずつ改善する。
 8. Holdout Datasetで検索品質、回答品質、拒否品質、アクセス制御を比較する。
 9. 合格したPrompt、Index、Code、モデル経路を不変RAGリリース構成台帳として段階的に昇格する。
 10. 導入時に開始済みのProduction Monitoringで本番Traceをサンプリング評価し、コスト、Alert、滞留を見直す。
-11. LLM Judgeと人間の同名Feedbackを蓄積し、Judgeを`align()`する。
+11. LLM Judgeと人間の同名Feedbackを蓄積し、Judgeを`align()`（Human Feedbackを使ってJudgeを調整する処理）する。
 12. Aligned Judgeを未使用Traceで検証してからMonitoringへ反映する。
 13. Gitコミット、Promptバージョン、Index設定、基盤モデルの組み合わせを監視する。
 
@@ -14779,15 +15117,15 @@ flowchart TD
 
 レビュー記録には、改善に必要なデータ量と機密性に応じて次の区分を持たせる。
 
-| `data_transfer_class` | Dev／Stagingへ渡すもの | 主な用途 | 本番Rawデータの扱い |
+| `data_transfer_class`（本番からDev／Stagingへ連携するデータ種別を示す区分） | Dev／Stagingへ渡すもの | 主な用途 | 本番Rawデータの扱い |
 | --- | --- | --- | --- |
-| `metadata_only` | Release ID、Prompt URI、Index Release、文書集合スナップショット、Metric、原因分類等 | Code／設定差分の調査、再現条件の特定 | Raw質問・文書本文は渡さない |
-| `sanitized_case` | Mask済み質問、承認済みExpectation、必要文書ID、固定証跡のMask済み抜粋 | Prompt Optimization、エージェント処理分岐、Judge改善 | PII、Secret、顧客ID等を除去してから配送 |
-| `staging_replay` | 再現に必要な最小文書Version／Chunk、ACL Fixture、質問、Expectation | Retrieval、Parse／Prep、Chunk、ACL問題の一次再現 | まず承認済み最小集合だけStagingへ作り、再現できるか確認する |
-| `full_snapshot_replay` | Productionと同じ`corpus_snapshot_id`の文書Version集合、同等のIndex Release設定、Embedding、Chunk Schema、ACL Fixture | 検索順位、類似文書競合、Corpus更新影響、Index同期、旧Version残存などCorpus全体依存の再現 | Data Owner承認後にProduction相当の検索状態をStaging／Qualityへ再構築する。物理コピーではなく論理的同等性を検証する |
-| `prod_only` | 原則としてデータを移動しない | 高機密文書、Raw Trace依存、外部持出し禁止Case | Candidate Code／Prompt／Judge／Retrieval設定を本番Quality領域へ持ち込んで同じSnapshotで評価 |
+| `metadata_only`（本文を移さずRelease ID等のMetadataだけ連携する区分） | Release ID、Prompt URI、Index Release、文書集合スナップショット、Metric、原因分類等 | Code／設定差分の調査、再現条件の特定 | Raw質問・文書本文は渡さない |
+| `sanitized_case`（機密情報を除去した評価Caseを連携する区分） | Mask済み質問、承認済みExpectation、必要文書ID、固定証跡のMask済み抜粋 | Prompt Optimization、エージェント処理分岐、Judge改善 | PII、Secret、顧客ID等を除去してから配送 |
+| `staging_replay`（最小文書集合をStagingで再現する区分） | 再現に必要な最小文書Version／Chunk、ACL Fixture、質問、Expectation | Retrieval、Parse／Prep、Chunk、ACL問題の一次再現 | まず承認済み最小集合だけStagingへ作り、再現できるか確認する |
+| `full_snapshot_replay`（文書集合全体をStaging相当環境で再現する区分） | Productionと同じ`corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID）の文書Version集合、同等のIndex Release設定、Embedding、Chunk Schema、ACL Fixture | 検索順位、類似文書競合、Corpus更新影響、Index同期、旧Version残存などCorpus全体依存の再現 | Data Owner承認後にProduction相当の検索状態をStaging／Qualityへ再構築する。物理コピーではなく論理的同等性を検証する |
+| `prod_only`（データを移動せず本番Quality領域で評価する区分） | 原則としてデータを移動しない | 高機密文書、Raw Trace依存、外部持出し禁止Case | Candidate Code／Prompt／Judge／Retrieval設定を本番Quality領域へ持ち込んで同じSnapshotで評価 |
 
-`data_transfer_class`はRoot Causeだけで自動決定しない。品質管理ジョブが候補を出し、品質責任者またはData Ownerが機密区分、再現に必要な情報、規制要件を確認して承認する。
+`data_transfer_class`（本番からDev／Stagingへ連携するデータ種別を示す区分）はRoot Causeだけで自動決定しない。品質管理ジョブが候補を出し、品質責任者またはData Ownerが機密区分、再現に必要な情報、規制要件を確認して承認する。
 
 再実行は次の順序で段階的に強くする。
 
@@ -14813,14 +15151,14 @@ Level 4: 本番環境内だけで行う評価
 
 | 項目 | 値 |
 | --- | --- |
-| `source_trace_id` | `trace-981` |
-| `rag_release_id` | `rag-release-17` |
+| `source_trace_id`（レビュー元となるMLflow Trace ID） | `trace-981` |
+| `rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID） | `rag-release-17` |
 | 質問 | 「海外送金の承認上限は？」 |
-| 取得文書 | `DOC-A/v3` |
+| 取得文書 | `DOC-A/v3`（対象Resource／ソースを指す物理パス） |
 | Answer Prompt | `prompts:/.../12` |
-| Human Feedback | `incorrect` |
-| Judge Feedback | `incorrect` |
-| `root_cause` | `PROMPT` |
+| Human Feedback | `incorrect`（Human評価で誤りを表す値） |
+| Judge Feedback | `incorrect`（Human評価で誤りを表す値） |
+| `root_cause`（品質問題の根本原因分類） | `PROMPT`（Promptに原因がある既存実装上の分類値） |
 
 このRaw TraceをDevへそのままコピーするのではなく、本番Quality領域で次の再現用Caseへ変換する。
 
@@ -14848,8 +15186,8 @@ DevではこのCaseをTraining EvaluationDatasetへ取り込み、Answer Prompt�
 
 | Human Feedback | Judge Feedback | アプリ回答 | 改善先 |
 | --- | --- | --- | --- |
-| `correct` | `incorrect` | 正しい | `JUDGE_ALIGNMENT` |
-| `incorrect` | `correct` | 誤り | `JUDGE_ALIGNMENT`候補＋回答側Root Cause調査 |
+| `correct`（Human評価で正しいことを表す値） | `incorrect`（Human評価で誤りを表す値） | 正しい | `JUDGE_ALIGNMENT`（HumanとJudgeの判定差に関する改善分類値） |
+| `incorrect`（Human評価で誤りを表す値） | `correct`（Human評価で正しいことを表す値） | 誤り | `JUDGE_ALIGNMENT`（HumanとJudgeの判定差に関する改善分類値）候補＋回答側Root Cause調査 |
 
 Judge Alignment用Caseは、人間が確定したFeedbackを教師情報として使う。ただし、**Alignmentに使ったTraceを同じJudgeの最終Validationへ再利用しない**。事例グループ単位でAlignment用とJudge Validation用を分け、候補Judgeが未使用Caseでも人間判定と一致することを確認してからMonitoringへ反映する。
 
@@ -14877,7 +15215,7 @@ Stagingではまずこの再実行 Corpusへ同じChunk Schema、Embedding条件
 
 ##### 最小文書集合で再現できない場合はProduction相当Snapshotを再構築する
 
-たとえば本番では`DOC-123/v7`が8位だったのに、最小文書集合では1位になった場合、原因は特定の誤取得文書1件ではなく、Corpus全体に存在する多数の類似Chunkとの競合かもしれない。
+たとえば本番では`DOC-123/v7`（対象Resource／ソースを指す物理パス）が8位だったのに、最小文書集合では1位になった場合、原因は特定の誤取得文書1件ではなく、Corpus全体に存在する多数の類似Chunkとの競合かもしれない。
 
 この場合、元Traceに記録された次の構成をStaging／Qualityで再現する。
 
@@ -14891,7 +15229,7 @@ chunk_schema_version   = chunk-v4
 acl_policy_version     = acl-v7
 ```
 
-`corpus_snapshot_members`から`corpus-101`に含まれる文書Version集合を解決し、持出し可能な場合は同じVersion集合をStagingへ再構築する。さらにIndex Releaseに記録されたEmbedding、同期列、Chunk Schema、検索設定を使ってStaging用AI Search Indexを新規作成する。
+`corpus_snapshot_members`（文書集合スナップショットと構成文書Versionの対応を保持するTable）から`corpus-101`に含まれる文書Version集合を解決し、持出し可能な場合は同じVersion集合をStagingへ再構築する。さらにIndex Releaseに記録されたEmbedding、同期列、Chunk Schema、検索設定を使ってStaging用AI Search Indexを新規作成する。
 
 ```text
 Production
@@ -14910,7 +15248,7 @@ Candidate Retrievalを比較
 
 ここで必要なのはProduction Tableの物理名やStorageを完全コピーすることではなく、**検索結果を決めるCorpus Version集合とIndex構成を論理的に同等にすること**である。再構築後は文書Version件数、Chunk件数、文書集合スナップショット Member Hash、Embedding／Chunk Schema／Index設定Digestを比較し、同等性Gateを通過した環境だけを「Production-equivalent 再実行」として扱う。
 
-Parse／Prep／Chunk問題も同様に、問題Versionの原文書を環境間持出し可能ならStaging専用Volumeへ限定複製する。Corpus全体との相互作用まで確認する必要があれば文書集合全体のスナップショット 再実行へ上げ、持出し不可なら`prod_only`として本番Quality側の隔離された検証JobでCandidate Parser／Prep設定を評価する。
+Parse／Prep／Chunk問題も同様に、問題Versionの原文書を環境間持出し可能ならStaging専用Volumeへ限定複製する。Corpus全体との相互作用まで確認する必要があれば文書集合全体のスナップショット 再実行へ上げ、持出し不可なら`prod_only`（データを移動せず本番Quality領域で評価する区分）として本番Quality側の隔離された検証JobでCandidate Parser／Prep設定を評価する。
 
 ##### ACL問題を再現する具体例
 
@@ -14921,14 +15259,14 @@ ACL問題は質問と文書だけでなく、実行時の権限条件も必要�
 | `user-sales` | `sales` | `DOC-SALES` |
 | `user-engineering` | `engineering` | `DOC-ENG` |
 
-再実行 Corpusには`DOC-SALES`と`DOC-ENG`を置き、Stagingでは承認済み`identity_fixture_id`を使って、
+再実行 Corpusには`DOC-SALES`と`DOC-ENG`を置き、Stagingでは承認済み`identity_fixture_id`（評価時に再現する利用者権限条件を識別するID）を使って、
 
 ```text
 user-sales が DOC-ENG を取得したら Fail
 user-engineering が DOC-SALES を取得したら Fail
 ```
 
-という回帰テストを行う。Raw User ID、実Group Membership、実Token、実Filter式は下位環境へ複製しない。ACL問題が特定文書だけで再現しない、またはCorpus全体のFilter適用・旧ACL残存・Index同期状態に依存する場合は、権限評価用テスト条件を維持したまま`full_snapshot_replay`へ昇格する。
+という回帰テストを行う。Raw User ID、実Group Membership、実Token、実Filter式は下位環境へ複製しない。ACL問題が特定文書だけで再現しない、またはCorpus全体のFilter適用・旧ACL残存・Index同期状態に依存する場合は、権限評価用テスト条件を維持したまま`full_snapshot_replay`（文書集合全体をStaging相当環境で再現する区分）へ昇格する。
 
 ##### 本番データを動かせない場合
 
@@ -14948,15 +15286,15 @@ Evaluationのみ実行
 Metric／Assessment／差分だけをDevへ返す
 ```
 
-本番Realtime AppのTrafficへ直接Candidateを当てず、Production Quality用のService Principal、専用Experiment、読取専用権限、出力Maskingを使ってオフライン評価する。Retrieval／Corpus依存問題では、元Traceの`corpus_snapshot_id`と`index_release_id`に対応する検索状態を固定し、その同じ状態にCandidateだけを適用する。合格後に通常のStaging／Release Gate／RAG Release手順へ戻す。
+本番Realtime AppのTrafficへ直接Candidateを当てず、Production Quality用のService Principal、専用Experiment、読取専用権限、出力Maskingを使ってオフライン評価する。Retrieval／Corpus依存問題では、元Traceの`corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID）と`index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID）に対応する検索状態を固定し、その同じ状態にCandidateだけを適用する。合格後に通常のStaging／Release Gate／RAG Release手順へ戻す。
 
 ##### 環境間還流で守る原則
 
 - 本番Trace、業務文書、Identityを無条件にDevへ複製しない。
-- 本番TraceからEvaluationDatasetへ自動直結せず、Human ReviewでExpectation、`root_cause`、改善先、持出し区分を確定する。
-- Devへ渡すのは可能な限り`metadata_only`または`sanitized_case`とする。
-- Retrieval／Parse／ACLの再現では、まず承認済み最小集合を`staging_replay`として作るが、再現できなければ`full_snapshot_replay`へ昇格する。
-- `full_snapshot_replay`では文書集合スナップショット Member、Chunk件数、Embedding、Chunk Schema、Index設定Digestを検証し、「本番相当」を名前だけで宣言しない。
+- 本番TraceからEvaluationDatasetへ自動直結せず、Human ReviewでExpectation、`root_cause`（品質問題の根本原因分類）、改善先、持出し区分を確定する。
+- Devへ渡すのは可能な限り`metadata_only`（本文を移さずRelease ID等のMetadataだけ連携する区分）または`sanitized_case`（機密情報を除去した評価Caseを連携する区分）とする。
+- Retrieval／Parse／ACLの再現では、まず承認済み最小集合を`staging_replay`（最小文書集合をStagingで再現する区分）として作るが、再現できなければ`full_snapshot_replay`（文書集合全体をStaging相当環境で再現する区分）へ昇格する。
+- `full_snapshot_replay`（文書集合全体をStaging相当環境で再現する区分）では文書集合スナップショット Member、Chunk件数、Embedding、Chunk Schema、Index設定Digestを検証し、「本番相当」を名前だけで宣言しない。
 - 実利用者Identityではなく権限評価用テスト条件を使う。
 - Masking後のCaseが元の失敗意味を維持しているか品質責任者が確認する。
 - TrainingとHoldout、Judge AlignmentとJudge Validationを事例グループ単位で分離する。
@@ -14969,20 +15307,20 @@ Metric／Assessment／差分だけをDevへ返す
 
 | 成果物 | 所有Bundle | 用途 |
 | --- | --- | --- |
-| `internal_rag_review_cases` | `quality` | Trace、期待値、原因、改善先、Split、担当者、承認履歴を保存する。 |
-| 品質改善課題／外部Issue対応 | `quality`または外部Tracker | 確認済み失敗原因グループの改善、再評価、Closeを追跡する。外部Tracker利用時はStatus等を外部側の正本とする。 |
-| Training EvaluationDataset | `quality` | Prompt Optimizationと検索設定探索に利用する。 |
-| Holdout EvaluationDataset | `quality` | 最終リリース判定専用として隔離する。 |
-| 機密情報を除いた改善用データ | `quality` | 本番TraceからReview済みExpectation、Mask済み入力、Version IDだけを抽出し、Dev／Stagingへ安全に還流する。独立Tableを増やさずレビュー記録＋EvaluationDataset Recordで表現する。 |
-| Staging Minimal 再実行 Corpus（条件付き） | `quality`＋`ingestion` | Retrieval／Parse／ACL問題をまず最小集合で再現する。期待文書、誤取得文書、競合文書、ACL Fixtureだけを承認付きでStagingへ作る。 |
-| Production-equivalent 文書集合全体のスナップショット 再実行（条件付き） | `quality`＋`ingestion` | Minimal 再実行で再現できない場合、Productionの文書集合スナップショットとIndex Release相当をStaging／Qualityへ再構築し、Corpus全体依存の検索問題を再現する。持出し不可ならProd-only評価へ切り替える。 |
-| Review App／Assessment Schema | `quality` | 専門家のFeedbackとMLflow Expectationを収集する。 |
-| Retrieval Evaluation Job | `quality` | Chunk、検索方式、件数、Filter、Rerankを比較する。 |
-| Prompt Optimization Job | `quality` | 判定・言い換え・回答Promptの候補を個別に生成する。 |
-| リリース判定 Job | `quality` | Retrieval、回答、拒否、ACL、性能、コストを判定する。 |
-| Production Monitoring設定 | `quality` | 本番Traceへ登録Scorerを継続実行する。 |
-| Judge Alignment Job | `quality` | 人間とJudgeのFeedback差分からAligned Judgeを作る。 |
-| CIビルドマニフェスト＋任意のGitベースLoggedModel | `realtime` | Apps実行環境のCommit／Build Tagを正本とし、Git checkout環境ではExperimental自動関連付けも検証する。 |
+| `internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable） | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | Trace、期待値、原因、改善先、Split、担当者、承認履歴を保存する。 |
+| 品質改善課題／外部Issue対応 | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名）または外部Tracker | 確認済み失敗原因グループの改善、再評価、Closeを追跡する。外部Tracker利用時はStatus等を外部側の正本とする。 |
+| Training EvaluationDataset | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | Prompt Optimizationと検索設定探索に利用する。 |
+| Holdout EvaluationDataset | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | 最終リリース判定専用として隔離する。 |
+| 機密情報を除いた改善用データ | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | 本番TraceからReview済みExpectation、Mask済み入力、Version IDだけを抽出し、Dev／Stagingへ安全に還流する。独立Tableを増やさずレビュー記録＋EvaluationDataset Recordで表現する。 |
+| Staging Minimal 再実行 Corpus（条件付き） | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名）＋`ingestion`（文書取込・解析・検索公開を配備するDAB Bundle名） | Retrieval／Parse／ACL問題をまず最小集合で再現する。期待文書、誤取得文書、競合文書、ACL Fixtureだけを承認付きでStagingへ作る。 |
+| Production-equivalent 文書集合全体のスナップショット 再実行（条件付き） | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名）＋`ingestion`（文書取込・解析・検索公開を配備するDAB Bundle名） | Minimal 再実行で再現できない場合、Productionの文書集合スナップショットとIndex Release相当をStaging／Qualityへ再構築し、Corpus全体依存の検索問題を再現する。持出し不可ならProd-only評価へ切り替える。 |
+| Review App／Assessment Schema | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | 専門家のFeedbackとMLflow Expectationを収集する。 |
+| Retrieval Evaluation Job | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | Chunk、検索方式、件数、Filter、Rerankを比較する。 |
+| Prompt Optimization Job | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | 判定・言い換え・回答Promptの候補を個別に生成する。 |
+| リリース判定 Job | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | Retrieval、回答、拒否、ACL、性能、コストを判定する。 |
+| Production Monitoring設定 | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | 本番Traceへ登録Scorerを継続実行する。 |
+| Judge Alignment Job | `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） | 人間とJudgeのFeedback差分からAligned Judgeを作る。 |
+| CIビルドマニフェスト＋任意のGitベースLoggedModel | `realtime`（RAG ApplicationとAgent Serverを配備するDAB Bundle名） | Apps実行環境のCommit／Build Tagを正本とし、Git checkout環境ではExperimental自動関連付けも検証する。 |
 
 #### 5.2.2 Quality・Review ソースファイル
 
@@ -14990,7 +15328,7 @@ Metric／Assessment／差分だけをDevへ返す
 
 この実装では、本番Traceに対するレビューをDelta Tableへ正規化して保存する。ただし、レビュー記録は個別Traceを無条件に1行ずつチケット化する仕組みではない。品質管理ジョブが失敗候補を抽出し、失敗パターン識別子、症状、暫定原因、Release、文書／質問カテゴリで失敗原因グループ化した後、代表Traceをレビュー対象にする。
 
-**レビュー記録（本資料独自用語）**は、代表TraceについてMLflow Expectation、技術根本原因、採否を確定するレビュー工程のRecordである。MLflow Review App／Labeling Sessionは公式UI／Resourceだが、`internal_rag_review_cases`とその状態遷移は本システム独自である。
+**レビュー記録（本資料独自用語）**は、代表TraceについてMLflow Expectation、技術根本原因、採否を確定するレビュー工程のRecordである。MLflow Review App／Labeling Sessionは公式UI／Resourceだが、`internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable）とその状態遷移は本システム独自である。
 
 レビュー記録と品質改善課題の関係は1対1とは限らない。複数レビュー記録から同じ根本原因が確認された場合は1つの品質改善課題へまとめる。逆に、1つの複雑な失敗原因グループを複数の改善テーマへ分割することもある。セキュリティ／可用性に即時影響する事象はQuality Reviewを待たずIncident経路を開始し、再発防止の品質改善だけを品質改善課題へ関連付ける。
 
@@ -15024,7 +15362,7 @@ MLflow／Databricks標準機能はTrace、Assessment、Feedback、MLflow Expecta
 | --- | --- | --- |
 | MLflow Trace | 本番実行時の質問、検索Span、回答Span、Assessment、Git・Prompt・Index バージョンを保持する証拠 | Realtime Agent、Monitoring／Scorer、Reviewer |
 | MLflow Review App／Assessment | 人がMLflow Expectation、原因診断、承認判断を入力するUIと入力履歴 | ドメイン担当者、RAG／LLMOps担当者、品質責任者 |
-| `internal_rag_review_cases` | Review工程の状態、Reviewer Group、確定値、Split、配送結果を管理する独自ワークフローの正本。品質改善課題のPriority／SLAは管理しない | 品質管理ジョブ |
+| `internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable） | Review工程の状態、Reviewer Group、確定値、Split、配送結果を管理する独自ワークフローの正本。品質改善課題のPriority／SLAは管理しない | 品質管理ジョブ |
 | EvaluationDataset | Prompt、検索、Agent経路の改善・評価に利用する再現可能なケース集合 | 品質管理ジョブ |
 | 専用バックログ／Dataset | 文書、Ingestion、セキュリティ、Judgeなど、EvaluationDataset以外の改善先 | Router Job、各担当チーム |
 
@@ -15033,14 +15371,14 @@ MLflow／Databricks標準機能はTrace、Assessment、Feedback、MLflow Expecta
 | 工程 | 開始条件 | システムが行うこと | 人が行うこと | 主な保存先 | 終了状態 |
 | --- | --- | --- | --- | --- | --- |
 | 本番実行 | 利用者が質問する | Agent処理をTrace化し、Prompt、Index、Git、アクセス範囲を記録する | 質問を送信する | MLflow Trace | レビュー状態なし |
-| 候補抽出 | 日次・週次Schedule | Scorer結果、検索0件、再検索上限、Judge不一致などで抽出し、マスキング・重複排除・暫定原因付与を行う | なし | Trace、Delta | `pending` |
-| Review Session作成 | 候補抽出完了 | 対象TraceをReview Sessionへ追加し、担当Groupへ通知する | なし | Review App、Delta | `pending` |
-| MLflow Expectation入力 | 担当者へ通知済み | AssessmentをDeltaへ同期し、必須項目を検証する | ドメイン担当者が期待回答・必要文書・拒否期待値を入力する | Assessment、Delta | `labeled` |
-| 原因診断 | MLflow Expectation確定 | Trace、Span、Chunk、Indexへの参照を提示し、診断結果を同期する | RAG／LLMOps担当者が最初に破綻した工程を特定する | Assessment、Delta | `diagnosed` |
-| 承認 | 原因診断完了 | 承認者の権限、必須項目、機密情報を検証し、判断を同期する | 品質責任者が採用または却下を判断する | Assessment、Delta | `approved`／`rejected` |
-| 改善先・Split割当 | `approved` | 固定Mappingで改善先を決め、`case_family_id`のHashでSplitを固定する | なし | Delta | `assigned` |
-| 環境間持出し判定 | `assigned` | `data_transfer_class`候補、Masking結果、必要な再実行資産を生成する | 品質責任者／Data Ownerが持出し可否と意味保存を承認する | レビュー記録、Mask済みArtifact | `promotion_status=approved`または`prod_only` |
-| 改善資産への配送 | `assigned` | EvaluationDatasetまたは専用バックログ／Datasetへ冪等に反映する | なし | 各改善資産、Delta | `synced` |
+| 候補抽出 | 日次・週次Schedule | Scorer結果、検索0件、再検索上限、Judge不一致などで抽出し、マスキング・重複排除・暫定原因付与を行う | なし | Trace、Delta | `pending`（未処理・確認待ちを表す状態値） |
+| Review Session作成 | 候補抽出完了 | 対象TraceをReview Sessionへ追加し、担当Groupへ通知する | なし | Review App、Delta | `pending`（未処理・確認待ちを表す状態値） |
+| MLflow Expectation入力 | 担当者へ通知済み | AssessmentをDeltaへ同期し、必須項目を検証する | ドメイン担当者が期待回答・必要文書・拒否期待値を入力する | Assessment、Delta | `labeled`（期待値入力済みを表す状態値） |
+| 原因診断 | MLflow Expectation確定 | Trace、Span、Chunk、Indexへの参照を提示し、診断結果を同期する | RAG／LLMOps担当者が最初に破綻した工程を特定する | Assessment、Delta | `diagnosed`（原因診断済みを表す状態値） |
+| 承認 | 原因診断完了 | 承認者の権限、必須項目、機密情報を検証し、判断を同期する | 品質責任者が採用または却下を判断する | Assessment、Delta | `approved`（承認済みを表す状態値）／`rejected`（却下済みを表す状態値） |
+| 改善先・Split割当 | `approved`（承認済みを表す状態値） | 固定Mappingで改善先を決め、`case_family_id`（同じ意味・業務目的の評価Case群を識別するID）のHashでSplitを固定する | なし | Delta | `assigned`（担当割当済みを表す状態値） |
+| 環境間持出し判定 | `assigned`（担当割当済みを表す状態値） | `data_transfer_class`（本番からDev／Stagingへ連携するデータ種別を示す区分）候補、Masking結果、必要な再実行資産を生成する | 品質責任者／Data Ownerが持出し可否と意味保存を承認する | レビュー記録、Mask済みArtifact | `promotion_status=approved`または`prod_only`（データを移動せず本番Quality領域で評価する区分） |
+| 改善資産への配送 | `assigned`（担当割当済みを表す状態値） | EvaluationDatasetまたは専用バックログ／Datasetへ冪等に反映する | なし | 各改善資産、Delta | `synced`（後続先へ同期済みを表す状態値） |
 | 改善・再リリース | 改善資産へ配送済み | 改善Job、Holdout評価、リリース判定、バージョン記録を実行する | 担当チームが修正し、責任者がリリースを承認する | MLflow Run、Git、Prompt、Index | 新しい本番Traceへ循環 |
 
 設定主体、場所、タイミングは次のとおりである。
@@ -15048,14 +15386,14 @@ MLflow／Databricks標準機能はTrace、Assessment、Feedback、MLflow Expecta
 | 項目 | 誰が | どこで | いつ | 設定方法 |
 | --- | --- | --- | --- | --- |
 | レビュー候補 | 品質管理ジョブ | MLflow Trace→Delta | 日次・週次 | 低評価、0件、再検索上限、Judge不一致を自動抽出する |
-| `proposed_root_cause` | 品質管理ジョブ | Delta | 候補作成時 | Trace TagとAssessmentから暫定分類する |
+| `proposed_root_cause`（システムが付ける暫定的な根本原因候補） | 品質管理ジョブ | Delta | 候補作成時 | Trace TagとAssessmentから暫定分類する |
 | 期待回答・期待文書・拒否期待値 | ドメイン担当者 | MLflow Review App | 候補抽出後 | MLflow Expectationと判定理由を入力する |
-| `root_cause` | RAG／LLMOps担当者 | Trace UI＋Review App | 期待値確定後 | Retriever Span、Chunk、Index、回答Spanを調査して確定する |
+| `root_cause`（品質問題の根本原因分類） | RAG／LLMOps担当者 | Trace UI＋Review App | 期待値確定後 | Retriever Span、Chunk、Index、回答Spanを調査して確定する |
 | `review_status=approved` | 品質責任者 | Review Appまたは承認UI | 原因診断後 | 正解値、原因、理由、機密情報を確認して承認する |
-| `improvement_target` | 品質管理ジョブ | Delta | 承認後 | `root_cause`から固定Mappingで決定する |
-| `dataset_split` | 品質管理ジョブ | Delta | 承認後・最適化前 | Snapshotを含まない`case_family_id`の安定Hashで自動割当する |
-| 改善資産への配送 | 品質管理ジョブ | Delta→MLflow／専用バックログ | 改善先・Split確定後 | Application改善ケースはEvaluationDatasetへ`merge_records()`し、それ以外は専用バックログ／Datasetへ冪等に反映する |
-| `review_status=synced` | 品質管理ジョブ | Delta | 配送成功後 | 配送先に同じ`review_case_id`が存在することを確認してから更新し、失敗時は`assigned`のまま再実行対象にする |
+| `improvement_target`（原因確認後に実際に修正する対象） | 品質管理ジョブ | Delta | 承認後 | `root_cause`（品質問題の根本原因分類）から固定Mappingで決定する |
+| `dataset_split`（Training／Holdoutのどちらへ属するかを示す区分） | 品質管理ジョブ | Delta | 承認後・最適化前 | Snapshotを含まない`case_family_id`（同じ意味・業務目的の評価Case群を識別するID）の安定Hashで自動割当する |
+| 改善資産への配送 | 品質管理ジョブ | Delta→MLflow／専用バックログ | 改善先・Split確定後 | Application改善ケースはEvaluationDatasetへ`merge_records()`（Evaluation DatasetへCaseを冪等に追加・更新するAPI）し、それ以外は専用バックログ／Datasetへ冪等に反映する |
+| `review_status=synced` | 品質管理ジョブ | Delta | 配送成功後 | 配送先に同じ`review_case_id`（代表Traceに対するレビュー記録を識別するID）が存在することを確認してから更新し、失敗時は`assigned`（担当割当済みを表す状態値）のまま再実行対象にする |
 
 以下の状態は、Review証跡を検証して改善資産へ配送したことを監査する本資料独自のPipeline状態であり、品質改善課題のチケット状態ではない。外部Issue Trackerを使う場合、そのStatusとは同期参照だけを持ち、相互に更新して二重の正本を作らない。角括弧は遷移主体を表し、人が入力した直後ではなく品質管理ジョブがAssessment必須項目と権限を検証して更新する。
 
@@ -15080,85 +15418,85 @@ synced
 新しい本番Traceへ循環
 ```
 
-ここで`rejected`は`assigned`へ進めず終了する。`synced`は「EvaluationDatasetへ登録済み」だけを意味せず、決定された改善資産への配送が正常終了したことを意味する。これにより、文書不足やACL問題も同じワークフローで配送完了まで追跡できる。
+ここで`rejected`（却下済みを表す状態値）は`assigned`（担当割当済みを表す状態値）へ進めず終了する。`synced`（後続先へ同期済みを表す状態値）は「EvaluationDatasetへ登録済み」だけを意味せず、決定された改善資産への配送が正常終了したことを意味する。これにより、文書不足やACL問題も同じワークフローで配送完了まで追跡できる。
 
-人手レビューの完了を1つの長時間Jobで待機しない。`review_queue_job.yml`では、候補生成・Session作成と、レビュー結果同期・Split割当を別のJob Runとして構成する。
+人手レビューの完了を1つの長時間Jobで待機しない。`review_queue_job.yml`（本番TraceからReview候補を抽出・割当し、人手確認キューを更新するJob定義）では、候補生成・Session作成と、レビュー結果同期・Split割当を別のJob Runとして構成する。
 
 | Job Task | 実行契機 | 処理 |
 | --- | --- | --- |
-| `triage_trace_candidates` | 日次 | Traceから候補を抽出し、失敗パターン識別子、失敗原因グループ、件数、`proposed_root_cause`をDeltaへ保存する |
-| `create_review_queue` | 失敗原因グループ作成後 | 代表Trace、Critical、分類不明TraceをReview Sessionへ追加して担当Groupへ通知する |
-| `sync_review_assessments` | 日次またはレビュー締切後 | AssessmentをDelta列へ正規化し、状態を`labeled`、`diagnosed`、`approved`または`rejected`へ進める |
-| `assign_review_cases` | 同期後 | 改善先とSplitを固定ルールで設定する |
-| `prepare_replay_assets` | 割当・持出し承認後 | `data_transfer_class`に応じて機密情報を除いた評価データ、Minimal 再実行 Corpus、文書集合全体のスナップショット 再実行定義、本番環境内だけで行う評価定義を作成し、Snapshot／Index同等性を検証する |
-| `sync_evaluation_dataset` | 割当後 | `RETRIEVAL`、`ANSWER_PROMPT`、`AGENT_ROUTING`の`train`と`holdout`を対応Datasetへ反映し、成功時に`synced`へ進める |
-| `route_specialized_cases` | 割当後 | `CORPUS`、`INGESTION`、`SECURITY`、`JUDGE_ALIGNMENT`を専用バックログ／Datasetへ反映し、成功時に`synced`へ進める |
+| `triage_trace_candidates`（失敗Trace候補を一次分類する処理） | 日次 | Traceから候補を抽出し、失敗パターン識別子、失敗原因グループ、件数、`proposed_root_cause`（システムが付ける暫定的な根本原因候補）をDeltaへ保存する |
+| `create_review_queue`（代表TraceをReview App／Labeling Sessionへ送る処理） | 失敗原因グループ作成後 | 代表Trace、Critical、分類不明TraceをReview Sessionへ追加して担当Groupへ通知する |
+| `sync_review_assessments`（Review AppのAssessmentを管理Tableへ同期する処理） | 日次またはレビュー締切後 | AssessmentをDelta列へ正規化し、状態を`labeled`（期待値入力済みを表す状態値）、`diagnosed`（原因診断済みを表す状態値）、`approved`（承認済みを表す状態値）または`rejected`（却下済みを表す状態値）へ進める |
+| `assign_review_cases`（Review済みCaseへ改善先・Dataset Split等を割り当てる処理） | 同期後 | 改善先とSplitを固定ルールで設定する |
+| `prepare_replay_assets`（原因再現に必要な評価データ／文書集合を準備する処理） | 割当・持出し承認後 | `data_transfer_class`（本番からDev／Stagingへ連携するデータ種別を示す区分）に応じて機密情報を除いた評価データ、Minimal 再実行 Corpus、文書集合全体のスナップショット 再実行定義、本番環境内だけで行う評価定義を作成し、Snapshot／Index同等性を検証する |
+| `sync_evaluation_dataset`（同期・Evaluation・Datasetを保持する項目） | 割当後 | `RETRIEVAL`（検索・順位付けに原因がある分類値）、`ANSWER_PROMPT`（回答Promptに原因がある分類値）、`AGENT_ROUTING`（Agent処理分岐に関する改善分類値）の`train`（候補探索に使うTraining側を表す区分）と`holdout`（候補探索に使わない最終評価側を表す区分）を対応Datasetへ反映し、成功時に`synced`（後続先へ同期済みを表す状態値）へ進める |
+| `route_specialized_cases`（失敗Caseを原因別の処理先へ振り分ける処理） | 割当後 | `CORPUS`（文書集合を指定する設定値／環境変数）、`INGESTION`（ingestionを指定する設定値／環境変数）、`SECURITY`（securityを指定する設定値／環境変数）、`JUDGE_ALIGNMENT`（HumanとJudgeの判定差に関する改善分類値）を専用バックログ／Datasetへ反映し、成功時に`synced`（後続先へ同期済みを表す状態値）へ進める |
 
 Deltaテーブルには次の列を持たせる。
 
 | 列 | 内容 | 誰が設定するか | いつ設定するか | どのような判断・方法で設定するか |
 | --- | --- | --- | --- | --- |
-| `review_case_id` | レビューケースID | 品質管理ジョブ | レビュー候補作成時 | 元Trace IDとレビューCycleからUUIDまたは安定Hashを生成し、重複登録を防ぐ |
-| `source_trace_id` | 元の本番Trace ID | 品質管理ジョブ | レビュー候補作成時 | `mlflow.search_traces()`で取得した元TraceのIDをそのまま保存する |
-| `source_environment` | 元証跡の環境 | 品質管理ジョブ | 候補作成時 | 通常は`production`。環境間Lineageを曖昧にしないため固定値として保存する |
-| `source_rag_release_id` | 問題発生時のRAG Release | 品質管理ジョブ | 候補作成時 | 元Traceの`rag.release_id`を転記し、当時のPrompt／Index／Corpus等を再現可能にする |
-| `source_corpus_snapshot_id` | 問題発生時の文書集合スナップショット | 品質管理ジョブ | 候補作成時 | 元TraceのSnapshot IDを転記し、文書更新後も当時の検索集合を特定できるようにする |
-| `data_transfer_class` | `metadata_only`、`sanitized_case`、`staging_replay`、`full_snapshot_replay`、`prod_only` | 品質管理ジョブ＋品質責任者／Data Owner | Root Cause確定後・配送前 | Case→最小文書集合→文書集合全体のスナップショットの順で再現性を確認し、機密区分と持出し可否を含め人が承認する |
-| `sanitization_status` | `not_required`、`pending`、`approved`、`rejected` | 品質管理ジョブ＋品質責任者 | 下位環境配送前 | Masking済み質問・Expectation・固定証跡が意味を保ち、禁止情報を含まないことを確認する |
-| `promotion_status` | `pending`、`approved`、`promoted`、`rejected`、`prod_only` | 品質管理ジョブ＋品質責任者 | Dev／Staging配送またはProd-only評価時 | 環境間配送の承認と完了を管理し、Review承認とデータ持出し承認を同一視しない |
-| `question_redacted` | マスキング済み質問 | 品質管理ジョブ | Delta保存前 | 組織のMasking Policyで個人情報、Secret、顧客識別子を除去し、原文を無条件に複製しない |
-| `entitlement_hash`、`acl_policy_version` | 実行時権限の非可逆識別子 | Realtime Agent、品質管理ジョブ | Trace生成時、候補作成時 | Raw User／GroupやFilter式を保存せず、Server解決済みPrincipal集合とPolicyバージョンのHashを転記する |
-| `identity_fixture_id` | 再現評価用の承認済み権限Fixture | 品質管理ジョブ | Case承認・配送時 | Production Identityを複製せず、同等のACL条件を持つ架空Fixtureを品質責任者が承認する |
-| `corpus_snapshot_id` | 評価対象となる有効全文書バージョン集合 | Ingestion／Index Release Job、品質管理ジョブ | Index同期・Release時、候補作成時 | 元Traceが使用した文書集合スナップショット IDを転記する |
-| `index_release_id` | Chunk、Embedding、Index設定を含む検索Release | Index Release Job、品質管理ジョブ | Index作成・候補作成時 | 元Traceが実際にQueryしたIndex Release IDを転記する |
-| `case_family_id` | 類似質問を同じSplitへまとめる安定ID | 品質管理ジョブ | Split割当前 | 正規化した質問の意味、業務目的、文書グループから生成し、Snapshot・実行バージョン・Identityを含めない |
-| `case_instance_id` | 個別評価Caseの安定ID | 品質管理ジョブ | Dataset配送前 | `case_family_id`、権限評価用テスト条件、文書集合スナップショット、`expectation_version`から生成する |
-| `expectation_version` | 期待値の変更履歴 | ドメイン担当者、品質管理ジョブ | MLflow Expectation承認時 | 文書改訂・業務ルール変更時に増分し、過去期待値を上書きしない |
-| `expected_response` | 承認済み期待回答 | ドメイン担当者 | Review AppでのLabeling時 | アクセス可能な承認済み社内資料だけを根拠に、業務上期待する回答を入力する |
-| `expected_response_redacted` | 配送用期待回答 | 品質管理ジョブ、品質責任者 | 承認前 | 機密情報をMaskingし、質問・期待回答・証跡の意味整合を品質責任者が承認する |
-| `expected_document_ids` | 回答に必要な文書ID | ドメイン担当者 | Review AppでのLabeling時 | 正答に必要かつ十分な文書を確認し、検索された文書ではなく本来取得すべき文書IDを入力する |
-| `expected_chunk_version_ids`、`expected_citation_ids` | 必要Chunkと安定した出典 | ドメイン担当者、品質管理ジョブ | Labeling・配送前 | 承認済みSnapshotのChunkバージョンを解決し、出典IDを決定論的に生成する |
-| `expected_refused` | 回答拒否が正解か | ドメイン担当者 | Review AppでのLabeling時 | アクセス可能な資料だけで回答できるなら`false`、根拠不足・対象外・権限不足なら`true`とする |
-| `expected_refusal_reason` | 拒否の内部理由 | ドメイン担当者、RAG／LLMOps担当者 | Labeling・診断時 | 利用者表示とは分離した定義済み理由を、根拠と権限条件から確定する |
-| `expected_max_search_attempts` | 許容検索回数 | RAG／LLMOps担当者 | 診断・承認時 | 質問難易度と経路期待からSystem上限以下で設定する |
-| `fixed_evidence_redacted` | Prompt単体評価用固定証跡 | 品質管理ジョブ、品質責任者 | 配送前 | 承認済みChunkをMaskingし、ACL、Snapshot、意味保存を確認する |
-| `rag_release_id` | 元Traceまたは評価対象Release | 品質管理ジョブ | 候補作成・配送時 | 元Traceのリリース構成台帳IDを転記し、再評価時は明示した候補リリースへバージョン化する |
-| `proposed_root_cause` | Jobが付与した未確定の原因候補 | 品質管理ジョブ | レビュー候補作成時 | 0件、再検索上限、Judge不一致、ACL疑義などのTrace TagとAssessmentからRule Baseで暫定分類する |
-| `root_cause` | 確定した`DOCUMENT`、`CHUNK`、`RETRIEVAL`、`PROMPT`、`ROUTING`、`ACL`、`JUDGE` | RAG／LLMOps担当者 | MLflow Expectation確定後の技術診断時 | Trace、Retriever Span、Chunk Table、Index、回答Spanを順に確認し、最初に破綻した主要工程を選ぶ |
-| `improvement_target` | `CORPUS`、`INGESTION`、`RETRIEVAL`、`ANSWER_PROMPT`、`AGENT_ROUTING`、`SECURITY`、`JUDGE_ALIGNMENT` | 品質管理ジョブ | 品質責任者の承認後 | 確定した`root_cause`をGit管理された固定Mappingで改善対象へ変換する |
-| `dataset_split` | `train`、`holdout`、`excluded` | 品質管理ジョブ | 承認後・最適化前 | 対象がApplication改善なら`split_bucket`で80:20に割り当て、それ以外はメインDatasetから`excluded`にする |
-| `split_bucket` | Hash割当結果の0〜99 | 品質管理ジョブ | `dataset_split`設定時 | `xxhash64(case_family_id) mod 100`で計算し、類似質問を必ず同じSplitへ入れる |
-| `split_policy_version` | Split規則のバージョン | 品質管理ジョブ | `dataset_split`設定時 | 実行したSplit規則のGit管理バージョンを保存し、後から割当方法を再現できるようにする |
-| `review_status` | `pending`、`labeled`、`diagnosed`、`approved`、`rejected`、`assigned`、`synced` | 品質管理ジョブのみ | 各工程の完了時 | Human Assessmentと権限を検証したJobだけが定義済み状態遷移に従って更新する |
-| `review_rationale` | 判定・修正理由 | ドメイン担当者、RAG／LLMOps担当者、品質責任者 | Labeling、原因診断、承認時 | 正解根拠、技術診断根拠、承認・却下理由をReviewerと時刻付きで追記し、既存理由を上書きしない |
-| `labeled_by` | 期待値を入力したドメイン担当者 | Review Assessment同期Job | MLflow Expectation同期時 | `expected_response`などを入力したHuman Assessmentの`source_id`から自動設定する |
-| `diagnosed_by` | 技術原因を確定したRAG／LLMOps担当者 | Review Assessment同期Job | `root_cause`同期時 | `root_cause`を入力したHuman Assessmentの`source_id`から自動設定する |
-| `approved_by` | 採用を承認した品質責任者 | Review Assessment同期Job | `review_decision=approve`同期時 | 承認Assessmentの`source_id`から自動設定し、入力値として自由編集させない |
-| `approved_at` | 承認時刻 | Review Assessment同期Job | 承認同期時 | `review_decision=approve` AssessmentのTimestampを保存する |
-| `source_git_commit` | 問題発生時のGitコミット | Realtime Agent、品質管理ジョブ | Trace生成時、候補作成時 | Git-based バージョン TrackingがTraceへ関連付けたCommit Hashを転記する |
-| `source_index_name` | 問題発生時のIndex | Realtime Agent、品質管理ジョブ | Trace生成時、候補作成時 | 実際にQueryしたAI Search Index名をTrace Tagから転記する |
-| `sync_attempt_count` | 配送試行回数 | 品質管理ジョブ | Case単位の配送開始時 | 再試行ごとに1増やし、無限再試行をAlertする |
-| `last_sync_error` | 最終配送エラー | 品質管理ジョブ | Case単位の配送失敗時 | Tokenや機密本文を除いた分類済みエラーだけを保存する |
-| `destination_id` | 配送先Record／バックログ ID | 品質管理ジョブ | 配送先存在確認後 | `case_instance_id`と同じ安定IDを保存する |
-| `synced_at` | 配送完了時刻 | 品質管理ジョブ | 配送先Record存在確認後 | Training／Holdout／専用バックログの照合成功時だけ設定する |
+| `review_case_id`（代表Traceに対するレビュー記録を識別するID） | レビューケースID | 品質管理ジョブ | レビュー候補作成時 | 元Trace IDとレビューCycleからUUIDまたは安定Hashを生成し、重複登録を防ぐ |
+| `source_trace_id`（レビュー元となるMLflow Trace ID） | 元の本番Trace ID | 品質管理ジョブ | レビュー候補作成時 | `mlflow.search_traces()`（条件に合うMLflow Traceを検索するAPI）で取得した元TraceのIDをそのまま保存する |
+| `source_environment`（評価Caseの元データが発生した環境） | 元証跡の環境 | 品質管理ジョブ | 候補作成時 | 通常は`production`（本番で現在利用する参照先を表すAlias）。環境間Lineageを曖昧にしないため固定値として保存する |
+| `source_rag_release_id`（取得元・RAG・Release・IDを表す識別子） | 問題発生時のRAG Release | 品質管理ジョブ | 候補作成時 | 元Traceの`rag.release_id`（実行したRAGリリースをTraceから参照するTag）を転記し、当時のPrompt／Index／Corpus等を再現可能にする |
+| `source_corpus_snapshot_id`（取得元・文書集合・スナップショット・IDを表す識別子） | 問題発生時の文書集合スナップショット | 品質管理ジョブ | 候補作成時 | 元TraceのSnapshot IDを転記し、文書更新後も当時の検索集合を特定できるようにする |
+| `data_transfer_class`（本番からDev／Stagingへ連携するデータ種別を示す区分） | `metadata_only`（本文を移さずRelease ID等のMetadataだけ連携する区分）、`sanitized_case`（機密情報を除去した評価Caseを連携する区分）、`staging_replay`（最小文書集合をStagingで再現する区分）、`full_snapshot_replay`（文書集合全体をStaging相当環境で再現する区分）、`prod_only`（データを移動せず本番Quality領域で評価する区分） | 品質管理ジョブ＋品質責任者／Data Owner | Root Cause確定後・配送前 | Case→最小文書集合→文書集合全体のスナップショットの順で再現性を確認し、機密区分と持出し可否を含め人が承認する |
+| `sanitization_status`（Development連携前の機密情報除去状態） | `not_required`（外部検査が不要だったことを表す状態値）、`pending`（未処理・確認待ちを表す状態値）、`approved`（承認済みを表す状態値）、`rejected`（却下済みを表す状態値） | 品質管理ジョブ＋品質責任者 | 下位環境配送前 | Masking済み質問・Expectation・固定証跡が意味を保ち、禁止情報を含まないことを確認する |
+| `promotion_status`（評価Case／改善Artifactの環境間配送・昇格状態） | `pending`（未処理・確認待ちを表す状態値）、`approved`（承認済みを表す状態値）、`promoted`、`rejected`（却下済みを表す状態値）、`prod_only`（データを移動せず本番Quality領域で評価する区分） | 品質管理ジョブ＋品質責任者 | Dev／Staging配送またはProd-only評価時 | 環境間配送の承認と完了を管理し、Review承認とデータ持出し承認を同一視しない |
+| `question_redacted`（機密情報をMaskingした評価用質問） | マスキング済み質問 | 品質管理ジョブ | Delta保存前 | 組織のMasking Policyで個人情報、Secret、顧客識別子を除去し、原文を無条件に複製しない |
+| `entitlement_hash`（利用者の権限集合を本文を保存せず比較するHash）、`acl_policy_version`（RAG検索で適用するACLポリシーのVersion） | 実行時権限の非可逆識別子 | Realtime Agent、品質管理ジョブ | Trace生成時、候補作成時 | Raw User／GroupやFilter式を保存せず、Server解決済みPrincipal集合とPolicyバージョンのHashを転記する |
+| `identity_fixture_id`（評価時に再現する利用者権限条件を識別するID） | 再現評価用の承認済み権限Fixture | 品質管理ジョブ | Case承認・配送時 | Production Identityを複製せず、同等のACL条件を持つ架空Fixtureを品質責任者が承認する |
+| `corpus_snapshot_id`（ある時点の検索対象文書Version集合を識別するID） | 評価対象となる有効全文書バージョン集合 | Ingestion／Index Release Job、品質管理ジョブ | Index同期・Release時、候補作成時 | 元Traceが使用した文書集合スナップショット IDを転記する |
+| `index_release_id`（評価・ロールバック可能なAI Search Index構成を識別するID） | Chunk、Embedding、Index設定を含む検索Release | Index Release Job、品質管理ジョブ | Index作成・候補作成時 | 元Traceが実際にQueryしたIndex Release IDを転記する |
+| `case_family_id`（同じ意味・業務目的の評価Case群を識別するID） | 類似質問を同じSplitへまとめる安定ID | 品質管理ジョブ | Split割当前 | 正規化した質問の意味、業務目的、文書グループから生成し、Snapshot・実行バージョン・Identityを含めない |
+| `case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID） | 個別評価Caseの安定ID | 品質管理ジョブ | Dataset配送前 | `case_family_id`（同じ意味・業務目的の評価Case群を識別するID）、権限評価用テスト条件、文書集合スナップショット、`expectation_version`（評価Caseの期待値定義のVersion）から生成する |
+| `expectation_version`（評価Caseの期待値定義のVersion） | 期待値の変更履歴 | ドメイン担当者、品質管理ジョブ | MLflow Expectation承認時 | 文書改訂・業務ルール変更時に増分し、過去期待値を上書きしない |
+| `expected_response`（評価Caseで期待する回答） | 承認済み期待回答 | ドメイン担当者 | Review AppでのLabeling時 | アクセス可能な承認済み社内資料だけを根拠に、業務上期待する回答を入力する |
+| `expected_response_redacted`（機密情報をMaskingした配送用期待回答） | 配送用期待回答 | 品質管理ジョブ、品質責任者 | 承認前 | 機密情報をMaskingし、質問・期待回答・証跡の意味整合を品質責任者が承認する |
+| `expected_document_ids`（正答に必要な文書IDの集合） | 回答に必要な文書ID | ドメイン担当者 | Review AppでのLabeling時 | 正答に必要かつ十分な文書を確認し、検索された文書ではなく本来取得すべき文書IDを入力する |
+| `expected_chunk_version_ids`（正答に必要なChunk Version IDの集合）、`expected_citation_ids`（評価Caseで期待する安定した出典IDの集合） | 必要Chunkと安定した出典 | ドメイン担当者、品質管理ジョブ | Labeling・配送前 | 承認済みSnapshotのChunkバージョンを解決し、出典IDを決定論的に生成する |
+| `expected_refused`（回答拒否が正解かを示す期待値） | 回答拒否が正解か | ドメイン担当者 | Review AppでのLabeling時 | アクセス可能な資料だけで回答できるなら`false`（偽を表すBoolean値）、根拠不足・対象外・権限不足なら`true`（真を表すBoolean値）とする |
+| `expected_refusal_reason`（期待する回答拒否理由） | 拒否の内部理由 | ドメイン担当者、RAG／LLMOps担当者 | Labeling・診断時 | 利用者表示とは分離した定義済み理由を、根拠と権限条件から確定する |
+| `expected_max_search_attempts`（評価Caseで許容する最大検索回数） | 許容検索回数 | RAG／LLMOps担当者 | 診断・承認時 | 質問難易度と経路期待からSystem上限以下で設定する |
+| `fixed_evidence_redacted`（機密情報を除去して固定した回答根拠） | Prompt単体評価用固定証跡 | 品質管理ジョブ、品質責任者 | 配送前 | 承認済みChunkをMaskingし、ACL、Snapshot、意味保存を確認する |
+| `rag_release_id`（Code・Prompt・Model・Index・文書集合を固定したRAGリリースID） | 元Traceまたは評価対象Release | 品質管理ジョブ | 候補作成・配送時 | 元Traceのリリース構成台帳IDを転記し、再評価時は明示した候補リリースへバージョン化する |
+| `proposed_root_cause`（システムが付ける暫定的な根本原因候補） | Jobが付与した未確定の原因候補 | 品質管理ジョブ | レビュー候補作成時 | 0件、再検索上限、Judge不一致、ACL疑義などのTrace TagとAssessmentからRule Baseで暫定分類する |
+| `root_cause`（品質問題の根本原因分類） | 確定した`DOCUMENT`（必要文書・公開Versionに原因がある分類値）、`CHUNK`（Chunk分割に原因がある分類値）、`RETRIEVAL`（検索・順位付けに原因がある分類値）、`PROMPT`（Promptに原因がある既存実装上の分類値）、`ROUTING`（LangGraphの処理分岐に原因がある分類値）、`ACL`（権限制御に原因がある分類値）、`JUDGE`（自動評価に原因がある分類値） | RAG／LLMOps担当者 | MLflow Expectation確定後の技術診断時 | Trace、Retriever Span、Chunk Table、Index、回答Spanを順に確認し、最初に破綻した主要工程を選ぶ |
+| `improvement_target`（原因確認後に実際に修正する対象） | `CORPUS`（文書集合を指定する設定値／環境変数）、`INGESTION`（ingestionを指定する設定値／環境変数）、`RETRIEVAL`（検索・順位付けに原因がある分類値）、`ANSWER_PROMPT`（回答Promptに原因がある分類値）、`AGENT_ROUTING`（Agent処理分岐に関する改善分類値）、`SECURITY`（securityを指定する設定値／環境変数）、`JUDGE_ALIGNMENT`（HumanとJudgeの判定差に関する改善分類値） | 品質管理ジョブ | 品質責任者の承認後 | 確定した`root_cause`（品質問題の根本原因分類）をGit管理された固定Mappingで改善対象へ変換する |
+| `dataset_split`（Training／Holdoutのどちらへ属するかを示す区分） | `train`（候補探索に使うTraining側を表す区分）、`holdout`（候補探索に使わない最終評価側を表す区分）、`excluded`（評価Datasetの自動分割対象外を表す区分） | 品質管理ジョブ | 承認後・最適化前 | 対象がApplication改善なら`split_bucket`（評価Caseを安定分割するためのHash Bucket）で80:20に割り当て、それ以外はメインDatasetから`excluded`（評価Datasetの自動分割対象外を表す区分）にする |
+| `split_bucket`（評価Caseを安定分割するためのHash Bucket） | Hash割当結果の0〜99 | 品質管理ジョブ | `dataset_split`（Training／Holdoutのどちらへ属するかを示す区分）設定時 | `xxhash64(case_family_id) mod 100`（評価Case群を安定してTraining／Holdoutへ分けるHash式）で計算し、類似質問を必ず同じSplitへ入れる |
+| `split_policy_version`（分割・ポリシー・Versionを表すVersion項目） | Split規則のバージョン | 品質管理ジョブ | `dataset_split`（Training／Holdoutのどちらへ属するかを示す区分）設定時 | 実行したSplit規則のGit管理バージョンを保存し、後から割当方法を再現できるようにする |
+| `review_status`（文書またはレビューの現在状態） | `pending`（未処理・確認待ちを表す状態値）、`labeled`（期待値入力済みを表す状態値）、`diagnosed`（原因診断済みを表す状態値）、`approved`（承認済みを表す状態値）、`rejected`（却下済みを表す状態値）、`assigned`（担当割当済みを表す状態値）、`synced`（後続先へ同期済みを表す状態値） | 品質管理ジョブのみ | 各工程の完了時 | Human Assessmentと権限を検証したJobだけが定義済み状態遷移に従って更新する |
+| `review_rationale`（レビュー判断の理由） | 判定・修正理由 | ドメイン担当者、RAG／LLMOps担当者、品質責任者 | Labeling、原因診断、承認時 | 正解根拠、技術診断根拠、承認・却下理由をReviewerと時刻付きで追記し、既存理由を上書きしない |
+| `labeled_by`（期待値を入力した担当者を示す項目） | 期待値を入力したドメイン担当者 | Review Assessment同期Job | MLflow Expectation同期時 | `expected_response`（評価Caseで期待する回答）などを入力したHuman Assessmentの`source_id`（Assessment等の入力元を識別するID）から自動設定する |
+| `diagnosed_by`（技術原因を確定した担当者を示す項目） | 技術原因を確定したRAG／LLMOps担当者 | Review Assessment同期Job | `root_cause`（品質問題の根本原因分類）同期時 | `root_cause`（品質問題の根本原因分類）を入力したHuman Assessmentの`source_id`（Assessment等の入力元を識別するID）から自動設定する |
+| `approved_by`（承認を行ったActorを記録する項目） | 採用を承認した品質責任者 | Review Assessment同期Job | `review_decision=approve`同期時 | 承認Assessmentの`source_id`（Assessment等の入力元を識別するID）から自動設定し、入力値として自由編集させない |
+| `approved_at`（承認が確定した時刻） | 承認時刻 | Review Assessment同期Job | 承認同期時 | `review_decision=approve` AssessmentのTimestampを保存する |
+| `source_git_commit`（取得元・Git・Commitを保持する項目） | 問題発生時のGitコミット | Realtime Agent、品質管理ジョブ | Trace生成時、候補作成時 | Git-based バージョン TrackingがTraceへ関連付けたCommit Hashを転記する |
+| `source_index_name`（取得元・Index・名称を保持する項目） | 問題発生時のIndex | Realtime Agent、品質管理ジョブ | Trace生成時、候補作成時 | 実際にQueryしたAI Search Index名をTrace Tagから転記する |
+| `sync_attempt_count`（同期を試行した回数） | 配送試行回数 | 品質管理ジョブ | Case単位の配送開始時 | 再試行ごとに1増やし、無限再試行をAlertする |
+| `last_sync_error`（直近の同期失敗理由） | 最終配送エラー | 品質管理ジョブ | Case単位の配送失敗時 | Tokenや機密本文を除いた分類済みエラーだけを保存する |
+| `destination_id`（評価Caseの配送先Record／Backlogを識別するID） | 配送先Record／バックログ ID | 品質管理ジョブ | 配送先存在確認後 | `case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID）と同じ安定IDを保存する |
+| `synced_at`（後続Datasetへ同期した時刻） | 配送完了時刻 | 品質管理ジョブ | 配送先Record存在確認後 | Training／Holdout／専用バックログの照合成功時だけ設定する |
 
-`root_cause`は次の診断順序で確定する。
+`root_cause`（品質問題の根本原因分類）は次の診断順序で確定する。
 
-| 確認結果 | `root_cause` | `improvement_target` |
+| 確認結果 | `root_cause`（品質問題の根本原因分類） | `improvement_target`（原因確認後に実際に修正する対象） |
 | --- | --- | --- |
-| 回答に必要な文書が管理対象に存在しない | `DOCUMENT` | `CORPUS` |
-| 文書はあるが必要箇所が解析・Chunk化されていない | `CHUNK` | `INGESTION` |
-| 正解ChunkはIndexにあるが検索されない | `RETRIEVAL` | `RETRIEVAL` |
-| 正解Chunkを取得したが回答内容や引用が誤っている | `PROMPT` | `ANSWER_PROMPT` |
-| 不要な再検索、誤った十分性判定、誤拒否が発生した | `ROUTING` | `AGENT_ROUTING` |
-| 権限外文書が検索・引用された | `ACL` | `SECURITY` |
-| アプリの回答は正しいが自動Judgeが誤判定した | `JUDGE` | `JUDGE_ALIGNMENT` |
+| 回答に必要な文書が管理対象に存在しない | `DOCUMENT`（必要文書・公開Versionに原因がある分類値） | `CORPUS`（文書集合を指定する設定値／環境変数） |
+| 文書はあるが必要箇所が解析・Chunk化されていない | `CHUNK`（Chunk分割に原因がある分類値） | `INGESTION`（ingestionを指定する設定値／環境変数） |
+| 正解ChunkはIndexにあるが検索されない | `RETRIEVAL`（検索・順位付けに原因がある分類値） | `RETRIEVAL`（検索・順位付けに原因がある分類値） |
+| 正解Chunkを取得したが回答内容や引用が誤っている | `PROMPT`（Promptに原因がある既存実装上の分類値） | `ANSWER_PROMPT`（回答Promptに原因がある分類値） |
+| 不要な再検索、誤った十分性判定、誤拒否が発生した | `ROUTING`（LangGraphの処理分岐に原因がある分類値） | `AGENT_ROUTING`（Agent処理分岐に関する改善分類値） |
+| 権限外文書が検索・引用された | `ACL`（権限制御に原因がある分類値） | `SECURITY`（securityを指定する設定値／環境変数） |
+| アプリの回答は正しいが自動Judgeが誤判定した | `JUDGE`（自動評価に原因がある分類値） | `JUDGE_ALIGNMENT`（HumanとJudgeの判定差に関する改善分類値） |
 
-同じ意味の質問は、文書版や権限条件が変わっても同じ`case_family_id`へまとめる。SnapshotやIdentity条件は`case_instance_id`だけへ含めるため、旧Snapshot版と新Snapshot版がTrainingとHoldoutへ分散しない。期待値が変わる場合は同じ質問グループに新しい`expectation_version`のInstanceを追加する。
+同じ意味の質問は、文書版や権限条件が変わっても同じ`case_family_id`（同じ意味・業務目的の評価Case群を識別するID）へまとめる。SnapshotやIdentity条件は`case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID）だけへ含めるため、旧Snapshot版と新Snapshot版がTrainingとHoldoutへ分散しない。期待値が変わる場合は同じ質問グループに新しい`expectation_version`（評価Caseの期待値定義のVersion）のInstanceを追加する。
 
 承認後の改善先とSplitは、次のJobで自動設定する。
 
-`bundles/quality/src/assign_review_cases.py`
+`bundles/quality/src/assign_review_cases.py`（レビュー候補を担当者・優先度・原因グループへ割り当て、Review対象を確定する処理）
 
 **実装概要**
 
@@ -15167,7 +15505,7 @@ Deltaテーブルには次の列を持たせる。
 | 目的 | 承認済みCaseへ改善対象と安定Dataset Splitを割り当てる。 |
 | 入力 | レビュー記録、root_cause、case_group_id、Split Policy。approved後に読む。 |
 | 処理 | 原因対応表とGroup Hashで改善先とSplitを固定する。結果を見た後のSplit変更と類似Case分断を禁止する。 |
-| 出力 | Caseを`assigned`にしてDataset Syncへ渡す。 |
+| 出力 | Caseを`assigned`（担当割当済みを表す状態値）にしてDataset Syncへ渡す。 |
 | 失敗・再実行 | 承認前Caseは変更しない。Policyバージョンとgroup_idを再読して既存割当を上書きしない。 |
 
 ```python
@@ -15333,17 +15671,17 @@ if __name__ == "__main__":
     assign_approved_cases()
 ```
 
-`DOCUMENT`と`CHUNK`は文書・Pipeline修正、`ACL`はセキュリティ回帰、`JUDGE`はJudge Alignmentが改善先であるため、メインのPrompt／Retrieval Training Datasetからは`excluded`にする。`route_specialized_cases`が同じ`review_case_id`を付けて各改善先のバックログまたは専用DatasetへRouteし、配送成功後に`synced`へ更新する。修正完了後にメインEvaluationDatasetの回帰ケースとして採用する場合は、修正後の文書Snapshotと期待値を再確認する別の承認フローで、新しいレビュー記録を作成する。
+`DOCUMENT`（必要文書・公開Versionに原因がある分類値）と`CHUNK`（Chunk分割に原因がある分類値）は文書・Pipeline修正、`ACL`（権限制御に原因がある分類値）はセキュリティ回帰、`JUDGE`（自動評価に原因がある分類値）はJudge Alignmentが改善先であるため、メインのPrompt／Retrieval Training Datasetからは`excluded`（評価Datasetの自動分割対象外を表す区分）にする。`route_specialized_cases`（失敗Caseを原因別の処理先へ振り分ける処理）が同じ`review_case_id`（代表Traceに対するレビュー記録を識別するID）を付けて各改善先のバックログまたは専用DatasetへRouteし、配送成功後に`synced`（後続先へ同期済みを表す状態値）へ更新する。修正完了後にメインEvaluationDatasetの回帰ケースとして採用する場合は、修正後の文書Snapshotと期待値を再確認する別の承認フローで、新しいレビュー記録を作成する。
 
-Splitの手動変更は原則禁止する。法令対応や重大障害などでHoldoutへ固定する必要がある場合は、`split_override`、変更理由、承認者、変更時刻を別列へ保存し、通常のHash規則と区別する。
+Splitの手動変更は原則禁止する。法令対応や重大障害などでHoldoutへ固定する必要がある場合は、`split_override`（自動Dataset分割を人が例外上書きする項目）、変更理由、承認者、変更時刻を別列へ保存し、通常のHash規則と区別する。
 
 ##### 5.2.2.2 MLflow EvaluationDatasetを冪等に育てる
 
-品質管理ジョブは `assigned` CaseをTraining／HoldoutへCase単位で配送する。MLflow EvaluationDatasetは同一 `inputs` を同じRecordとしてmergeするため、`case_instance_id` を `inputs` に含めてRecord identityを安定させる。質問だけでなく期待回答・期待文書もMaskingと意味保存を品質責任者が承認してから配送する。
+品質管理ジョブは `assigned`（担当割当済みを表す状態値） CaseをTraining／HoldoutへCase単位で配送する。MLflow EvaluationDatasetは同一 `inputs`（Evaluation Datasetへ保存する評価対象の入力） を同じRecordとしてmergeするため、`case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID） を `inputs`（Evaluation Datasetへ保存する評価対象の入力） に含めてRecord identityを安定させる。質問だけでなく期待回答・期待文書もMaskingと意味保存を品質責任者が承認してから配送する。
 
-大量Caseを無制限にDriverへ集めず、固定Batchで `merge_records()` し、配送先UC Tableに `case_instance_id` が存在することを確認したCaseだけ `synced` へ進める。失敗Caseは `assigned` のまま `sync_attempt_count` と `last_sync_error` を更新する。TrainingとHoldout、専用バックログは別Destinationとして同じ規則を適用する。
+大量Caseを無制限にDriverへ集めず、固定Batchで `merge_records()`（Evaluation DatasetへCaseを冪等に追加・更新するAPI） し、配送先UC Tableに `case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID） が存在することを確認したCaseだけ `synced`（後続先へ同期済みを表す状態値） へ進める。失敗Caseは `assigned`（担当割当済みを表す状態値） のまま `sync_attempt_count`（同期を試行した回数） と `last_sync_error`（直近の同期失敗理由） を更新する。TrainingとHoldout、専用バックログは別Destinationとして同じ規則を適用する。
 
-`bundles/quality/src/sync_evaluation_dataset.py`
+`bundles/quality/src/sync_evaluation_dataset.py`（承認済みReview結果をEvaluation Datasetへ同期するPythonファイル）
 
 **実装概要**
 
@@ -15352,8 +15690,8 @@ Splitの手動変更は原則禁止する。法令対応や重大障害などで
 | 目的 | assigned Caseを用途別EvaluationDatasetへ冪等配送する。 |
 | 入力 | レビュー記録、Dataset Mapping、Experiment ID。Assignment後に読む。 |
 | 処理 | Splitと改善先を検証しMask済みRecordをmergeする。競合する最終検証用途へ二重配送しない。 |
-| 出力 | Dataset Recordを作りCaseを`synced`へ更新する。 |
-| 失敗・再実行 | Dataset失敗時は`assigned`のまま残す。`review_case_id`で重複を防ぐ。 |
+| 出力 | Dataset Recordを作りCaseを`synced`（後続先へ同期済みを表す状態値）へ更新する。 |
+| 失敗・再実行 | Dataset失敗時は`assigned`（担当割当済みを表す状態値）のまま残す。`review_case_id`（代表Traceに対するレビュー記録を識別するID）で重複を防ぐ。 |
 
 ```python
 """承認済みレビュー記録を用途別MLflow EvaluationDatasetへ冪等同期するModule。同じCaseを競合する最終検証用途へ重複配送しない。
@@ -15613,20 +15951,20 @@ if __name__ == "__main__":
     main()
 ```
 
-Dataset実装バージョンによりUC Tableの `inputs` 表現がStructまたはJSON文字列となるため、`verify_destination_records()` の列式は実Workspace Schemaに合わせてAdapter化する。重要なのは `merge_records()` の戻りだけで完了扱いせず、配送先Recordを照合することである。候補生成、重複排除、層化Sampling、配送はPySpark、定期実行、再試行、通知、権限は `quality` BundleのLakeflow Jobで管理する。EvaluationDataset育成のためだけにLakeflow Declarative Pipelineへ寄せない。
+Dataset実装バージョンによりUC Tableの `inputs`（Evaluation Datasetへ保存する評価対象の入力） 表現がStructまたはJSON文字列となるため、`verify_destination_records()`（同期先Recordが期待どおり存在するか検証する関数） の列式は実Workspace Schemaに合わせてAdapter化する。重要なのは `merge_records()`（Evaluation DatasetへCaseを冪等に追加・更新するAPI） の戻りだけで完了扱いせず、配送先Recordを照合することである。候補生成、重複排除、層化Sampling、配送はPySpark、定期実行、再試行、通知、権限は `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） BundleのLakeflow Jobで管理する。EvaluationDataset育成のためだけにLakeflow Declarative Pipelineへ寄せない。
 
 Trainingには正常回答、検索失敗、拒否正解、略語、複数文書統合、旧版競合、ACL、削除、解析エラー、Prompt Injectionを含める。失敗ケースだけへ偏らせず、カテゴリ、ACL区分、拒否、文書種別の分布をSplitごとにGateする。
 
 
 ###### DevelopmentでTraceとEvaluation Datasetをどう使い分けるか
 
-`sync_evaluation_dataset.py`で作るEvaluation Datasetは、Production Traceから選別したCaseを継続的に再利用するためのTest Suiteである。一方、Retriever Span等の中間実行結果まで使うScorerの開発では、元のMLflow Traceを直接評価する。
+`sync_evaluation_dataset.py`（承認済みレビューCaseをEvaluation Datasetへ同期するPythonファイル）で作るEvaluation Datasetは、Production Traceから選別したCaseを継続的に再利用するためのTest Suiteである。一方、Retriever Span等の中間実行結果まで使うScorerの開発では、元のMLflow Traceを直接評価する。
 
 Developmentでは、目的に応じて次の3パターンを使い分ける。
 
 **パターン1：保存済みProduction Traceを直接再評価する**
 
-Retriever Span等を利用するScorer／Judgeを開発する場合は、Production Traceを検索して`mlflow.genai.evaluate()`へ直接渡す。このとき`predict_fn`を指定しないためRAGは再実行されず、Corpus／AI Searchは不要である。
+Retriever Span等を利用するScorer／Judgeを開発する場合は、Production Traceを検索して`mlflow.genai.evaluate()`（Evaluation DatasetとScorer／Judgeで評価Runを作成するMLflow API）へ直接渡す。このとき`predict_fn`（MLflow Evaluationが評価対象RAGを実行するために呼ぶ関数）を指定しないためRAGは再実行されず、Corpus／AI Searchは不要である。
 
 ```python
 import mlflow
@@ -15676,7 +16014,7 @@ Corpus検索
 
 **パターン2：Evaluation Datasetの既存Outputを使って回帰評価する**
 
-Production TraceからEvaluation Datasetへ昇格したRecordが`outputs`と`expectations`を保持している場合、Trace中間情報を必要としないScorerは、Evaluation Datasetだけで再評価できる。
+Production TraceからEvaluation Datasetへ昇格したRecordが`outputs`（既存実行結果として保存する評価対象の出力）と`expectations`（Evaluation Datasetへ保存する期待値）を保持している場合、Trace中間情報を必要としないScorerは、Evaluation Datasetだけで再評価できる。
 
 ```python
 import mlflow
@@ -15697,11 +16035,11 @@ result = mlflow.genai.evaluate(
 )
 ```
 
-この使い方は、Dataset Recordに既存`outputs`があるCaseに限る。Retriever Span等を必要とするScorerでは、Evaluation Datasetだけで過去Traceの全中間情報を代替できるとは考えず、元Traceを直接評価する。
+この使い方は、Dataset Recordに既存`outputs`（既存実行結果として保存する評価対象の出力）があるCaseに限る。Retriever Span等を必要とするScorerでは、Evaluation Datasetだけで過去Traceの全中間情報を代替できるとは考えず、元Traceを直接評価する。
 
 **パターン3：Evaluation DatasetのinputsをCandidateへ再投入する**
 
-新しいApplication挙動を確認するときは`predict_fn`を指定する。この場合はDatasetの`inputs`がCandidateへ渡され、新しいOutput／Traceが生成される。
+新しいApplication挙動を確認するときは`predict_fn`（MLflow Evaluationが評価対象RAGを実行するために呼ぶ関数）を指定する。この場合はDatasetの`inputs`（Evaluation Datasetへ保存する評価対象の入力）がCandidateへ渡され、新しいOutput／Traceが生成される。
 
 ```python
 import mlflow
@@ -15726,7 +16064,7 @@ result = mlflow.genai.evaluate(
 )
 ```
 
-`candidate_rag()`の内部でAI Searchを呼ぶ場合は、本番に近いCorpus／AI Searchが必要になるため、このEnd-to-End評価はStagingで実施する。
+`candidate_rag()`（評価対象Candidate RAGを実行する関数）の内部でAI Searchを呼ぶ場合は、本番に近いCorpus／AI Searchが必要になるため、このEnd-to-End評価はStagingで実施する。
 
 まとめると、同じEvaluation資産でも実行方法が異なる。
 
@@ -15751,7 +16089,9 @@ Evaluation Datasetの役割は、**Production Traceから選んだ重要Caseを�
 
 ここで行うのは、RAG全体の回答品質を見るEnd-to-End結合テストとは別に、**検索コンポーネントだけを比較するテスト**である。Evaluation Datasetの同じ質問をStagingのAI Searchへ投入し、検索設定を変えたときに「期待する文書をより適切に取得できるか」を比較する。
 
-この評価では回答生成まで行わなくてもよい。Chunk生成バージョン、`query_type`、`num_results`、Filter、Rerankingを候補として、期待文書Recall、Retrieval Relevance、Latencyを比較する。Embedding ModelやChunk Schemaを変える場合は既存Indexを上書きせず、Stagingに別Indexを構築して並行評価する。
+この評価では回答生成まで行わなくてもよい。Chunk生成バージョン、`query_type`（AI Searchの検索方式を指定する項目）、`num_results`（AI Searchから返す検索結果件数）、Filter、Rerankingを候補として、期待文書Recall、Retrieval Relevance、nDCG、Latencyを比較する。Embedding ModelやChunk Schemaを変える場合は既存Indexを上書きせず、Stagingに別Indexを構築して並行評価する。
+
+判断は「3.6 問題の原因分類と改善サイクル」の**検索系の詳細**に従う。例えば取得件数は5、10、20件等を同じEvaluation Datasetで比較し、必要文書Recallが頭打ちになる最小件数を選ぶ。Recallは十分なのに上位順位が悪い場合はRerankなし／ありを比較し、nDCG／Retrieval Relevanceの改善がLatency増加に見合う場合だけRerankを採用候補とする。取得件数を増やしてもRecallが改善しない場合は、件数ではなく検索Query、文書公開状態、Chunk、Embedding、Index設定を疑う。
 
 DevelopmentではCorpusを基本的に持たないため、この検索コンポーネント評価は**本番に近いCorpus／AI Searchを再現したStagingで実施する**。検索設定を選んだ後、別途RAG End-to-End結合テストでRetrieval→回答→Scorer／Judgeまで通して確認する。
 
@@ -15773,34 +16113,34 @@ flowchart TD
 
 | 変更対象 | 例 | 主な評価 |
 | --- | --- | --- |
-| Chunk | `ai_prep_search` バージョン、独自Chunk | Recall、重複率、Context長 |
+| Chunk | `ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function） バージョン、独自Chunk | Recall、重複率、Context長 |
 | 検索方式 | ANN、HYBRID、FULL_TEXT | Recall、Relevance、0件率 |
-| 取得件数 | 3、5、10 | Sufficiency、Latency、Token |
+| 取得件数 | 5、10、20等 | 必要文書Recall、Sufficiency、Latency、Token |
 | Filter | access、製品、版、日付 | ACL違反、Recall |
-| Rerank | なし／あり | nDCG、上位文書Recall、Latency |
+| Rerank | なし／あり | nDCG、Retrieval Relevance、上位文書Recall、Latency |
 
 検索設定を選択したTraining Datasetと、最終判定用Holdout Datasetを分離する。検索結果を見ながら期待文書を後から変更すると、検索設定に都合のよい評価になるため、期待文書はドメイン担当者が事前承認する。
 
 ##### 5.2.2.4 固定証跡でAnswer Promptだけを最適化する
 
-Prompt Optimizationは、固定したTraining Datasetに対してPrompt候補を生成・比較する改善処理であり、基盤LLMのWeightを更新する学習ではない。このシステムでは`optimize_answer_prompt.py`がReflection用Model Serviceを呼び、候補をMLflow RunとPrompt Registryの新バージョンとして保存する。Holdoutを候補探索へ使わず、最終採否は次節のリリース判定で判断する。
+Prompt Optimizationは、固定したTraining Datasetに対してPrompt候補を生成・比較する改善処理であり、基盤LLMのWeightを更新する学習ではない。このシステムでは`optimize_answer_prompt.py`（Training Dataset上で回答Prompt候補を最適化し、改善候補Versionを生成・比較する処理）がReflection用Model Serviceを呼び、候補をMLflow RunとPrompt Registryの新バージョンとして保存する。Holdoutを候補探索へ使わず、最終採否は次節のリリース判定で判断する。
 
-Answer Prompt Optimization用Training Recordは、承認済み `fixed_evidence`、出典ID、文書バージョン、文書集合スナップショットを `inputs` に保持する。証跡は選定時点でMasking・ACL確認し、Optimizer実行中にAI Search、Sufficiency、Query Rewriteを呼ばない。これにより差分はAnswer Promptだけとなる。Retrieval改善はAnswer PromptとModelを固定し、Sufficiency Prompt改善も固定証跡で別Jobとして行う。
+Answer Prompt Optimization用Training Recordは、承認済み `fixed_evidence`（回答生成条件を固定するため保存した根拠情報）、出典ID、文書バージョン、文書集合スナップショットを `inputs`（Evaluation Datasetへ保存する評価対象の入力） に保持する。証跡は選定時点でMasking・ACL確認し、Optimizer実行中にAI Search、Sufficiency、Query Rewriteを呼ばない。これにより差分はAnswer Promptだけとなる。Retrieval改善はAnswer PromptとModelを固定し、Sufficiency Prompt改善も固定証跡で別Jobとして行う。
 
-`sync_evaluation_dataset.py` の `to_record()` はAnswer Prompt対象Caseに次を追加する。
+`sync_evaluation_dataset.py`（承認済みレビューCaseをEvaluation Datasetへ同期するPythonファイル） の `to_record()`（レビュー結果をEvaluation Dataset Recordへ変換する関数） はAnswer Prompt対象Caseに次を追加する。
 
 | 実装情報 | 内容 |
 | --- | --- |
 | 導入段階 | 本番導入後に本番TraceとAssessmentを使って追加する。 |
 | 初めて必要になる段階 | 本番導入後 |
 | 後続段階で追加される機能 | 改善CycleごとにDataset、Rubric、閾値、Release比較を更新する。 |
-| 関連Table／Dataset | 入力: 承認済みレビュー記録、固定証跡、権限評価用テスト条件、文書集合スナップショット／出力: Prompt Optimization用EvaluationDataset Recordの`inputs` |
+| 関連Table／Dataset | 入力: 承認済みレビュー記録、固定証跡、権限評価用テスト条件、文書集合スナップショット／出力: Prompt Optimization用EvaluationDataset Recordの`inputs`（Evaluation Datasetへ保存する評価対象の入力） |
 | 関連Job／Pipeline | Quality Service Principal。該当BundleのJob／Pipelineから実行する。 |
 | 関連する検証 | Case、証跡、Release条件を再現可能なRecordへ変換する。必須IDまたはMasking済み証跡が欠けたCaseを同期しない。 |
-| ファイルパス | `bundles/quality/src/sync_evaluation_dataset.py` |
+| ファイルパス | `bundles/quality/src/sync_evaluation_dataset.py`（承認済みReview結果をEvaluation Datasetへ同期するPythonファイル） |
 | 実行主体 | Quality Service Principal |
 | 入力 | 承認済みレビュー記録、固定証跡、権限評価用テスト条件、文書集合スナップショット |
-| 出力 | Prompt Optimization用EvaluationDataset Recordの`inputs` |
+| 出力 | Prompt Optimization用EvaluationDataset Recordの`inputs`（Evaluation Datasetへ保存する評価対象の入力） |
 | 必要な理由 | Retrievalを固定し、Answer Promptだけの改善効果を比較するため |
 | 正常終了時 | Case、証跡、Release条件を再現可能なRecordへ変換する |
 | 失敗時 | 必須IDまたはMasking済み証跡が欠けたCaseを同期しない |
@@ -15822,9 +16162,9 @@ record_inputs = {
 }
 ```
 
-`fixed_evidence_redacted` はReview時に採用した `chunk_version_id`、`citation_id`、原文抜粋、文書バージョン、Title、Pageを含み、品質責任者が質問・期待回答との意味整合と機密区分を承認する。Holdout 証跡はOptimizerへ渡さない。
+`fixed_evidence_redacted`（機密情報を除去して固定した回答根拠） はReview時に採用した `chunk_version_id`（検索Chunkの内容・版を一意に識別するID）、`citation_id`（回答中の根拠を安定して参照する出典ID）、原文抜粋、文書バージョン、Title、Pageを含み、品質責任者が質問・期待回答との意味整合と機密区分を承認する。Holdout 証跡はOptimizerへ渡さない。
 
-`bundles/quality/src/optimize_answer_prompt.py`
+`bundles/quality/src/optimize_answer_prompt.py`（Training Dataset上で回答Prompt候補を最適化し、改善候補Versionを生成・比較する処理）
 
 **実装概要**
 
@@ -16008,7 +16348,7 @@ for optimized_prompt in result.optimized_prompts:
     print(optimized_prompt.uri)
 ```
 
-上のJobはPrompt単体Trainingであり、本番Graphの品質を保証しない。候補Promptを不変バージョンとして登録した後、別のEnd-to-End JobがRAGリリース候補、Training smoke set、未使用Holdoutを使って検索、経路、回答、ACL、Latencyを評価する。Prompt Optimizerの実行Caseと最終Release判定Caseを分離する。Optimizerは`bundles/quality/prompts/answer.md`を書き換えない。採用済み候補を次回のGit Baselineにする場合は、Registry候補とMarkdownの差分を人間がReviewし、Pull Requestで反映する。
+上のJobはPrompt単体Trainingであり、本番Graphの品質を保証しない。候補Promptを不変バージョンとして登録した後、別のEnd-to-End JobがRAGリリース候補、Training smoke set、未使用Holdoutを使って検索、経路、回答、ACL、Latencyを評価する。Prompt Optimizerの実行Caseと最終Release判定Caseを分離する。Optimizerは`bundles/quality/prompts/answer.md`（回答生成PromptをGit管理するMarkdownファイル）を書き換えない。採用済み候補を次回のGit Baselineにする場合は、Registry候補とMarkdownの差分を人間がReviewし、Pull Requestで反映する。
 
 ##### 5.2.2.5 Holdout評価とリリースゲート
 
@@ -16030,7 +16370,7 @@ for optimized_prompt in result.optimized_prompts:
 
 ##### 5.2.2.6 RAGリリース構成台帳を昇格・ロールバックする
 
-Prompt エイリアスは開発候補の探索用であり、本番切替単位ではない。リリース判定合格時に不変Prompt URI、Git Commit、Wheel、Index Release、文書集合スナップショット、Model Service／Route、ACL・Judgeバージョンを含む新しい`rag_release_manifest`を発行し、`production` Channel 参照を1 Transactionで切り替える。既存IndexやPromptバージョンを破壊更新しない。
+Prompt エイリアスは開発候補の探索用であり、本番切替単位ではない。リリース判定合格時に不変Prompt URI、Git Commit、Wheel、Index Release、文書集合スナップショット、Model Service／Route、ACL・Judgeバージョンを含む新しい`rag_release_manifest`（承認済みRAGリリース構成を保持する管理Table）を発行し、`production`（本番で現在利用する参照先を表すAlias） Channel 参照を1 Transactionで切り替える。既存IndexやPromptバージョンを破壊更新しない。
 
 | 変更対象 | 候補の作り方 | 本番切替 | ロールバック |
 | --- | --- | --- | --- |
@@ -16050,23 +16390,23 @@ Judgeバージョンを更新しても過去Traceが自動的に同じ条件で�
 
 ##### 5.2.2.8 TraceにAssessmentを収集する
 
-Assessment自体はPoCから収集している。この節で本番導入後に追加するのは、低評価、再検索上限、0件、Judgeの`no`、ACL疑義を定期的にLabeling Session／レビュー待ちキューへ配送し、担当割当とDataset同期を自動化する運用である。ドメイン担当者はFeedbackとMLflow Expectation、RAG／LLMOps担当者は`root_cause`、品質責任者は`review_decision`を入力する。
+Assessment自体はPoCから収集している。この節で本番導入後に追加するのは、低評価、再検索上限、0件、Judgeの`no`（不合格・Noを表す例示値）、ACL疑義を定期的にLabeling Session／レビュー待ちキューへ配送し、担当割当とDataset同期を自動化する運用である。ドメイン担当者はFeedbackとMLflow Expectation、RAG／LLMOps担当者は`root_cause`（品質問題の根本原因分類）、品質責任者は`review_decision`（レビューで確定した判断結果）を入力する。
 
 MLflow Review AppとLabeling SessionはTraceへFeedback／MLflow Expectationを付与する公式機能である。一方、本資料の状態遷移、原因分類、SLA、Dataset配送は独自ワークフローであるため、実行環境更新時にSDK互換性と権限をStagingで再確認する。PoCではTrace UIで少数CaseへFeedback／MLflow Expectationを直接入力すればよく、この定期配送ワークフローは必須ではない。
 
 | Assessment | 種類 | 用途 |
 | --- | --- | --- |
-| `internal_rag_quality` | Feedback | Judge Alignment用の人間判定 |
-| `expected_response` | MLflow Expectation | 回答評価とPrompt改善 |
-| `expected_document_ids` | MLflow Expectation | Retrieval評価 |
-| `expected_chunk_version_ids` | MLflow Expectation | Chunk／出典評価 |
-| `expected_refused` | MLflow Expectation | 回答拒否評価 |
-| `expected_refusal_reason` | MLflow Expectation | 内部拒否分類の評価 |
-| `root_cause` | Feedback | 技術的な主要原因の確定 |
-| `review_decision` | Feedback | 品質責任者による採用・却下 |
+| `internal_rag_quality`（内部・RAG・品質を保持する項目） | Feedback | Judge Alignment用の人間判定 |
+| `expected_response`（評価Caseで期待する回答） | MLflow Expectation | 回答評価とPrompt改善 |
+| `expected_document_ids`（正答に必要な文書IDの集合） | MLflow Expectation | Retrieval評価 |
+| `expected_chunk_version_ids`（正答に必要なChunk Version IDの集合） | MLflow Expectation | Chunk／出典評価 |
+| `expected_refused`（回答拒否が正解かを示す期待値） | MLflow Expectation | 回答拒否評価 |
+| `expected_refusal_reason`（期待する回答拒否理由） | MLflow Expectation | 内部拒否分類の評価 |
+| `root_cause`（品質問題の根本原因分類） | Feedback | 技術的な主要原因の確定 |
+| `review_decision`（レビューで確定した判断結果） | Feedback | 品質責任者による採用・却下 |
 | コメント | Rationale | 原因分析とAlignment |
 
-`bundles/quality/src/create_review_queue.py`
+`bundles/quality/src/create_review_queue.py`（代表Traceのレビュー待ちキューを作るPythonファイル）
 
 **ロジック概要**
 
@@ -16082,18 +16422,18 @@ MLflow Review AppとLabeling SessionはTraceへFeedback／MLflow Expectationを�
 | Traceとの関係 | 元Traceを複製せずSession側からsource_trace_idで参照する。 |
 | 正常終了時 | Reviewerへ割当済みのReview対象が作成される。 |
 | 失敗時 | Session追加を中断し元Trace／Case状態を変更しない。 |
-| 再試行時 | `trace_id`＋`review_policy_version`で二重投入を防ぐ。 |
+| 再試行時 | `trace_id`（MLflow Traceを一意に識別するID）＋`review_policy_version`（レビュー・ポリシー・Versionを表すVersion項目）で二重投入を防ぐ。 |
 | 後続処理 | Assessment収集、assign_review_cases.py、align_judge.py。 |
 
-Review AppはTraceへFeedback／MLflow Expectationを入力するMLflow UI、Labeling Sessionは対象Trace、Label Schema、担当者をまとめるレビュー単位である。Label Schemaは独立したDelta TableではなくMLflow管理Resourceであり、AssessmentはSession側へ複製されたTraceへ保存される。本資料独自の`internal_rag_review_cases`はSLA、原因、承認、Split、改善配送を管理するDelta Tableであり、Review Appの代替ではない。
+Review AppはTraceへFeedback／MLflow Expectationを入力するMLflow UI、Labeling Sessionは対象Trace、Label Schema、担当者をまとめるレビュー単位である。Label Schemaは独立したDelta TableではなくMLflow管理Resourceであり、AssessmentはSession側へ複製されたTraceへ保存される。本資料独自の`internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable）はSLA、原因、承認、Split、改善配送を管理するDelta Tableであり、Review Appの代替ではない。
 
 | 項目 | 本システムでの設定 |
 | --- | --- |
 | Session作成主体 | Quality SP。個人ReviewerはSession作成権限を持たない |
-| Source Experiment | `MLFLOW_REALTIME_EXPERIMENT_ID`。候補抽出元の本番Trace |
-| Session保存先 | `MLFLOW_LABELING_EXPERIMENT_ID`。元Traceと混ぜずReview用に保持 |
-| Reviewer | `REVIEW_ASSIGNED_USERS`へ認証済みUserをCI／Job Parameterから注入し、Reviewer GroupのMembershipを事前確認 |
-| 権限 | Source Experimentは`CAN_READ`、Labeling ExperimentはReviewer／Quality SPに`CAN_EDIT` |
+| Source Experiment | `MLFLOW_REALTIME_EXPERIMENT_ID`（mlflow・Realtime・Experiment・IDを指定する設定値／環境変数）。候補抽出元の本番Trace |
+| Session保存先 | `MLFLOW_LABELING_EXPERIMENT_ID`（Labeling／Review用Experiment IDを指定する環境変数）。元Traceと混ぜずReview用に保持 |
+| Reviewer | `REVIEW_ASSIGNED_USERS`（レビュー・割当・usersを指定する設定値／環境変数）へ認証済みUserをCI／Job Parameterから注入し、Reviewer GroupのMembershipを事前確認 |
+| 権限 | Source Experimentは`CAN_READ`（対象MLflow Resourceを参照する権限）、Labeling ExperimentはReviewer／Quality SPに`CAN_EDIT`（対象MLflow Resourceを編集する権限） |
 | 表示情報 | Mask済み質問、回答、許可された出典 metadata、必要なSpan。Raw ACL式、Token、署名付きURLは除外 |
 | Session終了 | 全必須Schema入力、重複／除外判定、品質責任者の締切承認が完了した時点 |
 | 保持 | SessionとAssessmentは監査保持Policy、元UC Traceは別のTrace保持Policyに従う |
@@ -16109,7 +16449,7 @@ PoCは少数Traceへ直接Assessmentを付ければよく、Labeling Sessionを�
 | 関連Table／Dataset | 入力: Trace、Assessment、Dataset、Prompt／Judge設定／出力: 評価、Dataset、Prompt／Judge候補 |
 | 関連Job／Pipeline | Quality SP。該当BundleのJob／Pipelineから実行する。 |
 | 関連する検証 | バージョン付き成果物を保存する。Releaseへ昇格しない。 |
-| ファイルパス | `bundles/quality/src/create_review_queue.py` |
+| ファイルパス | `bundles/quality/src/create_review_queue.py`（代表Traceのレビュー待ちキューを作るPythonファイル） |
 | 実行主体 | Quality SP |
 | 入力 | Trace、Assessment、Dataset、Prompt／Judge設定 |
 | 出力 | 評価、Dataset、Prompt／Judge候補 |
@@ -16303,9 +16643,9 @@ if __name__ == "__main__":
     main()
 ```
 
-Labeling Sessionは元TraceをSessionへコピーし、AssessmentもSession側Traceへ保存する。Dataset同期JobとJudge Alignment Jobは、元Experimentではなく`labeling_session.mlflow_run_id`を指定してレビュー済みTraceを取得する。
+Labeling Sessionは元TraceをSessionへコピーし、AssessmentもSession側Traceへ保存する。Dataset同期JobとJudge Alignment Jobは、元Experimentではなく`labeling_session.mlflow_run_id`（Labeling Sessionで作成されたMLflow Runを識別するID）を指定してレビュー済みTraceを取得する。
 
-Review Assessment同期Jobは、MLflow Expectationが揃ったら`labeled`、`root_cause`が確定したら`diagnosed`、`review_decision=approve`なら`approved`、`reject`なら`rejected`としてDeltaテーブルを更新する。Assessmentの`source_id`から各入力者を取得し、`labeled_by`、`diagnosed_by`、`approved_by`へ保存する。Review Appが`dataset_split`を入力する項目は用意せず、Splitは前述の`assign_review_cases.py`だけが設定する。
+Review Assessment同期Jobは、MLflow Expectationが揃ったら`labeled`（期待値入力済みを表す状態値）、`root_cause`（品質問題の根本原因分類）が確定したら`diagnosed`（原因診断済みを表す状態値）、`review_decision=approve`なら`approved`（承認済みを表す状態値）、`reject`なら`rejected`（却下済みを表す状態値）としてDeltaテーブルを更新する。Assessmentの`source_id`（Assessment等の入力元を識別するID）から各入力者を取得し、`labeled_by`（期待値を入力した担当者を示す項目）、`diagnosed_by`（技術原因を確定した担当者を示す項目）、`approved_by`（承認を行ったActorを記録する項目）へ保存する。Review Appが`dataset_split`（Training／Holdoutのどちらへ属するかを示す区分）を入力する項目は用意せず、Splitは前述の`assign_review_cases.py`（レビュー候補を担当者・優先度・原因グループへ割り当て、Review対象を確定する処理）だけが設定する。
 
 エンドユーザーの👍／👎はレビュー候補の優先順位付けに利用できるが、Judge Alignmentの正解として自動採用しない。社内の品質基準を理解した担当者が、判定理由とともに承認する。
 
@@ -16315,9 +16655,9 @@ Judge Alignmentは、人間FeedbackとJudge Feedbackの不一致を使ってJudg
 
 Judge Alignmentの時期はPoC／本番という環境名ではなく、**同じ評価基準の人間Feedbackが十分にあるか**、**Judgeをリリース判定やProduction Monitoringの判断へ使うか**で決める。JudgeをGateへ使わないPoCでは不要である。一方、専門家ラベルが集まりPilotのGateへ使うならPoC後半またはPilot中に実施する。本番後は基準変更や誤差Driftが確認されたときに再Alignmentする。
 
-この実装では、まず初期Judgeで`internal_rag_quality` Assessmentを作成し、同じTraceへ**完全に同じ名前**の人間Feedbackを収集する。公式上は最低10 TraceでAlignmentできるが、金融機関向けではカテゴリ、拒否、ACL境界を含む50～100 Traceを目安にする。`judge_dataset_split=alignment`と`judge_dataset_split=validation`をケースグループ単位で固定し、同じTraceを両方へ入れない。Aligned Judgeを人間へ合わせた後も、未使用Validationで一致率、False Positive、False Negativeを確認し、自動でProduction Monitoringへ反映しない。
+この実装では、まず初期Judgeで`internal_rag_quality`（内部・RAG・品質を保持する項目） Assessmentを作成し、同じTraceへ**完全に同じ名前**の人間Feedbackを収集する。公式上は最低10 TraceでAlignmentできるが、金融機関向けではカテゴリ、拒否、ACL境界を含む50～100 Traceを目安にする。`judge_dataset_split=alignment`と`judge_dataset_split=validation`をケースグループ単位で固定し、同じTraceを両方へ入れない。Aligned Judgeを人間へ合わせた後も、未使用Validationで一致率、False Positive、False Negativeを確認し、自動でProduction Monitoringへ反映しない。
 
-`bundles/quality/src/align_judge.py`
+`bundles/quality/src/align_judge.py`（人の評価結果とJudge結果を比較し、Judgeの判定基準を調整・検証する処理）
 
 **実装概要**
 
@@ -16498,7 +16838,7 @@ Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、Judgeの
 
 登録結果はあくまで候補バージョンである。品質責任者がValidation結果と誤判定例を承認し、リリース構成台帳へJudgeバージョンを記録した後に限ってProduction Monitoringを開始する。金融機関向けReleaseを未検証Judgeだけで自動可決しない。
 
-`MemAlignOptimizer`はExperimental APIである。`quality` JobではMLflow、DSPy、Jinja2、tqdmのバージョンを固定し、実行環境更新時にAlignmentとJudge Validationを再実行する。
+`MemAlignOptimizer`（Human Feedbackを使ってJudgeを調整するMLflow Optimizer）はExperimental APIである。`quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） JobではMLflow、DSPy、Jinja2、tqdmのバージョンを固定し、実行環境更新時にAlignmentとJudge Validationを再実行する。
 
 ##### 5.2.2.10 Gitコミットベースのバージョン Tracking
 
@@ -16506,9 +16846,9 @@ Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、Judgeの
 
 | 対象 | 正本 | Trace・実行との関連付け |
 | --- | --- | --- |
-| `ingestion` Bundle | Git | Pipeline Run、Git Commit、`ai_prep_search` バージョン |
-| `quality` Bundle | Git | Evaluation Run、Job Run、Git Commit |
-| `realtime` Bundle | Git＋CIビルドマニフェスト | Git checkout環境ではExperimental LoggedModel、Apps実行環境ではリリース構成台帳＋Trace Tag |
+| `ingestion`（文書取込・解析・検索公開を配備するDAB Bundle名） Bundle | Git | Pipeline Run、Git Commit、`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function） バージョン |
+| `quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名） Bundle | Git | Evaluation Run、Job Run、Git Commit |
+| `realtime`（RAG ApplicationとAgent Serverを配備するDAB Bundle名） Bundle | Git＋CIビルドマニフェスト | Git checkout環境ではExperimental LoggedModel、Apps実行環境ではリリース構成台帳＋Trace Tag |
 | 共通Package | Git | Wheel バージョン、Git Commit |
 | Prompt | Git Markdown（編集・Review用原本）＋Prompt Registry（実行・評価・Release用Version） | Git Commit、Markdown Hash、Promptバージョン、Trace |
 | Index設定 | Git | Index名、Embedding Model、Sync Mode、Trace Tag |
@@ -16528,10 +16868,10 @@ Judge Alignmentは基盤LLMのWeightを更新する処理ではなく、Judgeの
 | Index公開とData生成の運用組織が分かれた | Search Publish SPを分離 | Index管理とロールバックの当番／SLA |
 | 整合性差分確認が削除候補等の高機密情報を扱う | 整合性差分確認用SPを分離 | 候補表の閲覧者、保持期間、承認経路 |
 | Deploy IdentityへDDLを付与できない、Migrationの所有者が別、またはDatabase Change Managementが独立した | Platform → Deploy Identity／Schema Migration SP | Migration Artifact、環境承認、DDL実行窓口 |
-| Manifest Executorが登録反映と承認反映を兼ねることが許容されない | 登録Executor／承認Executor | 固定Artifact、Command種別、各Base Table更新権限 |
+| Manifest Executorが登録反映と承認反映を兼ねることが許容されない | 登録Executor／承認Executor | 固定Artifact、処理指示種別、各Base Table更新権限 |
 | Credential Rotationの管理組織または所有者が分離された | 対象責務だけを新SPへ分割 | Federation、Rotation、退役のRunbookと障害時連絡先 |
 
-移行は「新Identity作成 → Workspace Assignment → 新GrantのPlan／Apply → DAB変数と`run_as`のStaging切替 → Dry Run → prod切替 → Audit Log確認 → 旧Grant削除 → 旧Identity無効化」の順とする。新旧Credentialを長期間併用しない。分割してもProtected Branch、Job ACL、Git Commit、Audit Log、Workflow Validation、人間の登録／承認分離は変更しない。
+移行は「新Identity作成 → Workspace Assignment → 新GrantのPlan／Apply → DAB変数と`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）のStaging切替 → Dry Run → prod切替 → Audit Log確認 → 旧Grant削除 → 旧Identity無効化」の順とする。新旧Credentialを長期間併用しない。分割してもProtected Branch、Job ACL、Git Commit、Audit Log、Workflow Validation、人間の登録／承認分離は変更しない。
 
 #### 5.2.4 文書Workflowと整合性差分確認の高度化
 
@@ -16573,16 +16913,16 @@ Application品質だけでなく、初期セットアップで作成したResour
 
 | 対象 | 実行契機／頻度 | Systemによる検知・記録 | 担当者の判断・対応 |
 | --- | --- | --- | --- |
-| Model Service／Route | Route変更、月次 | `system.ai_gateway.usage`から実Route、Fallback、429、Tokenを集計しリリース構成台帳との差をSignal化 | Platform OwnerがWeight、Capacity、Fallbackを承認。未検証Routeは除外 |
+| Model Service／Route | Route変更、月次 | `system.ai_gateway.usage`（AI Gatewayの利用量・Token・Model経路等を確認するSystem Table）から実Route、Fallback、429、Tokenを集計しリリース構成台帳との差をSignal化 | Platform OwnerがWeight、Capacity、Fallbackを承認。未検証Routeは除外 |
 | AI Gateway Rate Limit | 429増加、利用範囲変更 | QPM／TPM、Group別上限、再試行回数をDashboard化 | Service Ownerが品質を落とさず上限またはClient Backoffを変更 |
 | Experiment／UC Trace容量 | 日次、保持期限到来 | 4 UC Tableの件数・Byte・取込Rate、欠落Span、削除対象を集計 | LLMOpsとData Ownerが保持／Legal Holdを判断し承認済みDELETE Jobを実行 |
-| Monitoring Budget Policy | 月次、Scorer追加 | `system.billing.usage`とScorer Sample数をBudgetと比較 | Quality OwnerがSample Rate、Scorer構成、停止条件を見直す |
+| Monitoring Budget Policy | 月次、Scorer追加 | `system.billing.usage`（Databricks System Table上の物理名）とScorer Sample数をBudgetと比較 | Quality OwnerがSample Rate、Scorer構成、停止条件を見直す |
 | Registered Scorer | Judge更新、週次 | Started／Stopped、バージョン、失敗率、Experiment当たり登録数をRun Logへ同期 | 未使用バージョンをStopし、20件上限へ近づく前に整理 |
 | Reviewer権限 | 異動、四半期 | Group Membership、Experiment ACL、Session割当差分をAccess レビュー記録化 | Quality Ownerが不要Userを削除し、未完Sessionを再割当 |
-| Prompt Registry権限 | エイリアス変更、四半期 | `MANAGE`、`CREATE FUNCTION`、`EXECUTE` Grant差分とエイリアス変更Auditを検知 | Prompt Managerとセキュリティが職務分離を再承認 |
+| Prompt Registry権限 | エイリアス変更、四半期 | `MANAGE`（対象Resourceを管理する権限）、`CREATE FUNCTION`（Unity Catalog Function／Prompt Resource作成に必要なSQL権限）、`EXECUTE`（対象Function／Model等を実行するSQL権限） Grant差分とエイリアス変更Auditを検知 | Prompt Managerとセキュリティが職務分離を再承認 |
 | EvaluationDataset | Case追加、月次 | Record数、重複ケースグループ、Split Drift、MLflow Expectation欠落、上限接近を検知 | Quality OwnerがArchive／新Datasetバージョン作成を判断 |
 | Inference Logging | 有効化中は日次 | Payload保存率、Masking違反、保持期限、閲覧Auditを検知 | セキュリティが即時停止、削除、Incident化を判断。不要なら無効化 |
-| App SP／Quality SP | Grant変更、四半期 | UC Grant、Workspace ACL、Model Service`EXECUTE`の差分を台帳化 | Platform／セキュリティが最小権限へ是正 |
+| App SP／Quality SP | Grant変更、四半期 | UC Grant、Workspace ACL、Model Service`EXECUTE`（対象Function／Model等を実行するSQL権限）の差分を台帳化 | Platform／セキュリティが最小権限へ是正 |
 | 文書マニフェスト／品質改善課題 | 状態変更、日次 | 不正遷移、SLA超過、孤立証跡、未同期CaseをSignal化 | Ownerが修正、Risk受容、Closeを意思決定記録へ記録 |
 
 保持期限はResourceごとに分ける。Raw Prompt／Responseを持たないGateway Usage、Mask済みUC Trace、Assessment、品質改善課題、Decision／Audit Event、EvaluationDatasetでは監査目的と機密性が異なる。1つの一律Retentionを適用せず、Legal Hold中のRecordを自動削除しない。削除Jobは対象件数、Policyバージョン、承認Decision ID、実行Identity、Before／After件数をRun Logへ残す。
@@ -16616,7 +16956,7 @@ Incident Close前に、Monitoringで検知できたか、Runbookで復旧でき�
 | --- | --- |
 | 候補抽出 | Scorer／Judge Fail、Retrieval 0件、User Feedback、セキュリティSignal、エラーを抽出する |
 | 正規化・集約 | Masking、失敗パターン識別子、重複排除、失敗原因グループ、Release／文書／質問カテゴリ別集計を行う |
-| 暫定付与 | `proposed_root_cause`、Severity候補、Owner候補を付ける |
+| 暫定付与 | `proposed_root_cause`（システムが付ける暫定的な根本原因候補）、Severity候補、Owner候補を付ける |
 | 緊急経路 | Critical／セキュリティは件数に関係なく即時通知し、必要ならIncidentを開始する |
 | レビュー待ちキュー | 通常の失敗原因グループは代表Trace、重要Trace、分類不明TraceだけをReviewerへ提示する |
 
@@ -16642,14 +16982,14 @@ Incident Close前に、Monitoringで検知できたか、Runbookで復旧でき�
 | Labeling | Assessmentを同期し必須項目を検証する | ドメイン担当者が代表TraceのMLflow ExpectationとRationaleを入力する | 期待回答、期待文書、拒否期待 |
 | Diagnosis | Chunk、Index、バージョンを表示・同期する | RAG／LLMOps担当者が最初に破綻したコンポーネントを確定する | Span、Dataset、バージョン |
 | Priority | 件数、Severity候補、前週比を集計する | 品質責任者が業務影響、セキュリティ、再現性、利用頻度、コストを含め決定する | 失敗原因グループ集計、代表Trace |
-| バックログ化 | 承認済み失敗原因グループと証跡参照を同期する | 上位テーマだけ品質改善課題／外部Issue化する | `family_id`、Issue ID、判断記録 |
+| バックログ化 | 承認済み失敗原因グループと証跡参照を同期する | 上位テーマだけ品質改善課題／外部Issue化する | `family_id`（同じ症状・原因でまとめる失敗原因グループID）、Issue ID、判断記録 |
 | 改善・再評価 | 固定Dataset／Holdoutで同じScorerを実行する | 担当者が1要素を改善し、責任者が採用／却下する | Baseline／Candidate Run、Gate結果 |
 
 Feedbackは「今回の実績への評価」、MLflow Expectationは「同じ入力で期待する正解」であり、用途を分ける。レビュー記録の`pending → labeled → diagnosed → approved／rejected → assigned → synced`は証跡配送の状態であって、外部Issueの作業状態ではない。
 
 ### 5.6 本番証跡に基づく改善サイクル
 
-改善開発は本番証跡から開始するが、Production Raw DataをそのままDevへ移動することを前提にしない。5.2で定義した`data_transfer_class`に従い、`metadata_only`／`sanitized_case`はDevへ、`staging_replay`／`full_snapshot_replay`はStaging／Qualityへ、`prod_only`はProduction Quality領域へ配送する。Retrieval系はCase 再実行→最小文書集合→文書集合全体のスナップショットの順で再現性を高め、どの経路でも元Trace、RAG Release、文書集合スナップショット、Index ReleaseへのLineageを保持する。
+改善開発は本番証跡から開始するが、Production Raw DataをそのままDevへ移動することを前提にしない。5.2で定義した`data_transfer_class`（本番からDev／Stagingへ連携するデータ種別を示す区分）に従い、`metadata_only`（本文を移さずRelease ID等のMetadataだけ連携する区分）／`sanitized_case`（機密情報を除去した評価Caseを連携する区分）はDevへ、`staging_replay`（最小文書集合をStagingで再現する区分）／`full_snapshot_replay`（文書集合全体をStaging相当環境で再現する区分）はStaging／Qualityへ、`prod_only`（データを移動せず本番Quality領域で評価する区分）はProduction Quality領域へ配送する。Retrieval系はCase 再実行→最小文書集合→文書集合全体のスナップショットの順で再現性を高め、どの経路でも元Trace、RAG Release、文書集合スナップショット、Index ReleaseへのLineageを保持する。
 
 改善開発は本番証跡から開始し、次のCycleで行う。改善CaseのTraining投入と、最終判定用Holdoutへの固定は品質管理ジョブがPolicyバージョン付きで行い、評価結果を見てからSplitを入れ替えない。
 
@@ -16680,10 +17020,10 @@ Judge Alignmentとオンライン比較は、PoCの必須機能ではなく、�
 
 | 高度化 | 開始条件 | 制御方法 | Guardrail |
 | --- | --- | --- | --- |
-| Judge Alignment | 同名の人間FeedbackとJudge Feedbackが十分あり、Label品質を確認済み | Alignment用Traceで`align()`し、別のJudge Validation Setで検証する | Alignment Caseを最終Validationへ再利用しない。False Positive／Negativeを確認する |
+| Judge Alignment | 同名の人間FeedbackとJudge Feedbackが十分あり、Label品質を確認済み | Alignment用Traceで`align()`（Human Feedbackを使ってJudgeを調整する処理）し、別のJudge Validation Setで検証する | Alignment Caseを最終Validationへ再利用しない。False Positive／Negativeを確認する |
 | Judgeバージョン更新 | 独立Validation合格、品質責任者承認 | Registered Judgeバージョンをリリース構成台帳へ固定する | 新Judgeを自動開始せず、旧Judgeへ戻せるようにする |
 | モデルのカナリアリリース | モデル経路別のオフライン評価、Capacity、コスト確認済み | Model ServiceのTraffic SplitまたはAgent側の決定的Routeで比率制御する | Session Affinityを使い、User／ケースグループを跨いだ混入を防ぎ、ACLと品質Guardrailを共通化する |
-| Prompt A/B | Prompt候補がHoldout合格し、割当単位と期間を事前定義済み | Agent側で`candidate_id`から不変Prompt URIを選び、Traceへ記録する | Prompt Registry自体のTraffic Splitに依存せず、途中で比率・KPIを恣意的変更しない |
+| Prompt A/B | Prompt候補がHoldout合格し、割当単位と期間を事前定義済み | Agent側で`candidate_id`（評価対象Candidateを識別するID）から不変Prompt URIを選び、Traceへ記録する | Prompt Registry自体のTraffic Splitに依存せず、途中で比率・KPIを恣意的変更しない |
 | インデックスのカナリアリリース | 新旧Indexを並行保持し、同一文書集合スナップショットで比較可能 | リリース構成台帳またはAgent RouteでIndexを固定する | 文書Snapshot差を検索設定差と混同しない |
 | 自動ロールバック | 十分な障害訓練、低誤検知Alert、承認済み停止条件 | Release Manager Jobが不変の旧リリース構成台帳へ切り戻す | ACL越境など限定条件から開始し、品質Judge単独では自動化しない |
 
@@ -16696,7 +17036,7 @@ Judge Alignmentとオンライン比較は、PoCの必須機能ではなく、�
 - 原文書の内容Hashを文書IDとして保持する。
 - 文書管理上の論理IDと内容Hashを分け、版更新を追跡する。
 - 削除・失効文書が検索Indexから除外されたことを確認する。
-- `ai_parse_document`、`ai_prep_search`、Embedding Model変更時は新Indexを作る。
+- `ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）、`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）、Embedding Model変更時は新Indexを作る。
 - 文書解析・検索準備エラーを隔離し、エラー行をIndexへ同期しない。
 - Delta Sync完了後にGolden Queryを自動評価する。
 - 文書SnapshotまたはIndex Release IDを評価結果へ残す。
@@ -16704,7 +17044,7 @@ Judge Alignmentとオンライン比較は、PoCの必須機能ではなく、�
 #### 5.8.2 Retrieval設計
 
 - 製品名、API名、エラー Codeを含む質問ではHYBRID Searchを基本とする。
-- `num_results`を増やしすぎず、RecallとLatency、Context Tokenを比較する。
+- `num_results`（AI Searchから返す検索結果件数）を増やしすぎず、RecallとLatency、Context Tokenを比較する。
 - Index ObjectをProcess起動時に取得して再利用する。
 - SDKの再試行を利用し、429に対して独自の無制限再試行を追加しない。
 - 検索Scoreを異なるQuery間の絶対品質値として扱わない。
@@ -16712,9 +17052,9 @@ Judge Alignmentとオンライン比較は、PoCの必須機能ではなく、�
 
 #### 5.8.3 アクセス制御
 
-- App Service PrincipalへAI Searchの参照権限とModel Serviceの`EXECUTE`だけを付与する。
+- App Service PrincipalへAI Searchの参照権限とModel Serviceの`EXECUTE`（対象Function／Model等を実行するSQL権限）だけを付与する。
 - 文書単位ACLは検索後ではなくQuery Filterへ適用する。
-- Clientが送った`access_scope`をそのまま信用しない。
+- Clientが送った`access_scope`（アクセス・範囲を保持する項目）をそのまま信用しない。
 - 認証済みUser／GroupからServer側で許可Filterを生成する。
 - 権限外文書をTrace、引用、Cacheへ残さない。
 - ACLを回避しようとする質問をHoldout Datasetへ含める。
@@ -16742,7 +17082,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 - Prompt TrainingとPrompt Holdoutを分離する。
 - Judge AlignmentとJudge Validationを分離する。
-- 質問グループを`case_family_id`、Snapshot・権限評価用テスト条件・期待値バージョンを`case_instance_id`で識別する。
+- 質問グループを`case_family_id`（同じ意味・業務目的の評価Case群を識別するID）、Snapshot・権限評価用テスト条件・期待値バージョンを`case_instance_id`（文書集合や権限条件を含む個々の評価Caseを識別するID）で識別する。
 - 回答可能、回答不能、略語、表記揺れ、複数文書、ACLを含める。
 - 期待回答だけでなく期待文書IDをレビューする。
 - 文書廃止や業務ルール変更時にMLflow Expectationを更新する。
@@ -16752,16 +17092,16 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 - FeedbackとMLflow Expectationを混同しない。
 - Judge名と人間Feedback名を完全に一致させる。
-- End UserとDomain Expertの`source_type`を区別する。
-- `yes`／`no`の両方とRationaleを収集する。
+- End UserとDomain Expertの`source_type`（監視イベントやReview情報の発生元種別）を区別する。
+- `yes`（合格・Yesを表す例示値）／`no`（不合格・Noを表す例示値）の両方とRationaleを収集する。
 - Aligned Judgeを自動で本番開始しない。
 - Judgeと人間の一致率、False Positive、文書種別別品質を確認する。
 - Judge変更後に必要な過去Traceを明示的に再評価する。
 
 #### 5.8.8 ストリーミング
 
-- Agent Serverの`@stream`を主経路にする。
-- 同じ`item_id`でDeltaとDone Eventを返す。
+- Agent Serverの`@stream`（Agent Serverで逐次応答を有効にするDecorator）を主経路にする。
+- 同じ`item_id`（Responses APIの出力Itemを識別するID）でDeltaとDone Eventを返す。
 - Chain-of-Thoughtを利用者へStreamしない。
 - 最終回答へ引用が揃ってから業務出力として扱う。
 - Streamlitで`[DONE]`、エラー、Timeout、切断を処理する。
@@ -16794,7 +17134,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 | 変更対象 | デプロイ | ロールバック |
 | --- | --- | --- |
 | 共通Package | WheelをBuildし影響Bundleを再Deploy | 直前Wheelへ戻す |
-| 文書Pipeline | `ingestion` BundleをDeploy | 直前CommitとTableへ戻す |
+| 文書Pipeline | `ingestion`（文書取込・解析・検索公開を配備するDAB Bundle名） BundleをDeploy | 直前CommitとTableへ戻す |
 | AI Search Index | 新Indexを並行作成し新リリース構成台帳へ含める | 旧Index Releaseのリリース構成台帳へ戻す |
 | Prompt | 合格した不変バージョンURIを新リリース構成台帳へ含める | 直前のリリース構成台帳へ戻す |
 | Agent | Clean BuildをDeployし新Commit／Wheelのリリース構成台帳へ切替 | 直前のリリース構成台帳とBuildへ戻す |
@@ -16808,66 +17148,66 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 - Workspace AdminがProduction Monitoring Beta、System Tables、SQL Warehouse、Serverless Budget Policyの利用可否を確認している
 - Answer／Judge Model ServiceをPlatform管理者が作成し、用途別FQN、Destination、Rate Limit、Fallback、Ownerを台帳化している
-- Realtime／Evaluation／Labeling ExperimentをMLflow SDKによる初期セットアップが別IDで作成し、DAB `experiments`と重複作成していない
+- Realtime／Evaluation／Labeling ExperimentをMLflow SDKによる初期セットアップが別IDで作成し、DAB `experiments`（DABでMLflow Experiment Resourceを定義するBlock名）と重複作成していない
 - Realtime Experimentが作成時からUC Trace Locationへ関連付けられ、Monitoring Warehouse IDがExperiment Tagへ永続化されている
-- Default Budget Policyを使えない環境では`mlflow.workload_creation_policy_id`がRealtime Experimentへ設定されている
+- Default Budget Policyを使えない環境では`mlflow.workload_creation_policy_id`（MLflowで利用する設定・Resource名）がRealtime Experimentへ設定されている
 - CI/CDが3 Experiment IDを保護Variable Storeから各Bundleへ注入し、Source内の名前検索や個人ExperimentへのFallbackがない
-- UC Trace 4表へ`SELECT`／`MODIFY`を明示付与し、`ALL PRIVILEGES`だけで完了扱いにしていない
+- UC Trace 4表へ`SELECT`（Table／Viewを読み取るSQL権限）／`MODIFY`（Delta Table等を変更するSQL権限）を明示付与し、`ALL PRIVILEGES`（対象Resourceの全権限をまとめて付与する権限指定）だけで完了扱いにしていない
 - Prompt Registry Schemaの登録者、実行環境、Prompt ManagerとEvaluationDataset Schemaの初期セットアップ／Reader権限を分離している
 - PoC／本番Smoke TestがModel、Experiment、Trace、Prompt、Dataset、Assessment、Search、Warehouse、Gatewayを検証している
-- Account／IdP管理者が`dev`、`stg`、`prod`で別のService Principalを作成し、表示名とApplication IDを台帳化している
-- Terraformの`databricks_service_principal`出力でApplication IDとAccount SCIM IDを混同していない
+- Account／IdP管理者が`dev`（Development環境を表す短縮名）、`stg`（Staging環境を表す短縮名）、`prod`（Production環境を表す短縮名）で別のService Principalを作成し、表示名とApplication IDを台帳化している
+- Terraformの`databricks_service_principal`（TerraformでDatabricks Service Principalを管理するResource Type）出力でApplication IDとAccount SCIM IDを混同していない
 - すべての実行環境 Service Principalが対象Workspaceへ割り当てられ、不要なCompute作成Entitlementを持たない
-- Bundle Deploy Identityと`run_as` Identityを分離し、Deploy Identityへ必要な`roles/servicePrincipal.user`だけを付与している
+- Bundle Deploy Identityと`run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定） Identityを分離し、Deploy Identityへ必要な`roles/servicePrincipal.user`（Service PrincipalへWorkspace利用Roleを割り当てるAzure／Databricks権限Scope）だけを付与している
 - Platform / Deploy IdentityとData Pipeline、Quality、Realtime AppのRuntime Identityを分離し、Deploy Identityを業務処理へ流用していない
-- すべての`${var.*_sp_application_id}`をBundleで宣言し、Terraform Outputから環境別`BUNDLE_VAR_*`へ渡している
-- `run_as.service_principal_name`とUnity CatalogのPrincipalに表示名ではなくApplication IDを使用している
+- すべての`${var.*_sp_application_id}`（DAB変数から設定値を解決する参照式）をBundleで宣言し、Terraform Outputから環境別`BUNDLE_VAR_*`（DAB Bundleへ環境別値を渡す変数名Pattern）へ渡している
+- `run_as.service_principal_name`（Job実行主体Service PrincipalのApplication IDを指定する項目）とUnity CatalogのPrincipalに表示名ではなくApplication IDを使用している
 - Client SecretをMarkdown、Git、DAB YAML、Terraform変数Fileへ保存せず、Workload Identity FederationまたはSecret Managerを使用している
 - Document Workflow SPをUI Backendで共有しても、人間の登録者Groupと承認者Group、画面／操作ACL、自己承認拒否を分離している
-- Document Workflow SPにBase 文書マニフェストの`MODIFY`を付与せず、Manifest Executor Jobを一般利用者が直接起動できない
+- Document Workflow SPにBase 文書マニフェストの`MODIFY`（Delta Table等を変更するSQL権限）を付与せず、Manifest Executor Jobを一般利用者が直接起動できない
 - Data Pipeline SPをIngestion／Gold／Search Publishで共有しても、個別のTable・Volume・Indexへ必要なGrantだけを列挙し、authoritative stateを更新できない。整合性差分確認 Grantは高度化前に付与しない
 - Quality SPとData Pipeline SPが分離され、Data生成権限と品質評価／リリース判定を共用していない
-- Realtime App SPはGold、AI Search Query、Model Service`EXECUTE`、必要なPrompt Readだけを許可され、DDL、Deploy、Index／Prompt管理、Dataset更新権限を持たない
-- 外部Scannerを使う場合だけ専用Identityを追加し、Staging／Scan Result以外へアクセスできない。使わない場合は`not_required`のPolicy根拠がある
-- Workflow / Request ID、Git Commit、Bundleバージョン、対象`document_id`、変更前後の公開Versionと`manifest_version`、操作時刻、理由、実行SP、人間の申請者／承認者を監査表とSystem Audit Logで関連付けている
+- Realtime App SPはGold、AI Search Query、Model Service`EXECUTE`（対象Function／Model等を実行するSQL権限）、必要なPrompt Readだけを許可され、DDL、Deploy、Index／Prompt管理、Dataset更新権限を持たない
+- 外部Scannerを使う場合だけ専用Identityを追加し、Staging／Scan Result以外へアクセスできない。使わない場合は`not_required`（外部検査が不要だったことを表す状態値）のPolicy根拠がある
+- Workflow / Request ID、Git Commit、Bundleバージョン、対象`document_id`（改訂をまたいで同じ論理文書を識別する不変ID）、変更前後の公開Versionと`manifest_version`（文書マニフェスト更新時の競合検知に使うVersion）、操作時刻、理由、実行SP、人間の申請者／承認者を監査表とSystem Audit Logで関連付けている
 - Identity退役時は後継への所有権・Grant・DAB変数移行、Job停止、無効化期間、監査確認を済ませてから削除している
 
 ### 6.2 プロジェクト境界
 
-- `document-workflow`、`ingestion`、`quality`、`realtime`が別の`databricks.yml`を持っている
+- `document-workflow`（文書審査UIと変更申請を配備するDAB Bundle名）、`ingestion`（文書取込・解析・検索公開を配備するDAB Bundle名）、`quality`（評価・Monitoring・リリース判定を配備するDAB Bundle名）、`realtime`（RAG ApplicationとAgent Serverを配備するDAB Bundle名）が別の`databricks.yml`（DAB BundleのResource・変数・Targetを定義する設定ファイル）を持っている
 - 各Bundleを独立してValidate、Deploy、ロールバックできる
-- 共通契約を`internal-rag-common` Wheelから利用している
+- 共通契約を`internal-rag-common`（RAG共通データ型・処理を提供するPython Package名） Wheelから利用している
 - BundleごとのService Principalへ最小権限を付与している
 
 ### 6.3 文書取り込み・Index
 
 - 文書マニフェスト、文書バージョン管理台帳、単一Workflow Request、Manifest Audit EventがUnity Catalog Delta TableとしてMigrationで作成されている
 - 文書管理UIでDocument List、Version List、Review、Publish Version、Confirmの画面フローを追跡できる
-- 登録者・承認者は文書マニフェストを直接`MODIFY`せず、UI → Workflow Backend → Manifest Executorを使っている
+- 登録者・承認者は文書マニフェストを直接`MODIFY`（Delta Table等を変更するSQL権限）せず、UI → Workflow Backend → Manifest Executorを使っている
 - Stagingの存在、拡張子、Size、空File、読取可能性、Hash、重複候補と、Policyが必要とする場合のMalware検査が完了した後に、人がRAG投入を承認した文書だけVolumeへMoveしている
 - RAG投入可否と本番公開Version選択を別の人間判断として記録している
 - 登録者Groupと承認者Groupを分け、同一Actorの自己承認を拒否している
-- 初期draftの`approved_document_version_id`は`NULL`で、Silver到達だけで公開参照を更新しない
+- 初期draftの`approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）は`NULL`（SQLで値がないことを表す値）で、Silver到達だけで公開参照を更新しない
 - v1公開中のv2審査は文書バージョン管理台帳で表現し、v1 参照を維持している
 - 最新Versionを自動公開せず、人がUIで選んだ公開PointerだけをGoldが強制している
 - 人がUIで過去Versionを選ぶロールバックを実行でき、Manifest → Gold → Search Sync → AI Searchの同じ経路で反映される
 - 文書マニフェスト・Registryの更新はバージョン付き楽観Lockで競合をFail Closedにしている
 - 未登録Fileは隔離へ保存し、同じPathの自動再検知に依存せず明示再実行している
 - 原文書と内容HashをBronzeへ保持している
-- `ai_parse_document`と`ai_prep_search`のバージョンを記録している
+- `ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）と`ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）のバージョンを記録している
 - Private 試行結果データセットで各AI Functionをバージョンごとに1回だけ実行している
 - 成功表とエラー表が相互排他的であることをInvariant Queryで確認している
 - 文書解析・検索準備エラーを別Tableへ隔離している
-- Parse／Prep隔離後に4.3.4.3.6のRunbookで対象、影響範囲、原文書、Processor Versionを確認し、原因を`SOURCE_PERMANENT`／`PROCESSOR_TRANSIENT`／`PROCESSOR_REGRESSION`／`PIPELINE_RULE`へ分類できる
+- Parse／Prep隔離後に4.3.4.3.6のRunbookで対象、影響範囲、原文書、Processor Versionを確認し、原因を`SOURCE_PERMANENT`（入力文書側の恒久的原因を表す分類値）／`PROCESSOR_TRANSIENT`（処理系の一時的障害を表す分類値）／`PROCESSOR_REGRESSION`（処理ロジックの退行を表す分類値）／`PIPELINE_RULE`（Pipeline品質Rule違反を表す分類値）へ分類できる
 - 原文書問題は失敗Versionを上書きせず修正版を新Versionとして再登録し、Processor／Platform問題は個別文書の無制限再試行ではなく修正版Releaseまたは上限付き専用Retryへ送る
 - Parse／Prepの初回隔離行を削除・成功扱いにせず、再試行Run ID、処置、終了判断をRun Log／Registry／Workflowへ残している
-- Chunkへ論理文書ID、文書バージョン ID、Chunkバージョン ID、Opaque Source Ref、`allowed_principals`、ページがある
+- Chunkへ論理文書ID、文書バージョン ID、Chunkバージョン ID、Opaque Source Ref、`allowed_principals`（この文書を検索できるUser／Group識別子の一覧）、ページがある
 - Delta Source TableでChange Data Feedが有効である
 - Current MVから物理CDF TableへMERGE／DELETEしている
 - Index設定Drift、Sync完了、Golden Query、ACL回帰を確認している
 - 本番導入時は高度な整合性差分確認、論理削除候補、自動失効、自動Version選定を必須にしていない
 - 整合性差分確認を高度化した場合も差分候補だけを作成し、削除・停止・改名・復活は人がUIで決定している
-- `manifest_invariants.sql`と`pipeline_invariants.sql`が正常時に0行となることをリリース判定で確認している
+- `manifest_invariants.sql`（文書マニフェストと文書Versionの整合性を検査し、不正な公開状態を検知するSQL）と`pipeline_invariants.sql`（文書取込Pipeline全体の不変条件を検査し、重複・版不整合・公開状態の破綻を検知するSQL）が正常時に0行となることをリリース判定で確認している
 
 ### 6.4 Agentic RAG
 
@@ -16882,7 +17222,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 ### 6.5 抽出・回答品質
 
-- PoCで`mlflow.genai.evaluate()`、Retriever／LLM／Agent Span、小規模EvaluationDataset、手動Assessmentを実行済みである
+- PoCで`mlflow.genai.evaluate()`（Evaluation DatasetとScorer／Judgeで評価Runを作成するMLflow API）、Retriever／LLM／Agent Span、小規模EvaluationDataset、手動Assessmentを実行済みである
 - PoCのPipeline／Evaluation Runごとに、入力、Git Commit、Prompt、モデル経路、Index、件数、エラー、判断を簡易なPoC実行記録へ残している
 - PoC結果を文書形式、質問カテゴリ、回答可否、Prompt／Model／Index バージョン、再検索有無でSlice比較している
 - 低品質CaseをDOCUMENT、PARSE、PREP、CHUNK、RETRIEVAL、QUERY_REWRITE、SUFFICIENCY、ANSWER_PROMPT、MODEL、ROUTING、出典、ACL、JUDGE、PLATFORMへ分類している
@@ -16913,8 +17253,8 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - 最初のScorer登録者が管理対象Quality SPであり、Monitoring Jobの実行権限と退役手順を管理している
 - Experiment当たり最大20 Registered Scorerを考慮し、不要バージョンのStop／整理手順がある
 - Custom Code Scorerを登録する場合はDatabricks NotebookでSelf-containedに定義し、Standalone PythonのSerializationを前提にしていない
-- Registered Scorerの`register`、`start`、`stop`、再開、旧バージョンへのロールバック手順と承認者を定義している
-- Judge Model Serviceの`EXECUTE`、Sampling Rate、月額コスト上限、停止条件を開始前に確定し、その内容を意思決定記録へ保存している
+- Registered Scorerの`register`（Scorer等を登録する操作名）、`start`（登録済みMonitoringを開始する操作名）、`stop`（Monitoring実行を停止する操作名）、再開、旧バージョンへのロールバック手順と承認者を定義している
+- Judge Model Serviceの`EXECUTE`（対象Function／Model等を実行するSQL権限）、Sampling Rate、月額コスト上限、停止条件を開始前に確定し、その内容を意思決定記録へ保存している
 - Production Monitoringを本番開始前に設定し、StagingでDry Runしている
 - Production Trace Schema、Masking、Assessment権限、Scorer／Judgeの誤検知を固定Staging Traceで検証している
 - Alert通知経路、Runbook、Index切替、再試行／再実行、Agent／Model／Search障害、ACL越境、ロールバックを本番開始前に試験している
@@ -16928,9 +17268,9 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 ### 6.8 リアルタイム処理
 
-- Agent Serverの`@stream`を使用している
+- Agent Serverの`@stream`（Agent Serverで逐次応答を有効にするDecorator）を使用している
 - StreamlitがSSEを逐次表示している
-- `response.output_item.done`を返している
+- `response.output_item.done`（Responses APIで返すEvent Type）を返している
 - Progress Itemと最終Answer Itemを分離している
 - Chain-of-Thoughtを表示していない
 - Timeout、429、切断、エラーを処理している
@@ -16938,7 +17278,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 ### 6.9 バージョン管理
 
 - CodeはGitコミットベースバージョン Trackingを使用している
-- PoCの短いPromptだけがPython直書きであり、本番の4 Prompt本文は`bundles/quality/prompts/*.md`に分離されている
+- PoCの短いPromptだけがPython直書きであり、本番の4 Prompt本文は`bundles/quality/prompts/*.md`（Quality BundleでGit管理するPrompt Markdown群）に分離されている
 - Prompt登録はFile存在、UTF-8、非空、必須／想定外Template変数、SHA-256 Hashを検証し、同一本文を重複登録しない
 - Prompt名、Version、Markdown Path、Template Hash、Git CommitをMLflow Run／Tagで追跡できる
 - 初期Prompt登録ScriptはどのAliasも変更せず、Markdown変更後もEvaluation／Holdout／リリース判定なしで本番昇格しない
@@ -16947,7 +17287,7 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - Model RegistryをApplication Code管理に使用していない
 - RAGリリース、Prompt、Index／Corpus、Chunk／Prep、WheelをTraceへ記録している
 - 基盤Model Service、期待Route、実Route、Embedding Modelを記録している
-- Apps実行環境は`.git`や`git rev-parse`へ依存していない
+- Apps実行環境は`.git`や`git rev-parse`（現在のGit Commitを取得するCLIコマンド）へ依存していない
 - CleanなGit CommitからDeployしている
 
 ### 6.10 設計書・Source整合性
@@ -16972,8 +17312,8 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - [Databricks AI Search](https://docs.databricks.com/aws/en/ai-search/ai-search)
 - [AI Search Python SDK example](https://docs.databricks.com/aws/en/ai-search/vector-search-python-sdk-example)
 - [AI Search performance guide](https://docs.databricks.com/aws/en/ai-search/best-practices)
-- [Databricks `ai_parse_document`](https://docs.databricks.com/aws/en/sql/language-manual/functions/ai_parse_document)
-- [Databricks `ai_prep_search`](https://docs.databricks.com/aws/en/sql/language-manual/functions/ai_prep_search)
+- [Databricks `ai_parse_document`（文書をText・表・Layout等へ解析するDatabricks AI Function）](https://docs.databricks.com/aws/en/sql/language-manual/functions/ai_parse_document)
+- [Databricks `ai_prep_search`（解析結果を検索・Chunk生成向けに整形するDatabricks AI Function）](https://docs.databricks.com/aws/en/sql/language-manual/functions/ai_prep_search)
 - [Query vision models with Unity AI Gateway](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-vision-models)
 - [Databricks Apps: Unity Catalog volume resource](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/uc-volumes)
 - [Databricks Apps environment variable resource resolution](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/environment-variables)
@@ -16992,22 +17332,22 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 - [Databricks Service Principal管理](https://docs.databricks.com/aws/en/admin/users-groups/service-principals)
 - [Service Principal Roles](https://docs.databricks.com/gcp/en/security/auth/access-control/service-principal-acl)
 - [Unity Catalog Principal指定](https://docs.databricks.com/gcp/en/sql/language-manual/sql-ref-principal)
-- [Databricks Declarative Automation Bundles `run_as`](https://docs.databricks.com/aws/en/dev-tools/bundles/run-as)
+- [Databricks Declarative Automation Bundles `run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定）](https://docs.databricks.com/aws/en/dev-tools/bundles/run-as)
 - [Databricks Declarative Automation Bundles Variables](https://docs.databricks.com/aws/en/dev-tools/bundles/variables)
 - [Databricks Declarative Automation Bundles Resources](https://docs.databricks.com/aws/en/dev-tools/bundles/resources)
 - [Databricks Declarative Automation Bundles permissions](https://docs.databricks.com/aws/en/dev-tools/bundles/permissions)
 - [Databricks Workload Identity Federation](https://docs.databricks.com/aws/en/dev-tools/auth/oauth-federation-provider)
-- [Terraform Provider `databricks_service_principal`](https://registry.terraform.io/providers/Databricks/databricks/latest/docs/resources/service_principal)
-- [Terraform Provider `databricks_mws_permission_assignment`](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/mws_permission_assignment)
-- [Terraform Provider `databricks_permission_assignment`](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/permission_assignment)
-- [Terraform Provider `databricks_entitlements`](https://github.com/databricks/terraform-provider-databricks/blob/main/docs/resources/entitlements.md)
-- [Terraform Provider `databricks_access_control_rule_set`](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/access_control_rule_set)
-- [Terraform Provider `databricks_grant`](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/grant)
-- [Delta Lake `MERGE`](https://docs.databricks.com/aws/en/delta/merge)
+- [Terraform Provider `databricks_service_principal`（TerraformでDatabricks Service Principalを管理するResource Type）](https://registry.terraform.io/providers/Databricks/databricks/latest/docs/resources/service_principal)
+- [Terraform Provider `databricks_mws_permission_assignment`（Account側Workspace権限割当を管理するTerraform Resource Type）](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/mws_permission_assignment)
+- [Terraform Provider `databricks_permission_assignment`（Workspace権限割当を管理するTerraform Resource Type）](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/permission_assignment)
+- [Terraform Provider `databricks_entitlements`（Workspace Entitlementを管理するTerraform Resource Type）](https://github.com/databricks/terraform-provider-databricks/blob/main/docs/resources/entitlements.md)
+- [Terraform Provider `databricks_access_control_rule_set`（Databricks Account／WorkspaceのAccess Control Rule Setを管理するTerraform Resource）](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/access_control_rule_set)
+- [Terraform Provider `databricks_grant`（Unity Catalog権限を管理するTerraform Resource Type）](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/grant)
+- [Delta Lake `MERGE`（MERGE操作を表すSQLキーワード）](https://docs.databricks.com/aws/en/delta/merge)
 - [Delta Lake isolation levels](https://docs.databricks.com/aws/en/optimizations/isolation/)
 - [Databricks SQL constraints](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-ddl-alter-table-add-constraint)
-- [Databricks `variant_explode`](https://docs.databricks.com/aws/en/sql/language-manual/functions/variant_explode)
-- [Databricks `try_variant_get`](https://docs.databricks.com/aws/en/sql/language-manual/functions/try_variant_get)
+- [Databricks `variant_explode`（ai_parse_documentのVariant結果を行へ展開する処理）](https://docs.databricks.com/aws/en/sql/language-manual/functions/variant_explode)
+- [Databricks `try_variant_get`（Variantから項目を安全に取り出す補助関数）](https://docs.databricks.com/aws/en/sql/language-manual/functions/try_variant_get)
 - [MLflow Agent Server](https://mlflow.org/docs/latest/genai/serving/agent-server/)
 - [MLflow 3 for GenAI: Evaluation and Monitoring](https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor)
 - [Databricks MLflow 3 for GenAI](https://docs.databricks.com/aws/en/mlflow3/genai/)
@@ -17052,13 +17392,13 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 
 - Unity Catalog、Lakeflow、AI Search、Databricks Apps、AI/BI DashboardなどはDatabricksが提供するServiceである。
 - Experiment、Trace、Assessment、Prompt、EvaluationDataset、Registered ScorerはMLflowが管理するResourceである。
-- `document_source_manifest`、`document_version_registry`、`internal_rag_review_cases`、任意の`internal_rag_quality_cases`は本システムがUnity Catalogへ作成するDelta Tableであり、Databricksの固有Service名ではない。
+- `document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable）、`document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table）、`internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable）、任意の`internal_rag_quality_cases`（同じ原因の問題を改善単位で管理する品質改善課題Table）は本システムがUnity Catalogへ作成するDelta Tableであり、Databricksの固有Service名ではない。
 - Job、Pipeline、App、Dashboard、AlertのYAMLはDAB Resource定義であり、YAML File自体が実行結果や業務状態を保持するわけではない。
 - リリース判定、品質改善課題の状態管理、整合性差分確認は本システム独自ワークフローである。品質改善課題は外部Issue Trackerを正本にする場合があり、常にDelta Tableで実装するとは限らない。
 
 | 用語 | 短い定義 | 物理的な実体 | 初出章 |
 | --- | --- | --- | --- |
-| DAB | SourceとWorkspace Resourceを環境別にDeployするDatabricks機能 | `databricks.yml`、`resources/*.yml` | 3.3.2 |
+| DAB | SourceとWorkspace Resourceを環境別にDeployするDatabricks機能 | `databricks.yml`（DAB BundleのResource・変数・Targetを定義する設定ファイル）、`resources/*.yml`（DAB Resource定義YAML群を表すPath Pattern） | 3.3.2 |
 | 初期セットアップ | RAGや評価を開始する前に、必要Resource、設定、権限、初期データを準備して利用可能な状態へ整える工程 | 初期セットアップJob、Python／SQL、Terraform。再実行可能・冪等に実装する場合がある | 3.3.2 |
 | Lakeflow Spark Declarative Pipelines | Dataset依存と増分処理を実行するDatabricks Service | Pipeline、Streaming Table、Materialized View | 3.3.2 |
 | Lakeflow Jobs | Task依存、再試行、Schedule、通知を管理するService | Job、Task、Run | 3.3.6.5 |
@@ -17066,10 +17406,10 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 | Materialized View | 上流から導出した現在値をRefreshするDataset | UC Materialized View | 3.3.5 |
 | AI Search Endpoint | AI Search Indexを実行するCompute | Vector Search Endpoint Resource | 3.3.6 |
 | Delta Sync Index | Delta Tableから増分同期する検索Index | AI Search Index Resource | 3.3.6 |
-| Model Service | Model Destination、Route、Rate Limitを統制するUC Securable | `catalog.schema.service` | 3.3.6.1 |
+| Model Service | Model Destination、Route、Rate Limitを統制するUC Securable | `catalog.schema.service`（Unity Catalog上のModel Service FQN形式） | 3.3.6.1 |
 | MLflow Experiment | Run、Trace、Assessment、Datasetを関連付ける管理単位 | Workspace Experiment ID | 3.3.6.1 |
 | Prompt Registry | Promptを名前、バージョン、エイリアスで管理するMLflow Resource | UC-backed Prompt | 3.3.6.3 |
-| Git管理Prompt Markdown | 本番Prompt本文をApplication Codeから分離してReviewする編集用原本 | `bundles/quality/prompts/*.md`。Runtimeは直接読まない | 4.3.4.2 |
+| Git管理Prompt Markdown | 本番Prompt本文をApplication Codeから分離してReviewする編集用原本 | `bundles/quality/prompts/*.md`（Quality BundleでGit管理するPrompt Markdown群）。Runtimeは直接読まない | 4.3.4.2 |
 | EvaluationDataset | 入力とMLflow Expectationをバージョン管理する評価ケース正本 | Unity Catalog Table | 3.3.6.4 |
 | MLflow Trace | 1 Requestの入出力と処理経路を保存する証跡 | Experiment ArtifactまたはUC Trace Table | 3.3.6.6 |
 | Span | Trace内の検索・LLMなどの処理区間 | Traceの子Record | 3.3.6.6 |
@@ -17078,36 +17418,36 @@ AI Search Indexの行・列権限だけで文書単位ACLが自動適用され�
 | Assessment | Trace／Spanへ付与する評価Recordの総称 | MLflow Assessment Record | 3.3.6.6 |
 | Feedback | 実際の結果がよかったかを表すAssessment | AssessmentのFeedback Record | 3.3.6.6 |
 | MLflow Expectation | 同じ入力で期待する正解を表すAssessment | Assessment／EvaluationDataset内のMLflow Expectation | 3.3.6.6 |
-| Lakeflow Pipeline Expectation | Lakeflow Datasetの各行を検証し、Warn／Drop／Fail Updateを適用する品質制約 | Streaming Table／Materialized View定義の`CONSTRAINT ... EXPECT (...)` | 3.3.2.1 |
+| Lakeflow Pipeline Expectation | Lakeflow Datasetの各行を検証し、Warn／Drop／Fail Updateを適用する品質制約 | Streaming Table／Materialized View定義の`CONSTRAINT ... EXPECT (...)`（Lakeflow SDPで品質条件を定義するSQL構文） | 3.3.2.1 |
 | 品質改善課題 | 失敗原因グループ単位で修正・再評価・Closeを追跡する本資料独自の論理チケット | PoCは簡易バックログ行。本番は外部Issue、または外部Trackerがない場合のみ任意のDelta Case行 | 3.6.9 |
 | 意思決定記録 | 採用、却下、Risk受容、Release、ロールバック、Close等の人間判断を証跡とともに保存する本資料独自の追記型記録 | Delta Table、外部承認記録、必要時は外部Issue／Change Management System | 1.5 |
 | Service Principal | JobやAppが使う非人間Identity | Account PrincipalとWorkspace Assignment | 4.3.4.3.1.1 |
 | Service Principal標準構成 | 本番導入時にTrust Boundaryの異なる処理だけを分けるIdentity構成 | Platform / Deploy、Document Workflow、Manifest Executor、Data Pipeline、Quality、Realtime App | 4.3.4.3.1.1 |
-| Service Principal厳格構成 | 監査・規制・所有者分離・影響範囲縮小の実需に応じ、標準構成を責務単位へ追加分割した構成 | 追加したSP、Workspace Assignment、UC Grant、DAB `run_as` | 5.2.3 |
-| `run_as` | 作成済みIdentityをJob／Pipeline実行主体にする設定 | DAB Resource Field | 4.3.4.3.1.1 |
-| 文書マニフェスト | 文書の管理属性と公開参照を持つ正本 | `main.llmops.document_source_manifest` | 4.3.4.3.1 |
-| 文書バージョン管理台帳 | 文書バージョンの処理・審査履歴を持つ正本 | `main.llmops.document_version_registry` | 4.3.4.3.1 |
-| 公開バージョン参照 | 現在公開する文書バージョンを指す値 | `approved_document_version_id`列 | 1.6 |
+| Service Principal厳格構成 | 監査・規制・所有者分離・影響範囲縮小の実需に応じ、標準構成を責務単位へ追加分割した構成 | 追加したSP、Workspace Assignment、UC Grant、DAB `run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定） | 5.2.3 |
+| `run_as`（Lakeflow Job等を実行するService Principalを固定するDAB設定） | 作成済みIdentityをJob／Pipeline実行主体にする設定 | DAB Resource Field | 4.3.4.3.1.1 |
+| 文書マニフェスト | 文書の管理属性と公開参照を持つ正本 | `main.llmops.document_source_manifest`（論理文書の公開状態・ACL・公開Version参照を保持する文書マニフェストTable） | 4.3.4.3.1 |
+| 文書バージョン管理台帳 | 文書バージョンの処理・審査履歴を持つ正本 | `main.llmops.document_version_registry`（文書Versionごとの技術処理・審査状態を保持する管理Table） | 4.3.4.3.1 |
+| 公開バージョン参照 | 現在公開する文書バージョンを指す値 | `approved_document_version_id`（現在公開すると人が選んだ文書Versionへの参照）列 | 1.6 |
 | 隔離 | 失敗・未登録データを公開経路から分離し、原因調査と復旧判断を行う領域 | エラー／隔離 Delta Table。Parse／Prepの調査Runbookは4.3.4.3.6 | 4.3.4.3 |
 | 文書集合スナップショット | 評価・Index時点の公開文書バージョン集合 | Snapshot RegistryとMember Table | 4.3.4.5 |
 | インデックスリリース | Index、Corpus、Embedding、Schemaを固定した版 | Index Registry RecordとAI Search Index | 4.3.4.5 |
-| リリース構成台帳 | RAG構成を一体で再現・ロールバックする正本 | `main.llmops.rag_release_manifest`の1行 | 4.3.4.6 |
+| リリース構成台帳 | RAG構成を一体で再現・ロールバックする正本 | `main.llmops.rag_release_manifest`（承認済みRAGリリース構成の正本となるDelta Table）の1行 | 4.3.4.6 |
 | RAGリリースID | 固定したRAG構成の不変ID | リリース構成台帳 KeyとTrace Tag | 4.3.4.6 |
-| 安定した出典 | 回答と不変Chunkバージョンを結ぶ出典情報 | `Citation` ObjectとResponse／Trace属性 | 4.3.4.7 |
+| 安定した出典 | 回答と不変Chunkバージョンを結ぶ出典情報 | `Citation`（回答へ返す出典情報を表す型） ObjectとResponse／Trace属性 | 4.3.4.7 |
 | 権限評価用テスト条件 | ACL評価用の承認済み架空Identity | Git FixtureとDataset参照ID | 4.3.4.9 |
 | Production Monitoring | 本番Traceを登録済みScorerでSampling評価するMLflow機能 | Registered Scorer、Monitoring Job、Assessment | 4.3.4.14 |
-| 監視検知イベント | Detector出力をCase化前に正規化する本資料独自Event | `internal_rag_monitoring_signals`の1行 | 3.6（物理実体は4.3.4.15） |
+| 監視検知イベント | Detector出力をCase化前に正規化する本資料独自Event | `internal_rag_monitoring_signals`（品質・運用監視で検知したイベントを集約するTable）の1行 | 3.6（物理実体は4.3.4.15） |
 | Review App | TraceやRecordへ人間Labelを入力するMLflow UI | Review UIとLabel Schema | 5.2.2.1 |
 | Labeling Session | Reviewerと対象TraceをまとめるReview単位 | MLflow Labeling Session | 5.2.2.1 |
 | 失敗パターン識別子 | 重複候補を見つける本資料独自の正規化識別値 | 品質管理ジョブのHashまたはPoC分析列 | 3.6 |
 | 失敗原因グループ | 同じ症状・原因・改善で解消できる失敗集合 | グループ集計Recordと代表Trace参照 | 3.6 |
-| レビュー記録 | 代表TraceのMLflow Expectation・技術原因・採否を確定する本資料独自のReview Record | `internal_rag_review_cases`の1行 | 4.3.4.15（詳細は5.2.2.1） |
-| Training Dataset | 改善候補の探索に使う評価Dataset | `main.llmops.internal_rag_train` | 5.2.2.2 |
-| Holdout Dataset | 最終Release判定だけに使う固定Dataset | `main.llmops.internal_rag_holdout` | 5.2.2.2 |
+| レビュー記録 | 代表TraceのMLflow Expectation・技術原因・採否を確定する本資料独自のReview Record | `internal_rag_review_cases`（代表Traceのレビュー結果・期待値・原因を保持するTable）の1行 | 4.3.4.15（詳細は5.2.2.1） |
+| Training Dataset | 改善候補の探索に使う評価Dataset | `main.llmops.internal_rag_train`（候補改善に利用するTraining Evaluation Dataset） | 5.2.2.2 |
+| Holdout Dataset | 最終Release判定だけに使う固定Dataset | `main.llmops.internal_rag_holdout`（候補探索に使わない最終判定用Holdout Evaluation Dataset） | 5.2.2.2 |
 | Prompt Optimization | Training DataでPrompt候補を比較する改善処理 | Optimization RunとPromptバージョン候補 | 5.2.2.4 |
 | リリース判定 | Holdout、セキュリティ、SLO、コストから採否を決める独自ワークフロー | 品質管理ジョブ、Python判定、意思決定記録 | 1.5（実装は5.2.2.5） |
 | Judge Alignment | Judge定義を人間Feedbackへ適合させる処理 | Alignment Runと候補Judge | 5.2.2.9 |
-| 根本原因分類体系 | 最初に破綻したコンポーネントを表す本資料独自の分類体系 | Review／失敗原因グループ集計の`proposed_root_cause`と`confirmed_root_cause` | 3.6 |
+| 根本原因分類体系 | 最初に破綻したコンポーネントを表す本資料独自の分類体系 | Review／失敗原因グループ集計の`proposed_root_cause`（システムが付ける暫定的な根本原因候補）と`confirmed_root_cause`（人がTrace等を確認して確定した根本原因） | 3.6 |
 | 改善対象 | 確定原因から決める本資料独自の改善資産分類 | Review／品質改善課題列とGit管理Mapping | 3.6 |
 | 整合性差分確認 | Volume、文書マニフェスト、Gold、Indexの差分候補を作る本番導入後の任意高度化 | Job、Python、候補Delta Table。公開Pointerは更新しない | 4.3.4.4、5.2.4 |
 | モデル経路 | 用途別Model ServiceとFallbackの固定構成 | リリース構成台帳列とAI Gateway設定 | 4.3.3.2 |
